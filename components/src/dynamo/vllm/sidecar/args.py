@@ -16,7 +16,6 @@ import argparse
 import logging
 from typing import Optional
 
-from dynamo.common.configuration.config_base import ConfigBase
 from dynamo.common.configuration.groups.runtime_args import (
     DynamoRuntimeArgGroup,
     DynamoRuntimeConfig,

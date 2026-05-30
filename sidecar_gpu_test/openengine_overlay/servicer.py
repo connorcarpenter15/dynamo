@@ -34,7 +34,6 @@ logger = logging.getLogger(__name__)
 KV_TRANSFER_PARAMS_ATTR = "kv_transfer_params"
 
 _ROLE_PREFILL = pb.ENGINE_ROLE_PREFILL
-_ROLE_DECODE = pb.ENGINE_ROLE_DECODE
 
 # vLLM finish-reason string -> OpenEngine FinishReason enum.
 _FINISH_REASON_MAP = {
@@ -167,7 +166,6 @@ class OpenEngineServicer(pb_grpc.OpenEngineServicer):
                                     kv_session=kv_session
                                 ),
                             )
-                            prefill_ready_sent = True
                         total = prompt_tokens + total_completion
                         yield pb.GenerateResponse(
                             request_id=request_id,
