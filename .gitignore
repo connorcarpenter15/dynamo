@@ -38,6 +38,7 @@ CMakeCache.txt
 *.vcxproj.filters
 *_pb2.py
 *_pb2.pyi
+*_pb2_grpc.py
 *.svg
 !docs/assets/**/*.svg
 
