@@ -1,0 +1,66 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Aggregated serving via the OpenEngine sidecar.
+#
+# Each worker pod runs TWO containers sharing the pod network (localhost):
+#   - vllm-engine  : native `vllm serve` with the OpenEngine gRPC server (GPU)
+#   - mainContainer: the Dynamo vLLM sidecar worker, an OpenEngine client (CPU)
+#
+# The sidecar reaches the engine over 127.0.0.1:50051 because containers in the
+# same pod share a network namespace. The engine owns the GPU; the sidecar is
+# CPU-only. The image below bundles both vllm and dynamo for convenience; in a
+# real split you would use a vllm-only image for the engine and a dynamo-only
+# image for the sidecar.
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: vllm-sidecar-agg
+spec:
+  services:
+    Frontend:
+      envFromSecret: hf-token-secret
+      componentType: frontend
+      replicas: 1
+      extraPodSpec:
+        mainContainer:
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:my-tag
+    VllmSidecarWorker:
+      envFromSecret: hf-token-secret
+      componentType: worker
+      replicas: 1
+      resources:
+        requests:
+          custom:
+            # Increase this value for larger models
+            ephemeral-storage: "2Gi"
+      extraPodSpec:
+        # Engine container: holds the GPU and runs the native vLLM server.
+        containers:
+          - name: vllm-engine
+            image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:my-tag
+            command:
+              - vllm
+              - serve
+              - Qwen/Qwen3-0.6B
+              - --enforce-eager
+              - --openengine-host
+              - 127.0.0.1
+              - --openengine-port
+              - "50051"
+            resources:
+              limits:
+                nvidia.com/gpu: "1"
+        # Sidecar container (Dynamo worker): CPU-only OpenEngine client.
+        mainContainer:
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:my-tag
+          workingDir: /workspace/examples/backends/vllm
+          command:
+            - python3
+            - -m
+            - dynamo.vllm.sidecar
+          args:
+            - --model
+            - Qwen/Qwen3-0.6B
+            - --openengine-endpoint
+            - 127.0.0.1:50051
