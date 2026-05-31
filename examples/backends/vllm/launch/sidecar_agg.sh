@@ -7,10 +7,14 @@
 # Unlike agg.sh (which runs vLLM in-process inside the Dynamo worker), this
 # launches three processes:
 #   1. Dynamo frontend (HTTP ingress)
-#   2. A native `vllm serve` engine exposing the OpenEngine gRPC server
+#   2. A native `vllm-rs serve` engine exposing the OpenEngine gRPC server
 #   3. The Dynamo vLLM sidecar worker, which talks to (2) over OpenEngine
 #
-# The sidecar never imports vllm; it only speaks the OpenEngine v1 contract.
+# `vllm-rs serve` is the Rust vLLM frontend: it self-manages a headless Python
+# EngineCore subprocess and mounts the OpenEngine v1 gRPC service on
+# --openengine-port. The Dynamo sidecar (dynamo-vllm-sidecar) never imports
+# vllm; it is given ONLY the OpenEngine endpoint and discovers the model, role,
+# parallelism, and KV config from the engine over OpenEngine RPCs.
 
 set -e
 trap 'echo Cleaning up...; kill 0' EXIT
@@ -35,7 +39,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --model <name>       Specify model (default: $MODEL)"
             echo "  -h, --help           Show this help message"
             echo ""
-            echo "Additional options are passed through to the vllm serve engine."
+            echo "Additional options are passed through to the vllm-rs serve engine."
             exit 0
             ;;
         *)
@@ -50,6 +54,9 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
 MAX_CONCURRENT_SEQS="${MAX_CONCURRENT_SEQS:-2}"
 OPENENGINE_HOST="${OPENENGINE_HOST:-127.0.0.1}"
 OPENENGINE_PORT="${OPENENGINE_PORT:-50051}"
+# vllm-rs runs its own OpenAI HTTP frontend; it is unused by the sidecar but
+# still binds, so keep it off the Dynamo frontend's port (8000).
+VLLM_RS_HTTP_PORT="${VLLM_RS_HTTP_PORT:-8100}"
 
 HTTP_PORT="${DYN_HTTP_PORT:-8000}"
 print_launch_banner "Launching Sidecar Aggregated Serving (1 GPU)" "$MODEL" "$HTTP_PORT"
@@ -57,20 +64,23 @@ print_launch_banner "Launching Sidecar Aggregated Serving (1 GPU)" "$MODEL" "$HT
 # 1. Dynamo frontend (HTTP ingress)
 python -m dynamo.frontend &
 
-# 2. Native vLLM engine with the OpenEngine gRPC server.
-# --enforce-eager is for quick startup; drop it for production.
-vllm serve "$MODEL" \
-    --enforce-eager \
+# 2. Native vLLM engine (Rust frontend + managed Python EngineCore) with the
+# OpenEngine gRPC server. The model is positional; --enforce-eager and
+# --max-num-seqs are forwarded to the Python EngineCore. --enforce-eager is for
+# quick startup; drop it for production.
+vllm-rs serve "$MODEL" \
+    --port "$VLLM_RS_HTTP_PORT" \
     --max-model-len "$MAX_MODEL_LEN" \
-    --max-num-seqs "$MAX_CONCURRENT_SEQS" \
     --openengine-host "$OPENENGINE_HOST" \
     --openengine-port "$OPENENGINE_PORT" \
+    --enforce-eager \
+    --max-num-seqs "$MAX_CONCURRENT_SEQS" \
     "${EXTRA_ARGS[@]}" &
 
-# 3. Dynamo sidecar worker (no vllm import; OpenEngine client only).
+# 3. Dynamo sidecar worker (no vllm import; OpenEngine client only). It receives
+# ONLY the endpoint; model and role are discovered from the engine.
 DYN_SYSTEM_PORT=${DYN_SYSTEM_PORT:-8081} \
-    python -m dynamo.vllm.sidecar \
-    --model "$MODEL" \
+    dynamo-vllm-sidecar \
     --openengine-endpoint "${OPENENGINE_HOST}:${OPENENGINE_PORT}" &
 
 # Exit on first process failure; kill 0 in the EXIT trap tears down the rest
