@@ -23,7 +23,10 @@ use futures::{Stream, StreamExt};
 use tonic::{Request, Response, Status};
 
 use crate::args::TransportConfig;
-use crate::engine::{VllmSidecarEngine, disagg_json_to_kv_session, kv_session_to_disagg_json};
+use crate::engine::{
+    VllmSidecarEngine, disagg_json_to_kv_session, json_to_prost_struct, kv_session_to_disagg_json,
+    prost_struct_to_json,
+};
 use crate::proto as pb;
 use crate::proto::open_engine_server::{OpenEngine, OpenEngineServer};
 
@@ -83,17 +86,18 @@ impl OpenEngine for FakeOpenEngine {
             match cfg.role {
                 pb::EngineRole::Prefill => {
                     // Prefill returns a single KV handoff and no decoded tokens.
+                    // Mirror real vLLM prefill: typed params via attributes_struct,
+                    // legacy string map left empty.
                     let kv = pb::KvSessionRef {
                         session_id: request_id.clone(),
                         transfer_backend: "NixlConnector".to_string(),
                         endpoints: Vec::new(),
                         dp_rank: 0,
-                        attributes: [
-                            ("remote_engine_id".to_string(), "engine-fake".to_string()),
-                            ("remote_block_ids".to_string(), "[1,2,3]".to_string()),
-                        ]
-                        .into_iter()
-                        .collect(),
+                        attributes: Default::default(),
+                        attributes_struct: json_to_prost_struct(&serde_json::json!({
+                            "remote_engine_id": "engine-fake",
+                            "remote_block_ids": [1, 2, 3],
+                        })),
                     };
                     yield Ok(pb::GenerateResponse {
                         request_id: request_id.clone(),
@@ -616,7 +620,9 @@ async fn prefill_emits_terminal_with_disaggregated_params() {
         .as_ref()
         .expect("prefill terminal must carry disaggregated_params");
     assert_eq!(params["transfer_backend"], "NixlConnector");
-    assert_eq!(params["attributes"]["remote_engine_id"], "engine-fake");
+    // Typed params pass through as native JSON with types preserved.
+    assert_eq!(params["attributes_struct"]["remote_engine_id"], "engine-fake");
+    assert_eq!(params["attributes_struct"]["remote_block_ids"], serde_json::json!([1, 2, 3]));
 
     engine.cleanup().await.unwrap();
 }
@@ -657,7 +663,7 @@ async fn decode_lifts_prefill_result_onto_kv_session() {
         "session_id": "sess-xyz",
         "transfer_backend": "NixlConnector",
         "dp_rank": 2,
-        "attributes": { "remote_engine_id": "engine-fake" },
+        "attributes_struct": { "remote_engine_id": "engine-fake", "remote_port": 20097 },
     });
     let stream = engine
         .generate(request_with_prefill_result(disagg), gen_ctx(fresh_ctx()))
@@ -674,27 +680,34 @@ async fn decode_lifts_prefill_result_onto_kv_session() {
     assert_eq!(captured.session_id, "sess-xyz");
     assert_eq!(captured.transfer_backend, "NixlConnector");
     assert_eq!(captured.dp_rank, 2);
-    assert_eq!(
-        captured.attributes.get("remote_engine_id").map(String::as_str),
-        Some("engine-fake")
+    // The typed handoff is forwarded on attributes_struct with types intact.
+    let attrs = prost_struct_to_json(
+        captured.attributes_struct.as_ref().expect("attributes_struct forwarded"),
     );
+    assert_eq!(attrs["remote_engine_id"], "engine-fake");
+    assert_eq!(attrs["remote_port"], serde_json::json!(20097));
 
     engine.cleanup().await.unwrap();
 }
 
 #[test]
 fn disagg_json_round_trips_through_kv_session() {
+    // Typed params survive the prefill -> JSON -> decode round-trip with their
+    // JSON types intact (numbers stay numbers, arrays stay arrays).
+    let attrs = serde_json::json!({
+        "remote_engine_id": "engine-7",
+        "remote_port": 20097,
+        "tp_size": 1,
+        "do_remote_prefill": true,
+        "remote_block_ids": [4, 5, 6],
+    });
     let original = pb::KvSessionRef {
         session_id: "sess-1".to_string(),
         transfer_backend: "NixlConnector".to_string(),
         endpoints: Vec::new(),
         dp_rank: 3,
-        attributes: [
-            ("remote_engine_id".to_string(), "engine-7".to_string()),
-            ("remote_block_ids".to_string(), "[4,5,6]".to_string()),
-        ]
-        .into_iter()
-        .collect(),
+        attributes: Default::default(),
+        attributes_struct: json_to_prost_struct(&attrs),
     };
 
     let json = kv_session_to_disagg_json(original.clone());
@@ -703,6 +716,31 @@ fn disagg_json_round_trips_through_kv_session() {
     assert_eq!(restored.session_id, original.session_id);
     assert_eq!(restored.transfer_backend, original.transfer_backend);
     assert_eq!(restored.dp_rank, original.dp_rank);
+    let restored_attrs = prost_struct_to_json(
+        restored.attributes_struct.as_ref().expect("attributes_struct round-trips"),
+    );
+    assert_eq!(restored_attrs, attrs);
+}
+
+#[test]
+fn disagg_json_round_trips_legacy_string_attributes() {
+    // Back-compat: a peer that still sends the string-map `attributes` (no
+    // attributes_struct) round-trips through the legacy path unchanged.
+    let original = pb::KvSessionRef {
+        session_id: "sess-2".to_string(),
+        transfer_backend: "NixlConnector".to_string(),
+        endpoints: Vec::new(),
+        dp_rank: 1,
+        attributes: [("remote_engine_id".to_string(), "engine-9".to_string())]
+            .into_iter()
+            .collect(),
+        attributes_struct: None,
+    };
+
+    let json = kv_session_to_disagg_json(original.clone());
+    let restored = disagg_json_to_kv_session(&json, "fallback-id");
+
+    assert!(restored.attributes_struct.is_none());
     assert_eq!(restored.attributes, original.attributes);
 }
 

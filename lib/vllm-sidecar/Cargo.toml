@@ -33,6 +33,9 @@ tracing = { workspace = true }
 # bundles prost codegen via `compile_protos` (the 0.14 split to
 # tonic-prost-build does not apply here).
 prost = { version = "0.13.5" }
+# prost-types provides google.protobuf.Struct (KvSessionRef.attributes_struct);
+# tonic-build maps the well-known types to ::prost_types by default.
+prost-types = { version = "0.13.5" }
 tonic = { version = "0.13.1" }
 
 [build-dependencies]

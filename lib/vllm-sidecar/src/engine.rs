@@ -411,10 +411,23 @@ impl LLMEngine for VllmSidecarEngine {
             .sources
             .into_iter()
             .filter(|s| s.transport == "zmq")
-            .map(|s| KvEventSource::Zmq {
-                endpoint: s.endpoint,
-                topic: s.topic,
-                dp_rank: s.data_parallel_rank,
+            .map(|s| {
+                // Prefer the connectable `endpoint_addr` (a routable host:port)
+                // over the legacy `endpoint` string, which the engine often
+                // sets to a bind wildcard (e.g. `tcp://*:5557`) that the KV
+                // router cannot dial from another node.
+                let endpoint = match s.endpoint_addr {
+                    Some(e) => {
+                        let proto = if e.protocol.is_empty() { "tcp" } else { &e.protocol };
+                        format!("{proto}://{}:{}", e.host, e.port)
+                    }
+                    None => s.endpoint,
+                };
+                KvEventSource::Zmq {
+                    endpoint,
+                    topic: s.topic,
+                    dp_rank: s.data_parallel_rank,
+                }
             })
             .collect();
         Ok(sources)
@@ -604,13 +617,23 @@ fn finish_output(
 /// Encode a prefill `KvSessionRef` into the JSON the frontend's PrefillRouter
 /// forwards to the decode peer (round-trips with
 /// [`disagg_json_to_kv_session`]).
+///
+/// The sidecar is an opaque pass-through for the connector's handoff metadata:
+/// the typed `attributes_struct` is carried as native JSON (types preserved),
+/// with the legacy string-map `attributes` carried alongside only if set.
 pub(crate) fn kv_session_to_disagg_json(session: pb::KvSessionRef) -> serde_json::Value {
-    serde_json::json!({
+    let mut obj = serde_json::json!({
         "session_id": session.session_id,
         "transfer_backend": session.transfer_backend,
         "dp_rank": session.dp_rank,
-        "attributes": session.attributes,
-    })
+    });
+    if let Some(s) = session.attributes_struct.as_ref() {
+        obj["attributes_struct"] = prost_struct_to_json(s);
+    }
+    if !session.attributes.is_empty() {
+        obj["attributes"] = serde_json::json!(session.attributes);
+    }
+    obj
 }
 
 /// Reconstruct a `KvSessionRef` from the prefill peer's forwarded JSON.
@@ -630,6 +653,9 @@ pub(crate) fn disagg_json_to_kv_session(
         .and_then(|o| o.get("dp_rank"))
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as u32;
+    let attributes_struct = obj
+        .and_then(|o| o.get("attributes_struct"))
+        .and_then(json_to_prost_struct);
     let attributes = obj
         .and_then(|o| o.get("attributes"))
         .and_then(|v| v.as_object())
@@ -646,5 +672,68 @@ pub(crate) fn disagg_json_to_kv_session(
         endpoints: Vec::new(),
         dp_rank,
         attributes,
+        attributes_struct,
+    }
+}
+
+/// Convert a JSON object into a `google.protobuf.Struct`. Non-object inputs
+/// yield `None`.
+pub(crate) fn json_to_prost_struct(value: &serde_json::Value) -> Option<prost_types::Struct> {
+    match value {
+        serde_json::Value::Object(map) => Some(prost_types::Struct {
+            fields: map.iter().map(|(k, v)| (k.clone(), json_to_prost_value(v))).collect(),
+        }),
+        _ => None,
+    }
+}
+
+fn json_to_prost_value(value: &serde_json::Value) -> prost_types::Value {
+    use prost_types::value::Kind;
+    let kind = match value {
+        serde_json::Value::Null => Kind::NullValue(prost_types::NullValue::NullValue as i32),
+        serde_json::Value::Bool(b) => Kind::BoolValue(*b),
+        serde_json::Value::Number(n) => Kind::NumberValue(n.as_f64().unwrap_or(0.0)),
+        serde_json::Value::String(s) => Kind::StringValue(s.clone()),
+        serde_json::Value::Array(arr) => Kind::ListValue(prost_types::ListValue {
+            values: arr.iter().map(json_to_prost_value).collect(),
+        }),
+        serde_json::Value::Object(map) => Kind::StructValue(prost_types::Struct {
+            fields: map.iter().map(|(k, v)| (k.clone(), json_to_prost_value(v))).collect(),
+        }),
+    };
+    prost_types::Value { kind: Some(kind) }
+}
+
+/// Convert a `google.protobuf.Struct` back into a JSON object.
+pub(crate) fn prost_struct_to_json(s: &prost_types::Struct) -> serde_json::Value {
+    serde_json::Value::Object(
+        s.fields.iter().map(|(k, v)| (k.clone(), prost_value_to_json(v))).collect(),
+    )
+}
+
+fn prost_value_to_json(value: &prost_types::Value) -> serde_json::Value {
+    use prost_types::value::Kind;
+    match &value.kind {
+        None | Some(Kind::NullValue(_)) => serde_json::Value::Null,
+        Some(Kind::BoolValue(b)) => serde_json::Value::Bool(*b),
+        Some(Kind::NumberValue(n)) => number_to_json(*n),
+        Some(Kind::StringValue(s)) => serde_json::Value::String(s.clone()),
+        Some(Kind::ListValue(l)) => {
+            serde_json::Value::Array(l.values.iter().map(prost_value_to_json).collect())
+        }
+        Some(Kind::StructValue(s)) => prost_struct_to_json(s),
+    }
+}
+
+/// `google.protobuf.Struct` numbers are IEEE-754 doubles; recover integral
+/// values as JSON integers so connector params (`remote_port`, `tp_size`, …)
+/// keep their integer type through the pass-through.
+fn number_to_json(n: f64) -> serde_json::Value {
+    if n.is_finite() && n.fract() == 0.0 && n >= i64::MIN as f64 && n <= i64::MAX as f64 {
+        serde_json::Value::Number((n as i64).into())
+    } else {
+        serde_json::Number::from_f64(n)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null)
     }
 }
