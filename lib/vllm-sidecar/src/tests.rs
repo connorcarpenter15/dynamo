@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use dynamo_backend_common::{
     BackendError, DisaggregationMode, ErrorType, FinishReason, GenerateContext, LLMEngine,
-    LLMEngineOutput, PrefillResult, PreprocessedRequest, RoutingHints, SamplingOptions,
-    StopConditions,
+    LLMEngineOutput, MultimodalData, MultimodalDataMap, PrefillResult, PreprocessedRequest,
+    RoutingHints, SamplingOptions, StopConditions,
 };
 use dynamo_runtime::engine::AsyncEngineContext;
 use dynamo_runtime::pipeline::{AsyncEngineContextProvider, Context};
@@ -25,8 +25,8 @@ use tonic::{Request, Response, Status};
 
 use crate::args::TransportConfig;
 use crate::engine::{
-    VllmSidecarEngine, disagg_json_to_kv_session, json_to_prost_struct, kv_session_to_disagg_json,
-    prost_struct_to_json,
+    VllmSidecarEngine, build_generate_request, disagg_json_to_kv_session, json_to_prost_struct,
+    kv_session_to_disagg_json, prost_struct_to_json,
 };
 use crate::proto as pb;
 use crate::proto::open_engine_server::{OpenEngine, OpenEngineServer};
@@ -745,6 +745,135 @@ async fn generate_without_routing_leaves_dp_rank_unset() {
     );
 
     engine.cleanup().await.unwrap();
+}
+
+// ============================================================================
+// Media forwarding (build_generate_request)
+// ============================================================================
+
+fn request_with_media(map: MultimodalDataMap) -> PreprocessedRequest {
+    let mut req = request(Some(16));
+    req.multi_modal_data = Some(map);
+    req
+}
+
+/// Build a `MultimodalData::Url` (the parsed-`url::Url` variant) via serde, so
+/// the test exercises the real typed variant without pulling the `url` crate
+/// into the sidecar's deliberately lean dependency set.
+fn url_media(s: &str) -> MultimodalData {
+    serde_json::from_value(serde_json::json!({ "Url": s })).expect("parse MultimodalData::Url")
+}
+
+/// Synthesize a `MultimodalData::Decoded` (the RDMA-descriptor variant) via
+/// serde. Its inner `RdmaMediaDataDescriptor` fields are `pub(crate)` to
+/// `dynamo-llm`, so the sidecar test crate cannot build one with struct
+/// literal syntax — deserialization is the only route. The exact payload is
+/// irrelevant: `build_media` rejects on the variant alone, before reading any
+/// field.
+fn decoded_media() -> MultimodalData {
+    serde_json::from_value(serde_json::json!({
+        "Decoded": {
+            "nixl_metadata": "",
+            "nixl_descriptor": { "addr": 0, "size": 0, "mem_type": "Dram", "device_id": 0 },
+            "shape": [1, 1, 1],
+            "dtype": "UINT8",
+            "metadata": null,
+        }
+    }))
+    .expect("synthesize MultimodalData::Decoded")
+}
+
+#[test]
+fn build_media_passes_through_http_url_as_url_source() {
+    let map = MultimodalDataMap::from([(
+        "image_url".to_string(),
+        vec![url_media("http://example.com/cat.png")],
+    )]);
+    let req = build_generate_request(&request_with_media(map), "req-1", false).unwrap();
+
+    assert_eq!(req.media.len(), 1);
+    let item = &req.media[0];
+    assert_eq!(item.modality, pb::Modality::Image as i32);
+    assert_eq!(
+        item.source,
+        Some(pb::media_item::Source::Url(
+            "http://example.com/cat.png".to_string()
+        ))
+    );
+}
+
+#[test]
+fn build_media_passes_through_data_uri_as_data_uri_source() {
+    // A `data:` string — whether it arrives as a parsed `Url` or a `RawUrl`
+    // string — must land on the `data_uri` source so the engine decodes it
+    // rather than trying to fetch it over the network.
+    let data_uri = "data:image/png;base64,AAAA";
+    let map = MultimodalDataMap::from([(
+        "image_url".to_string(),
+        vec![MultimodalData::RawUrl(data_uri.to_string())],
+    )]);
+    let req = build_generate_request(&request_with_media(map), "req-2", false).unwrap();
+
+    assert_eq!(req.media.len(), 1);
+    assert_eq!(
+        req.media[0].source,
+        Some(pb::media_item::Source::DataUri(data_uri.to_string()))
+    );
+}
+
+#[test]
+fn build_media_maps_modality_from_map_key() {
+    let map = MultimodalDataMap::from([
+        (
+            "image_url".to_string(),
+            vec![MultimodalData::RawUrl("http://h/a.png".to_string())],
+        ),
+        (
+            "video_url".to_string(),
+            vec![MultimodalData::RawUrl("http://h/b.mp4".to_string())],
+        ),
+        (
+            "audio_url".to_string(),
+            vec![MultimodalData::RawUrl("http://h/c.wav".to_string())],
+        ),
+    ]);
+    let req = build_generate_request(&request_with_media(map), "req-3", false).unwrap();
+
+    // Emitted in fixed modality order: image, then video, then audio.
+    let modalities: Vec<i32> = req.media.iter().map(|m| m.modality).collect();
+    assert_eq!(
+        modalities,
+        vec![
+            pb::Modality::Image as i32,
+            pb::Modality::Video as i32,
+            pb::Modality::Audio as i32,
+        ]
+    );
+}
+
+#[test]
+fn build_media_is_empty_for_text_only_request() {
+    let req = build_generate_request(&request(Some(8)), "req-4", false).unwrap();
+    assert!(req.media.is_empty());
+}
+
+#[test]
+fn build_media_rejects_decoded_rdma_descriptor() {
+    // Fail-closed: the sidecar has no NIXL agent to dereference a pre-decoded
+    // descriptor, so a request carrying one must error rather than silently
+    // drop the media and degrade to a text request.
+    let map = MultimodalDataMap::from([("image_url".to_string(), vec![decoded_media()])]);
+    let err = build_generate_request(&request_with_media(map), "req-5", false).unwrap_err();
+
+    assert_eq!(
+        err.error_type(),
+        ErrorType::Backend(BackendError::InvalidArgument)
+    );
+    assert!(
+        err.message().contains("media_decoder"),
+        "error should point operators at URL-passthrough mode, got: {}",
+        err.message()
+    );
 }
 
 #[test]

@@ -32,7 +32,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use dynamo_backend_common::{
     AsyncEngineContext, DisaggregationMode, DynamoError, EngineConfig, GenerateContext,
-    HEALTH_CHECK_KEY, KvEventSource, LLMEngine, LLMEngineOutput, LLMEngineOutputExt,
+    HEALTH_CHECK_KEY, KvEventSource, LLMEngine, LLMEngineOutput, LLMEngineOutputExt, MultimodalData,
     PreprocessedRequest, WorkerConfig, usage,
 };
 use futures::stream::BoxStream;
@@ -215,7 +215,7 @@ impl LLMEngine for VllmSidecarEngine {
 
         let is_prefill = self.disaggregation_mode.is_prefill();
         let prompt_len = request.token_ids.len() as u32;
-        let grpc_req = build_generate_request(&request, ctx.id(), is_prefill);
+        let grpc_req = build_generate_request(&request, ctx.id(), is_prefill)?;
         let cancel = self.cancel.clone();
 
         Ok(Box::pin(async_stream::stream! {
@@ -525,11 +525,11 @@ fn build_engine_config(discovery: &Discovery) -> EngineConfig {
 // Request building + terminal mapping
 // ============================================================================
 
-fn build_generate_request(
+pub(crate) fn build_generate_request(
     request: &PreprocessedRequest,
     request_id: &str,
     is_prefill: bool,
-) -> pb::GenerateRequest {
+) -> Result<pb::GenerateRequest, DynamoError> {
     let sampling = &request.sampling_options;
     // Prefill only needs to populate the KV cache for the prompt: cap to one
     // token regardless of the client's request.
@@ -589,7 +589,9 @@ fn build_generate_request(
     // never populated by the router.
     let data_parallel_rank = request.routing.as_ref().and_then(|r| r.dp_rank);
 
-    pb::GenerateRequest {
+    let media = build_media(request)?;
+
+    Ok(pb::GenerateRequest {
         request_id: request_id.to_string(),
         model: request.model.clone(),
         input: Some(pb::generate_request::Input::TokenIds(pb::TokenIds {
@@ -598,10 +600,74 @@ fn build_generate_request(
         sampling: Some(proto_sampling),
         stop,
         stream: true,
+        media,
         data_parallel_rank,
         kv_session,
         metadata: Default::default(),
+    })
+}
+
+/// Map a media-map key (`image_url`/`video_url`/`audio_url`) to its proto
+/// modality. Unknown keys fall back to `Unspecified`, which the engine treats
+/// as image.
+fn modality_for_key(key: &str) -> pb::Modality {
+    match key {
+        "image_url" => pb::Modality::Image,
+        "video_url" => pb::Modality::Video,
+        "audio_url" => pb::Modality::Audio,
+        _ => pb::Modality::Unspecified,
     }
+}
+
+/// A URL / `data:` string becomes a `data_uri` source when it is a data URI,
+/// otherwise a plain `url` source the engine fetches.
+fn media_source_from_str(s: &str) -> pb::media_item::Source {
+    if s.starts_with("data:") {
+        pb::media_item::Source::DataUri(s.to_string())
+    } else {
+        pb::media_item::Source::Url(s.to_string())
+    }
+}
+
+/// Build the proto `media` list from the request's multimodal map.
+///
+/// The sidecar runs the frontend in URL-passthrough mode (`media_decoder:
+/// null`), so each item is a URL or `data:` URI the engine fetches and
+/// preprocesses. A pre-decoded RDMA descriptor (`MultimodalData::Decoded`) is
+/// rejected fail-closed: the sidecar has no NIXL agent to dereference it.
+///
+/// Items are emitted in a fixed modality order (image, then video, then audio)
+/// so the i-th item aligns with the i-th placeholder marker for single-modality
+/// prompts.
+fn build_media(request: &PreprocessedRequest) -> Result<Vec<pb::MediaItem>, DynamoError> {
+    let Some(map) = request.multi_modal_data.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let mut media = Vec::new();
+    for key in ["image_url", "video_url", "audio_url"] {
+        let Some(items) = map.get(key) else { continue };
+        let modality = modality_for_key(key);
+        for item in items {
+            let source = match item {
+                MultimodalData::Url(u) => media_source_from_str(u.as_str()),
+                MultimodalData::RawUrl(s) => media_source_from_str(s),
+                MultimodalData::Decoded(_) => {
+                    return Err(client::invalid_arg(
+                        "vllm-sidecar received a pre-decoded RDMA media descriptor; the \
+                         sidecar has no NIXL agent to dereference it. Run the frontend in \
+                         URL-passthrough mode (set the model's media_decoder to null).",
+                    ));
+                }
+            };
+            media.push(pb::MediaItem {
+                modality: modality as i32,
+                source: Some(source),
+                mime_type: String::new(),
+                uuid: String::new(),
+            });
+        }
+    }
+    Ok(media)
 }
 
 fn finish_output(
