@@ -15,7 +15,8 @@ use std::time::Duration;
 
 use dynamo_backend_common::{
     BackendError, DisaggregationMode, ErrorType, FinishReason, GenerateContext, LLMEngine,
-    LLMEngineOutput, PrefillResult, PreprocessedRequest, SamplingOptions, StopConditions,
+    LLMEngineOutput, PrefillResult, PreprocessedRequest, RoutingHints, SamplingOptions,
+    StopConditions,
 };
 use dynamo_runtime::engine::AsyncEngineContext;
 use dynamo_runtime::pipeline::{AsyncEngineContextProvider, Context};
@@ -64,6 +65,9 @@ struct FakeOpenEngine {
     /// Captures the `kv_session` of the most recent `Generate` request so the
     /// decode round-trip test can assert the handoff was lifted onto the wire.
     last_kv_session: Arc<Mutex<Option<pb::KvSessionRef>>>,
+    /// Captures the `data_parallel_rank` of the most recent `Generate` request
+    /// so the KV-routing test can assert the router's forced rank is forwarded.
+    last_dp_rank: Arc<Mutex<Option<u32>>>,
 }
 
 #[tonic::async_trait]
@@ -79,6 +83,7 @@ impl OpenEngine for FakeOpenEngine {
     ) -> Result<Response<Self::GenerateStream>, Status> {
         let req = request.into_inner();
         *self.last_kv_session.lock().unwrap() = req.kv_session.clone();
+        *self.last_dp_rank.lock().unwrap() = req.data_parallel_rank;
         let request_id = req.request_id;
         let cfg = self.cfg.clone();
 
@@ -283,6 +288,7 @@ struct FakeHandle {
     endpoint: String,
     abort_count: Arc<AtomicUsize>,
     last_kv_session: Arc<Mutex<Option<pb::KvSessionRef>>>,
+    last_dp_rank: Arc<Mutex<Option<u32>>>,
 }
 
 /// Bind a fake OpenEngine server to an ephemeral port on a dedicated runtime
@@ -290,10 +296,12 @@ struct FakeHandle {
 fn spawn_fake_engine(cfg: FakeConfig) -> FakeHandle {
     let abort_count = Arc::new(AtomicUsize::new(0));
     let last_kv_session = Arc::new(Mutex::new(None));
+    let last_dp_rank = Arc::new(Mutex::new(None));
     let (tx, rx) = std::sync::mpsc::channel();
 
     let svc_abort = abort_count.clone();
     let svc_kv = last_kv_session.clone();
+    let svc_dp = last_dp_rank.clone();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -310,6 +318,7 @@ fn spawn_fake_engine(cfg: FakeConfig) -> FakeHandle {
                 cfg,
                 abort_count: svc_abort,
                 last_kv_session: svc_kv,
+                last_dp_rank: svc_dp,
             };
             tonic::transport::Server::builder()
                 .add_service(OpenEngineServer::new(svc))
@@ -324,6 +333,7 @@ fn spawn_fake_engine(cfg: FakeConfig) -> FakeHandle {
         endpoint: format!("http://{addr}"),
         abort_count,
         last_kv_session,
+        last_dp_rank,
     }
 }
 
@@ -686,6 +696,53 @@ async fn decode_lifts_prefill_result_onto_kv_session() {
     );
     assert_eq!(attrs["remote_engine_id"], "engine-fake");
     assert_eq!(attrs["remote_port"], serde_json::json!(20097));
+
+    engine.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn generate_forwards_router_forced_dp_rank() {
+    let handle = spawn_fake_engine(FakeConfig::default());
+    let engine = engine_for(&handle, DisaggregationMode::Aggregated);
+    engine.start(0).await.unwrap();
+
+    let mut req = request(Some(4));
+    req.routing = Some(RoutingHints {
+        dp_rank: Some(3),
+        ..Default::default()
+    });
+    let stream = engine
+        .generate(req, gen_ctx(fresh_ctx()))
+        .await
+        .expect("stream");
+    let _ = collect_ok(stream).await;
+
+    assert_eq!(
+        *handle.last_dp_rank.lock().unwrap(),
+        Some(3),
+        "the router's forced dp_rank must be forwarded on the OpenEngine request"
+    );
+
+    engine.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn generate_without_routing_leaves_dp_rank_unset() {
+    let handle = spawn_fake_engine(FakeConfig::default());
+    let engine = engine_for(&handle, DisaggregationMode::Aggregated);
+    engine.start(0).await.unwrap();
+
+    let stream = engine
+        .generate(request(Some(4)), gen_ctx(fresh_ctx()))
+        .await
+        .expect("stream");
+    let _ = collect_ok(stream).await;
+
+    assert_eq!(
+        *handle.last_dp_rank.lock().unwrap(),
+        None,
+        "with no routing hint the engine selects its own rank (field stays unset)"
+    );
 
     engine.cleanup().await.unwrap();
 }

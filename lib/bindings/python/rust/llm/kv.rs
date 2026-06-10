@@ -269,6 +269,11 @@ impl KvEventPublisher {
         let source_config = zmq_endpoint.map(|ep| KvEventSourceConfig::Zmq {
             endpoint: ep,
             topic: zmq_topic.unwrap_or_default(),
+            // In-process callers may multiplex ranks on a shared port (e.g. the
+            // KV-event consolidator), so the wire `data_parallel_rank` stays
+            // authoritative here. Each in-process worker also has its own
+            // worker_id, so rank separation does not depend on this.
+            authoritative_dp_rank: None,
         });
 
         if kv_block_size == 0 {

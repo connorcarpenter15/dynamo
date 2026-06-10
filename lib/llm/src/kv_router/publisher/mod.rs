@@ -67,7 +67,20 @@ fn create_kv_stream_name(component: &Component, subject: &str) -> String {
 /// Configure the source of KV events.
 /// Currently, only ZMQ is supported.
 pub enum KvEventSourceConfig {
-    Zmq { endpoint: String, topic: String },
+    Zmq {
+        endpoint: String,
+        topic: String,
+        /// Rank this socket is *bound* to, when the subscriber knows it
+        /// authoritatively (one ZMQ publisher per dp_rank). When `Some`, the
+        /// listener keys events by this value instead of the per-batch
+        /// `data_parallel_rank` on the wire. Use this when the source binding
+        /// is the source of truth and the engine's wire `data_parallel_rank`
+        /// is unreliable (e.g. an internal-DP engine that publishes one socket
+        /// per rank but stamps a constant wire rank). Leave `None` for
+        /// multiplexed sources (e.g. a shared consolidator port) where the
+        /// wire `data_parallel_rank` is the only way to tell ranks apart.
+        authoritative_dp_rank: Option<DpRank>,
+    },
 }
 
 enum KvEventSource {
@@ -87,7 +100,11 @@ impl KvEventSource {
         next_event_id: Arc<AtomicU64>,
     ) -> Result<Self> {
         match source_config {
-            KvEventSourceConfig::Zmq { endpoint, topic } => {
+            KvEventSourceConfig::Zmq {
+                endpoint,
+                topic,
+                authoritative_dp_rank,
+            } => {
                 let zmq_handle = component
                     .drt()
                     .runtime()
@@ -96,6 +113,7 @@ impl KvEventSource {
                         endpoint,
                         topic,
                         worker_id,
+                        authoritative_dp_rank,
                         tx,
                         cancellation_token.clone(),
                         kv_block_size,

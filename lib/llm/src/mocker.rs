@@ -317,6 +317,7 @@ impl MockEngine {
                             let source_config = Some(KvEventSourceConfig::Zmq {
                                 endpoint: format!("tcp://127.0.0.1:{zmq_port}"),
                                 topic: String::new(),
+                                authoritative_dp_rank: None,
                             });
                             match KvEventPublisher::new_with_local_indexer(
                                 comp.clone(),

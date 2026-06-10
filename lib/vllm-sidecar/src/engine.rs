@@ -551,6 +551,7 @@ fn build_generate_request(
             .filter(|v| *v > 0)
             .map(|v| v as u64)
             .unwrap_or(0),
+        ignore_eos: request.stop_conditions.ignore_eos.unwrap_or(false),
     };
 
     let mut stop = Vec::new();
@@ -576,6 +577,18 @@ fn build_generate_request(
         .as_ref()
         .map(|pr| disagg_json_to_kv_session(&pr.disaggregated_params, request_id));
 
+    // Forward the KV router's forced DP-rank decision so the engine pins this
+    // request to the rank that holds its prefix. Without it, vLLM internal-DP
+    // load-balances and scatters the prefix across ranks, so a child block's
+    // parent lands under a different rank → `parent_block_not_found` in the
+    // indexer. The sidecar advertises one KV-event source per *engine-local*
+    // rank (`GetKvEventSources`), so the router indexes — and decides — in the
+    // engine-local rank space; the value is forwarded as-is. The in-process
+    // backend reads the same `routing.dp_rank` for both prefill and decode
+    // (`dynamo.common.backend.dp_rank.forced_dp_rank`); `prefill_dp_rank` is
+    // never populated by the router.
+    let data_parallel_rank = request.routing.as_ref().and_then(|r| r.dp_rank);
+
     pb::GenerateRequest {
         request_id: request_id.to_string(),
         model: request.model.clone(),
@@ -585,6 +598,7 @@ fn build_generate_request(
         sampling: Some(proto_sampling),
         stop,
         stream: true,
+        data_parallel_rank,
         kv_session,
         metadata: Default::default(),
     }

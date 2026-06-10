@@ -18,6 +18,7 @@ pub(super) async fn start_zmq_listener(
     zmq_endpoint: String,
     zmq_topic: String,
     worker_id: WorkerId,
+    authoritative_dp_rank: Option<DpRank>,
     tx: mpsc::UnboundedSender<PlacementEvent>,
     cancellation_token: CancellationToken,
     kv_block_size: u32,
@@ -94,15 +95,22 @@ pub(super) async fn start_zmq_listener(
                     continue;
                 };
 
+                let wire_dp_rank = batch.data_parallel_rank.unwrap_or(0).cast_unsigned();
+                // Prefer the rank this socket is bound to. Some engines (e.g.
+                // internal-DP) publish one socket per rank yet stamp a constant
+                // wire `data_parallel_rank`; trusting the wire would collapse
+                // every rank into one `(worker_id, dp_rank)` index entry. The
+                // binding is authoritative when known.
+                let dp_rank = authoritative_dp_rank.unwrap_or(wire_dp_rank);
+
                 tracing::trace!(
-                    "ZMQ listener on {} received batch with {} events (engine_seq={}, dp_rank={})",
+                    "ZMQ listener on {} received batch with {} events (engine_seq={}, wire_dp_rank={}, dp_rank={})",
                     zmq_endpoint,
                     batch.events.len(),
                     engine_seq,
-                    batch.data_parallel_rank.unwrap_or(0)
+                    wire_dp_rank,
+                    dp_rank
                 );
-
-                let dp_rank = batch.data_parallel_rank.unwrap_or(0).cast_unsigned();
                 for raw_event in batch.events {
                     let event_type = raw_event.event_type_label();
                     if let Some(metrics) = &metrics {
