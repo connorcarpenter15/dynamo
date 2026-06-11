@@ -341,12 +341,14 @@ fn spawn_fake_engine(cfg: FakeConfig) -> FakeHandle {
 // Test helpers
 // ============================================================================
 
-/// Short, test-friendly timeouts: fail fast instead of hanging.
+/// Short, test-friendly timeouts: fail fast instead of hanging. Uses a 2-conn
+/// pool so the round-robin / multi-connection `start()` path is exercised.
 fn test_transport() -> TransportConfig {
     TransportConfig {
         connect_timeout: Duration::from_secs(5),
         poll_interval: Duration::from_millis(50),
         deadline: Duration::from_secs(10),
+        connections: 2,
     }
 }
 

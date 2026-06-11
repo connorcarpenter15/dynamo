@@ -4,9 +4,15 @@
 //! Thin OpenEngine v1 gRPC client: connect-with-backoff, two-RPC discovery,
 //! and error mapping into [`DynamoError`].
 //!
-//! The generated tonic [`Client`] is cheap to clone (the underlying
-//! [`Channel`] multiplexes over one HTTP/2 connection), so the engine stores a
-//! single client and clones it per call.
+//! A single tonic [`Channel`] multiplexes every concurrent stream over **one**
+//! HTTP/2 connection — one socket, one codec task. Under overhead-bound load
+//! (low/zero per-token engine compute, high concurrency) that one codec task
+//! becomes the throughput ceiling: streams queue behind it, latency grows
+//! unbounded, and requests start timing out. [`Pool`] sidesteps this by holding
+//! several independent [`Channel`]s and round-robining streaming calls across
+//! them, so concurrent requests spread over multiple sockets + codec tasks.
+
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use dynamo_backend_common::{BackendError, DynamoError, ErrorType};
 use tokio::time::Instant;
@@ -58,6 +64,56 @@ async fn try_connect_once(uri: &str, cfg: &TransportConfig) -> Result<Client, St
         .connect_timeout(cfg.connect_timeout);
     let channel = endpoint.connect().await.map_err(|e| e.to_string())?;
     Ok(OpenEngineClient::new(channel))
+}
+
+/// A fixed-size pool of independent OpenEngine connections.
+///
+/// Each [`Client`] wraps its own tonic [`Channel`] — its own HTTP/2 connection,
+/// socket, and codec task on both ends. Streaming `generate` calls are
+/// round-robined via [`stream_client`](Pool::stream_client) so concurrent
+/// requests are not all serialized through a single connection. Low-frequency
+/// control RPCs (discovery / health / abort / drain / kv-event-sources) use a
+/// stable connection via [`control_client`](Pool::control_client).
+pub struct Pool {
+    clients: Vec<Client>,
+    next: AtomicUsize,
+}
+
+impl Pool {
+    /// Dial `size` (clamped to ≥1) independent connections to `uri`. Every
+    /// connection uses the same connect-with-backoff budget; the first blocks
+    /// until the engine is reachable, the rest then connect against the now-up
+    /// server (typically on their first attempt).
+    pub async fn connect(
+        uri: &str,
+        cfg: &TransportConfig,
+        size: usize,
+    ) -> Result<Self, DynamoError> {
+        let size = size.max(1);
+        let mut clients = Vec::with_capacity(size);
+        for _ in 0..size {
+            clients.push(connect(uri, cfg).await?);
+        }
+        Ok(Self { clients, next: AtomicUsize::new(0) })
+    }
+
+    /// Number of connections in the pool (always ≥ 1).
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
+        self.clients.len()
+    }
+
+    /// Round-robin a client for a streaming `generate` call. The returned
+    /// [`Client`] is a cheap clone sharing one of the pool's connections.
+    pub fn stream_client(&self) -> Client {
+        let i = self.next.fetch_add(1, Ordering::Relaxed) % self.clients.len();
+        self.clients[i].clone()
+    }
+
+    /// A stable client (the first connection) for low-frequency control RPCs.
+    pub fn control_client(&self) -> Client {
+        self.clients[0].clone()
+    }
 }
 
 /// Fetch engine + model metadata in one shot.

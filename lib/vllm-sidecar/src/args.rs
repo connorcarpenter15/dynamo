@@ -31,6 +31,16 @@ pub struct Args {
     #[arg(long, env = "OPENENGINE_ENDPOINT")]
     pub openengine_endpoint: String,
 
+    /// Number of independent gRPC connections to open to the engine.
+    ///
+    /// Streaming `generate` requests are round-robined across the pool so
+    /// concurrent load is spread over multiple HTTP/2 connections rather than
+    /// funneled through one connection's serialized frame processing (the
+    /// overhead-bound throughput/stability bottleneck). This is a transport
+    /// knob, not discovery — the value is not engine-reported.
+    #[arg(long, env = "OPENENGINE_CONNECTIONS", default_value_t = 8)]
+    pub openengine_connections: usize,
+
     /// Dynamo namespace for discovery routing.
     #[arg(long, env = "DYN_NAMESPACE", default_value = "dynamo")]
     pub namespace: String,
@@ -68,6 +78,7 @@ impl Args {
             connect_timeout: Duration::from_secs(self.connect_timeout_secs),
             poll_interval: Duration::from_secs(self.health_poll_interval_secs.max(1)),
             deadline: Duration::from_secs(self.health_deadline_secs),
+            connections: self.openengine_connections.max(1),
         }
     }
 }
@@ -81,6 +92,9 @@ pub struct TransportConfig {
     pub poll_interval: Duration,
     /// Total budget for "become reachable" / "become ready".
     pub deadline: Duration,
+    /// Size of the `generate` connection pool opened in `start()`. Bootstrap
+    /// discovery always uses a single throwaway connection regardless.
+    pub connections: usize,
 }
 
 impl Default for TransportConfig {
@@ -89,6 +103,7 @@ impl Default for TransportConfig {
             connect_timeout: Duration::from_secs(30),
             poll_interval: Duration::from_secs(2),
             deadline: Duration::from_secs(300),
+            connections: 1,
         }
     }
 }

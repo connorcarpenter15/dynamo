@@ -41,7 +41,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::args::{Args, TransportConfig, normalize_endpoint};
-use crate::client::{self, Client, Discovery};
+use crate::client::{self, Client, Discovery, Pool};
 use crate::proto as pb;
 
 /// A Dynamo backend that proxies inference to a vLLM OpenEngine server.
@@ -53,8 +53,9 @@ pub struct VllmSidecarEngine {
     /// Role discovered at bootstrap; drives `generate()` dispatch and is
     /// re-validated against the live engine in `start()`.
     disaggregation_mode: DisaggregationMode,
-    /// Set once in `start()`. Cloned per call (cheap; shares the connection).
-    client: OnceCell<Client>,
+    /// Connection pool, set once in `start()`. Streaming calls round-robin
+    /// across it; control RPCs use its stable connection.
+    pool: OnceCell<Pool>,
     /// Cancels in-flight `generate()` streams on `cleanup()`.
     cancel: CancellationToken,
 }
@@ -71,7 +72,7 @@ impl VllmSidecarEngine {
             endpoint: endpoint.into(),
             transport,
             disaggregation_mode,
-            client: OnceCell::new(),
+            pool: OnceCell::new(),
             cancel: CancellationToken::new(),
         }
     }
@@ -160,13 +161,15 @@ impl VllmSidecarEngine {
 #[async_trait]
 impl LLMEngine for VllmSidecarEngine {
     async fn start(&self, _worker_id: u64) -> Result<EngineConfig, DynamoError> {
-        if self.client.initialized() {
+        if self.pool.initialized() {
             return Err(client::engine_shutdown("vllm sidecar already started"));
         }
 
-        let mut client = client::connect(&self.endpoint, &self.transport).await?;
-        self.await_ready(&mut client).await?;
-        let discovery = client::discover(&mut client).await?;
+        let pool =
+            Pool::connect(&self.endpoint, &self.transport, self.transport.connections).await?;
+        let mut control = pool.control_client();
+        self.await_ready(&mut control).await?;
+        let discovery = client::discover(&mut control).await?;
 
         // The role is the engine's authoritative `kv_role`; it must not have
         // flipped between bootstrap and now (that would mean the worker
@@ -179,8 +182,9 @@ impl LLMEngine for VllmSidecarEngine {
             )));
         }
 
-        self.client
-            .set(client)
+        let pool_size = pool.len();
+        self.pool
+            .set(pool)
             .map_err(|_| client::engine_shutdown("vllm sidecar already started"))?;
 
         let config = build_engine_config(&discovery);
@@ -188,6 +192,7 @@ impl LLMEngine for VllmSidecarEngine {
             model = %config.model,
             context_length = ?config.context_length,
             kv_cache_block_size = ?config.kv_cache_block_size,
+            connections = pool_size,
             "vllm sidecar started"
         );
         Ok(config)
@@ -199,9 +204,9 @@ impl LLMEngine for VllmSidecarEngine {
         ctx: GenerateContext,
     ) -> Result<BoxStream<'static, Result<LLMEngineOutput, DynamoError>>, DynamoError> {
         let mut client = self
-            .client
+            .pool
             .get()
-            .cloned()
+            .map(Pool::stream_client)
             .ok_or_else(|| client::engine_shutdown("generate called before start"))?;
 
         // Decode workers must receive the prefill peer's handoff (forwarded by
@@ -333,7 +338,7 @@ impl LLMEngine for VllmSidecarEngine {
     }
 
     async fn abort(&self, ctx: Arc<dyn AsyncEngineContext>) {
-        let Some(mut client) = self.client.get().cloned() else {
+        let Some(mut client) = self.pool.get().map(Pool::control_client) else {
             return;
         };
         let req = pb::AbortRequest {
@@ -349,7 +354,7 @@ impl LLMEngine for VllmSidecarEngine {
     }
 
     async fn drain(&self) -> Result<(), DynamoError> {
-        let Some(mut client) = self.client.get().cloned() else {
+        let Some(mut client) = self.pool.get().map(Pool::control_client) else {
             return Ok(());
         };
         let deadline_ms = self
@@ -386,15 +391,15 @@ impl LLMEngine for VllmSidecarEngine {
     async fn cleanup(&self) -> Result<(), DynamoError> {
         // Cancels in-flight `generate()` streams (they select on this token).
         // Idempotent (CancellationToken::cancel) and null-safe (no resources
-        // to free on a partially-started engine; the Channel closes when the
-        // last client clone drops).
+        // to free on a partially-started engine; the pool's channels close when
+        // it drops).
         self.cancel.cancel();
         tracing::info!("vllm sidecar: cleanup invoked");
         Ok(())
     }
 
     async fn kv_event_sources(&self) -> Result<Vec<KvEventSource>, DynamoError> {
-        let Some(mut client) = self.client.get().cloned() else {
+        let Some(mut client) = self.pool.get().map(Pool::control_client) else {
             return Ok(Vec::new());
         };
         let resp = client
