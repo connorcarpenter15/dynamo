@@ -75,12 +75,16 @@ print_launch_banner "Launching Sidecar Disaggregated + KVBM on prefill (2 GPUs)"
 python -m dynamo.frontend &
 
 # 2. Decode engine: vllm-rs serve, kv_consumer, no KVBM. --enforce-eager is for
-# quick startup; drop it for production.
+# quick startup; drop it for production. --disable-hybrid-kv-cache-manager:
+# matches the prefill engine's KV-cache layout so the NIXL prefill->decode
+# handshake compat check passes (the prefill MUST disable HMA, see below; the
+# two instances must have identical KV-cache configs or NIXL refuses the xfer).
 CUDA_VISIBLE_DEVICES=0 vllm-rs serve "$MODEL" \
     --port "$DECODE_HTTP_PORT" \
     --openengine-host 127.0.0.1 \
     --openengine-port "$DECODE_OE_PORT" \
     --enforce-eager \
+    --disable-hybrid-kv-cache-manager \
     --kv-transfer-config "$DECODE_KV_TRANSFER_CONFIG" &
 
 # 3. Decode sidecar worker (endpoint-only; role discovered as DECODE).
@@ -90,11 +94,16 @@ DYN_SYSTEM_PORT=${DYN_SYSTEM_PORT1:-8081} \
 
 # 4. Prefill engine: vllm-rs serve, kv_producer, KVBM PdConnector + KV events.
 # The KVBM connector + consolidator run inside this engine's EngineCore.
+# --disable-hybrid-kv-cache-manager is REQUIRED for PdConnector: MultiConnector
+# asserts HMA is off unless every sub-connector supports it (DynamoConnector/KVBM
+# does not), and the auto-disable that fires for a *single* connector does NOT
+# fire through MultiConnector -> startup AssertionError without this flag.
 CUDA_VISIBLE_DEVICES=1 VLLM_NIXL_SIDE_CHANNEL_PORT=20097 vllm-rs serve "$MODEL" \
     --port "$PREFILL_HTTP_PORT" \
     --openengine-host 127.0.0.1 \
     --openengine-port "$PREFILL_OE_PORT" \
     --enforce-eager \
+    --disable-hybrid-kv-cache-manager \
     --kv-transfer-config "$PREFILL_KV_TRANSFER_CONFIG" \
     --kv-events-config "$PREFILL_KV_EVENTS_CONFIG" &
 
