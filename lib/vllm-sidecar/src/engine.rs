@@ -609,6 +609,9 @@ pub(crate) fn build_generate_request(
         data_parallel_rank,
         kv_session,
         metadata: Default::default(),
+        // openengine.v1 additive request fields. The vLLM sidecar does not map
+        // guided decoding / LoRA / logprobs yet (parallel to the SGLang work).
+        ..Default::default()
     })
 }
 
