@@ -35,7 +35,7 @@ pub use engine::{
     FinishReason, GenerateContext, HEALTH_CHECK_KEY, KvEventPublisher, KvEventSource, LLMEngine,
     LLMEngineOutput, LLMEngineOutputExt, Metrics, MetricsBindings, MetricsCtx, MultimodalData,
     MultimodalDataMap, OnPublisherReady, OnSnapshotPublisherReady, OutputOptions, PrefillResult,
-    PreprocessedRequest, RoutingHints, SamplingOptions, StopConditions, chunk, usage,
+    PreprocessedRequest, RoutingHints, SamplingOptions, StopConditions, TopLogprob, chunk, usage,
 };
 pub use error::{BackendError, DynamoError, ErrorType};
 pub use metrics::{ComponentGauges, EngineMetrics, LifecycleGauges};
