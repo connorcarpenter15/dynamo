@@ -272,7 +272,9 @@ impl OpenEngine for FakeOpenEngine {
         &self,
         _request: Request<pb::SubscribeKvEventsRequest>,
     ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
-        Err(Status::unimplemented("subscribe_kv_events not supported by fake"))
+        Err(Status::unimplemented(
+            "subscribe_kv_events not supported by fake",
+        ))
     }
 
     async fn subscribe_runtime_events(
@@ -285,13 +287,26 @@ impl OpenEngine for FakeOpenEngine {
     }
 }
 
-/// Handle to a running fake engine. Dropping it leaves the server thread
-/// running (daemonized) until the test process exits — fine for tests.
 struct FakeHandle {
     endpoint: String,
     abort_count: Arc<AtomicUsize>,
     last_kv_session: Arc<Mutex<Option<pb::KvSessionRef>>>,
     last_dp_rank: Arc<Mutex<Option<u32>>>,
+    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl FakeHandle {
+    fn shutdown(&mut self) {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+impl Drop for FakeHandle {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
 }
 
 /// Bind a fake OpenEngine server to an ephemeral port on a dedicated runtime
@@ -301,6 +316,7 @@ fn spawn_fake_engine(cfg: FakeConfig) -> FakeHandle {
     let last_kv_session = Arc::new(Mutex::new(None));
     let last_dp_rank = Arc::new(Mutex::new(None));
     let (tx, rx) = std::sync::mpsc::channel();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
     let svc_abort = abort_count.clone();
     let svc_kv = last_kv_session.clone();
@@ -325,7 +341,12 @@ fn spawn_fake_engine(cfg: FakeConfig) -> FakeHandle {
             };
             tonic::transport::Server::builder()
                 .add_service(OpenEngineServer::new(svc))
-                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    async move {
+                        let _ = shutdown_rx.await;
+                    },
+                )
                 .await
                 .expect("serve fake engine");
         });
@@ -337,6 +358,7 @@ fn spawn_fake_engine(cfg: FakeConfig) -> FakeHandle {
         abort_count,
         last_kv_session,
         last_dp_rank,
+        shutdown_tx: Some(shutdown_tx),
     }
 }
 
@@ -391,7 +413,10 @@ fn request_with_prefill_result(disagg: serde_json::Value) -> PreprocessedRequest
 }
 
 async fn collect_ok(
-    stream: futures::stream::BoxStream<'static, Result<LLMEngineOutput, dynamo_backend_common::DynamoError>>,
+    stream: futures::stream::BoxStream<
+        'static,
+        Result<LLMEngineOutput, dynamo_backend_common::DynamoError>,
+    >,
 ) -> Vec<LLMEngineOutput> {
     stream
         .collect::<Vec<_>>()
@@ -448,6 +473,26 @@ async fn double_start_is_rejected() {
         err.error_type(),
         ErrorType::Backend(BackendError::EngineShutdown)
     );
+    engine.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn watch_reports_engine_shutdown_when_health_endpoint_disappears() {
+    let mut handle = spawn_fake_engine(FakeConfig::default());
+    let engine = engine_for(&handle, DisaggregationMode::Aggregated);
+    engine.start(0).await.expect("start");
+
+    handle.shutdown();
+
+    let err = tokio::time::timeout(Duration::from_secs(3), engine.watch())
+        .await
+        .expect("watch should notice fake engine shutdown")
+        .expect_err("engine shutdown should fail watch");
+    assert_eq!(
+        err.error_type(),
+        ErrorType::Backend(BackendError::EngineShutdown)
+    );
+
     engine.cleanup().await.unwrap();
 }
 
@@ -535,12 +580,19 @@ async fn generate_observes_midstream_cancellation() {
         .expect("stream");
 
     let first = stream.next().await.expect("first item").expect("ok");
-    assert!(first.finish_reason.is_none(), "first item should be a token");
+    assert!(
+        first.finish_reason.is_none(),
+        "first item should be a token"
+    );
 
     ctx.stop_generating();
 
     let rest: Vec<_> = stream.collect().await;
-    let last = rest.last().expect("terminal after cancel").as_ref().unwrap();
+    let last = rest
+        .last()
+        .expect("terminal after cancel")
+        .as_ref()
+        .unwrap();
     assert!(
         matches!(last.finish_reason, Some(FinishReason::Cancelled)),
         "expected Cancelled terminal, got {:?}",
@@ -565,7 +617,10 @@ async fn generate_cancelled_before_first_poll_yields_cancelled() {
     let chunks = collect_ok(stream).await;
 
     assert_eq!(chunks.len(), 1, "pre-stopped request must short-circuit");
-    assert!(matches!(chunks[0].finish_reason, Some(FinishReason::Cancelled)));
+    assert!(matches!(
+        chunks[0].finish_reason,
+        Some(FinishReason::Cancelled)
+    ));
 
     engine.cleanup().await.unwrap();
 }
@@ -636,8 +691,14 @@ async fn prefill_emits_terminal_with_disaggregated_params() {
         .expect("prefill terminal must carry disaggregated_params");
     assert_eq!(params["transfer_backend"], "NixlConnector");
     // Typed params pass through as native JSON with types preserved.
-    assert_eq!(params["attributes_struct"]["remote_engine_id"], "engine-fake");
-    assert_eq!(params["attributes_struct"]["remote_block_ids"], serde_json::json!([1, 2, 3]));
+    assert_eq!(
+        params["attributes_struct"]["remote_engine_id"],
+        "engine-fake"
+    );
+    assert_eq!(
+        params["attributes_struct"]["remote_block_ids"],
+        serde_json::json!([1, 2, 3])
+    );
 
     engine.cleanup().await.unwrap();
 }
@@ -697,7 +758,10 @@ async fn decode_lifts_prefill_result_onto_kv_session() {
     assert_eq!(captured.dp_rank, 2);
     // The typed handoff is forwarded on attributes_struct with types intact.
     let attrs = prost_struct_to_json(
-        captured.attributes_struct.as_ref().expect("attributes_struct forwarded"),
+        captured
+            .attributes_struct
+            .as_ref()
+            .expect("attributes_struct forwarded"),
     );
     assert_eq!(attrs["remote_engine_id"], "engine-fake");
     assert_eq!(attrs["remote_port"], serde_json::json!(20097));
@@ -908,7 +972,10 @@ fn disagg_json_round_trips_through_kv_session() {
     assert_eq!(restored.transfer_backend, original.transfer_backend);
     assert_eq!(restored.dp_rank, original.dp_rank);
     let restored_attrs = prost_struct_to_json(
-        restored.attributes_struct.as_ref().expect("attributes_struct round-trips"),
+        restored
+            .attributes_struct
+            .as_ref()
+            .expect("attributes_struct round-trips"),
     );
     assert_eq!(restored_attrs, attrs);
 }

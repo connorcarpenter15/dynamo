@@ -693,7 +693,13 @@ impl Worker {
         let serve_fut = builder.start();
         tokio::pin!(serve_fut);
 
-        tokio::select! {
+        let engine_watch = {
+            let engine = self.engine.clone();
+            async move { engine.watch().await }
+        };
+        tokio::pin!(engine_watch);
+
+        let engine_watch_result = tokio::select! {
             biased;
             result = &mut serve_fut => {
                 match result {
@@ -713,13 +719,34 @@ impl Worker {
                         ));
                     }
                 }
+                None
             }
             _ = shutdown.cancelled() => {
                 tracing::info!("Received shutdown signal; running graceful orchestration");
+                None
             }
-        }
+            result = &mut engine_watch => {
+                match result.as_ref() {
+                    Ok(()) => {
+                        tracing::warn!(
+                            "Engine liveness watcher requested shutdown; running graceful orchestration"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "Engine liveness watcher failed; running graceful orchestration"
+                        );
+                    }
+                }
+                Some(result)
+            }
+        };
 
         self.orchestrator_steps(&endpoint).await;
+        if let Some(result) = engine_watch_result {
+            result?;
+        }
         Ok(())
     }
 

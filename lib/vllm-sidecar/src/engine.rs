@@ -32,12 +32,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use dynamo_backend_common::{
     AsyncEngineContext, DisaggregationMode, DynamoError, EngineConfig, GenerateContext,
-    HEALTH_CHECK_KEY, KvEventSource, LLMEngine, LLMEngineOutput, LLMEngineOutputExt, MultimodalData,
-    PreprocessedRequest, WorkerConfig, usage,
+    HEALTH_CHECK_KEY, KvEventSource, LLMEngine, LLMEngineOutput, LLMEngineOutputExt,
+    MultimodalData, PreprocessedRequest, WorkerConfig, usage,
 };
 use futures::stream::BoxStream;
-use tokio::sync::OnceCell;
-use tokio::time::Instant;
+use tokio::sync::{OnceCell, watch};
+use tokio::time::{Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
 use crate::args::{Args, TransportConfig, normalize_endpoint};
@@ -58,6 +58,8 @@ pub struct VllmSidecarEngine {
     pool: OnceCell<Pool>,
     /// Cancels in-flight `generate()` streams on `cleanup()`.
     cancel: CancellationToken,
+    /// Set when the out-of-process OpenEngine server can no longer serve.
+    fatal: watch::Sender<Option<String>>,
 }
 
 impl VllmSidecarEngine {
@@ -68,12 +70,14 @@ impl VllmSidecarEngine {
         transport: TransportConfig,
         disaggregation_mode: DisaggregationMode,
     ) -> Self {
+        let (fatal, _) = watch::channel(None);
         Self {
             endpoint: endpoint.into(),
             transport,
             disaggregation_mode,
             pool: OnceCell::new(),
             cancel: CancellationToken::new(),
+            fatal,
         }
     }
 
@@ -222,8 +226,18 @@ impl LLMEngine for VllmSidecarEngine {
         let prompt_len = request.token_ids.len() as u32;
         let grpc_req = build_generate_request(&request, ctx.id(), is_prefill)?;
         let cancel = self.cancel.clone();
+        let fatal = self.fatal.clone();
+        let current_failure = {
+            let fatal_rx = self.fatal.subscribe();
+            fatal_rx.borrow().as_ref().cloned()
+        };
 
         Ok(Box::pin(async_stream::stream! {
+            if let Some(reason) = current_failure {
+                yield Err(client::engine_shutdown(reason));
+                return;
+            }
+
             // Pre-flight: honour an already-cancelled request before opening the
             // RPC, so a stopped context never streams a single token.
             if ctx.is_stopped() || cancel.is_cancelled() {
@@ -244,7 +258,13 @@ impl LLMEngine for VllmSidecarEngine {
             let mut stream = match open {
                 Ok(resp) => resp.into_inner(),
                 Err(status) => {
-                    yield Err(client::status_to_dynamo("Generate", status));
+                    if is_fatal_generate_status(status.code()) {
+                        let err = fatal_generate_error(status);
+                        signal_engine_failure(&fatal, err.message().to_string());
+                        yield Err(err);
+                    } else {
+                        yield Err(client::status_to_dynamo("Generate", status));
+                    }
                     return;
                 }
             };
@@ -321,13 +341,21 @@ impl LLMEngine for VllmSidecarEngine {
                                 }
                             }
                             Ok(None) => {
-                                yield Err(client::engine_shutdown(
+                                let err = client::engine_shutdown(
                                     "engine closed the Generate stream before a terminal event",
-                                ));
+                                );
+                                signal_engine_failure(&fatal, err.message().to_string());
+                                yield Err(err);
                                 break;
                             }
                             Err(status) => {
-                                yield Err(client::status_to_dynamo("Generate", status));
+                                if is_fatal_generate_status(status.code()) {
+                                    let err = fatal_generate_error(status);
+                                    signal_engine_failure(&fatal, err.message().to_string());
+                                    yield Err(err);
+                                } else {
+                                    yield Err(client::status_to_dynamo("Generate", status));
+                                }
                                 break;
                             }
                         }
@@ -357,11 +385,7 @@ impl LLMEngine for VllmSidecarEngine {
         let Some(mut client) = self.pool.get().map(Pool::control_client) else {
             return Ok(());
         };
-        let deadline_ms = self
-            .transport
-            .deadline
-            .as_millis()
-            .min(u32::MAX as u128) as u32;
+        let deadline_ms = self.transport.deadline.as_millis().min(u32::MAX as u128) as u32;
         let req = pb::DrainRequest {
             stop_accepting_new_requests: true,
             deadline_ms,
@@ -386,6 +410,72 @@ impl LLMEngine for VllmSidecarEngine {
             }
         }
         Ok(())
+    }
+
+    async fn watch(&self) -> Result<(), DynamoError> {
+        let Some(pool) = self.pool.get() else {
+            return std::future::pending::<Result<(), DynamoError>>().await;
+        };
+
+        let mut fatal_rx = self.fatal.subscribe();
+        let mut client = pool.control_client();
+        let mut interval = tokio::time::interval(self.transport.poll_interval);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        loop {
+            if let Some(reason) = fatal_rx.borrow().as_ref().cloned() {
+                return Err(client::engine_shutdown(reason));
+            }
+
+            tokio::select! {
+                changed = fatal_rx.changed() => {
+                    if changed.is_err() {
+                        return Err(client::engine_shutdown(
+                            "vllm sidecar fatal watcher closed",
+                        ));
+                    }
+                }
+                _ = interval.tick() => {
+                    match tokio::time::timeout(
+                        self.transport.connect_timeout,
+                        client.health(health_request()),
+                    )
+                    .await
+                    {
+                        Ok(Ok(resp)) => {
+                            let state = pb::HealthState::try_from(resp.into_inner().state)
+                                .unwrap_or(pb::HealthState::Unspecified);
+                            match state {
+                                pb::HealthState::Ready => {}
+                                pb::HealthState::Draining => {
+                                    return Err(client::engine_shutdown(
+                                        "engine reported DRAINING after startup",
+                                    ));
+                                }
+                                other => {
+                                    return Err(client::engine_shutdown(format!(
+                                        "engine health state {other:?} after startup"
+                                    )));
+                                }
+                            }
+                        }
+                        Ok(Err(status)) => {
+                            return Err(client::engine_shutdown(format!(
+                                "OpenEngine Health RPC failed after startup: {} ({:?})",
+                                status.message(),
+                                status.code(),
+                            )));
+                        }
+                        Err(_) => {
+                            return Err(client::engine_shutdown(format!(
+                                "OpenEngine Health RPC timed out after {:?}",
+                                self.transport.connect_timeout,
+                            )));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     async fn cleanup(&self) -> Result<(), DynamoError> {
@@ -423,7 +513,11 @@ impl LLMEngine for VllmSidecarEngine {
                 // router cannot dial from another node.
                 let endpoint = match s.endpoint_addr {
                     Some(e) => {
-                        let proto = if e.protocol.is_empty() { "tcp" } else { &e.protocol };
+                        let proto = if e.protocol.is_empty() {
+                            "tcp"
+                        } else {
+                            &e.protocol
+                        };
                         format!("{proto}://{}:{}", e.host, e.port)
                     }
                     None => s.endpoint,
@@ -487,6 +581,38 @@ fn role_to_mode(role: pb::EngineRole) -> DisaggregationMode {
         pb::EngineRole::Decode => DisaggregationMode::Decode,
         _ => DisaggregationMode::Aggregated,
     }
+}
+
+fn health_request() -> pb::HealthRequest {
+    pb::HealthRequest {
+        include_inference_probe: false,
+        model: String::new(),
+        role: pb::EngineRole::Unspecified as i32,
+    }
+}
+
+fn signal_engine_failure(fatal: &watch::Sender<Option<String>>, reason: impl Into<String>) {
+    let _ = fatal.send(Some(reason.into()));
+}
+
+fn is_fatal_generate_status(code: tonic::Code) -> bool {
+    matches!(
+        code,
+        tonic::Code::Unknown
+            | tonic::Code::Unavailable
+            | tonic::Code::Internal
+            | tonic::Code::DeadlineExceeded
+            | tonic::Code::DataLoss
+            | tonic::Code::Aborted
+    )
+}
+
+fn fatal_generate_error(status: tonic::Status) -> DynamoError {
+    client::engine_shutdown(format!(
+        "OpenEngine Generate RPC failed: {} ({:?})",
+        status.message(),
+        status.code(),
+    ))
 }
 
 /// Prefill workers register under the `prefill` component (targeted by the
@@ -769,7 +895,10 @@ pub(crate) fn disagg_json_to_kv_session(
 pub(crate) fn json_to_prost_struct(value: &serde_json::Value) -> Option<prost_types::Struct> {
     match value {
         serde_json::Value::Object(map) => Some(prost_types::Struct {
-            fields: map.iter().map(|(k, v)| (k.clone(), json_to_prost_value(v))).collect(),
+            fields: map
+                .iter()
+                .map(|(k, v)| (k.clone(), json_to_prost_value(v)))
+                .collect(),
         }),
         _ => None,
     }
@@ -786,7 +915,10 @@ fn json_to_prost_value(value: &serde_json::Value) -> prost_types::Value {
             values: arr.iter().map(json_to_prost_value).collect(),
         }),
         serde_json::Value::Object(map) => Kind::StructValue(prost_types::Struct {
-            fields: map.iter().map(|(k, v)| (k.clone(), json_to_prost_value(v))).collect(),
+            fields: map
+                .iter()
+                .map(|(k, v)| (k.clone(), json_to_prost_value(v)))
+                .collect(),
         }),
     };
     prost_types::Value { kind: Some(kind) }
@@ -795,7 +927,10 @@ fn json_to_prost_value(value: &serde_json::Value) -> prost_types::Value {
 /// Convert a `google.protobuf.Struct` back into a JSON object.
 pub(crate) fn prost_struct_to_json(s: &prost_types::Struct) -> serde_json::Value {
     serde_json::Value::Object(
-        s.fields.iter().map(|(k, v)| (k.clone(), prost_value_to_json(v))).collect(),
+        s.fields
+            .iter()
+            .map(|(k, v)| (k.clone(), prost_value_to_json(v)))
+            .collect(),
     )
 }
 

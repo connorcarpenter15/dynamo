@@ -169,7 +169,8 @@ pub struct EngineConfig {
 ///   2. `start()` — start the engine, return `EngineConfig` metadata.
 ///   3. `generate()` — called for each request (concurrent calls expected).
 ///   4. `abort()` — called when a request is cancelled (optional, default no-op).
-///   5. `cleanup()` — called once on shutdown, release all resources.
+///   5. `watch()` — optionally request worker shutdown when external liveness fails.
+///   6. `cleanup()` — called once on shutdown, release all resources.
 #[async_trait]
 pub trait LLMEngine: Send + Sync + 'static {
     /// Start the engine and return registration metadata.
@@ -256,6 +257,20 @@ pub trait LLMEngine: Send + Sync + 'static {
     /// Failures are logged and swallowed; shutdown proceeds regardless.
     async fn drain(&self) -> Result<(), DynamoError> {
         Ok(())
+    }
+
+    /// Watch external engine liveness (optional, default never resolves).
+    ///
+    /// Implement this for sidecar-style backends whose serving process is
+    /// separate from the Dynamo worker. Returning from this future asks
+    /// [`Worker`](crate::Worker) to run the normal graceful shutdown path:
+    /// unregister from discovery, wait the grace period, drain, then cleanup.
+    ///
+    /// Use `Ok(())` for an intentional engine-side shutdown and `Err(_)` for a
+    /// failed liveness check. The worker still runs the graceful path in both
+    /// cases, then propagates an error result when one was returned here.
+    async fn watch(&self) -> Result<(), DynamoError> {
+        std::future::pending::<Result<(), DynamoError>>().await
     }
 
     /// Release all engine resources. Called exactly once.
