@@ -25,6 +25,7 @@ members = [
     "lib/backend-common",
     "lib/backend-common/examples/mocker",
     "lib/vllm-sidecar",
+    "lib/vllm-smg-sidecar",
     "lib/bindings/c",
     "lib/bindings/python/codegen",
 ]
