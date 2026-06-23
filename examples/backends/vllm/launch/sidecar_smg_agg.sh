@@ -56,12 +56,13 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
 MAX_CONCURRENT_SEQS="${MAX_CONCURRENT_SEQS:-2}"
 SMG_HOST="${SMG_HOST:-127.0.0.1}"
 SMG_PORT="${SMG_PORT:-50051}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 HTTP_PORT="${DYN_HTTP_PORT:-8000}"
 print_launch_banner "Launching SMG Sidecar Aggregated Serving (1 GPU)" "$MODEL" "$HTTP_PORT"
 
 # 1. Dynamo frontend (HTTP ingress)
-python -m dynamo.frontend &
+"$PYTHON_BIN" -m dynamo.frontend &
 
 # 2. Upstream vLLM engine with SMG gRPC enabled. The vLLM OpenAI HTTP server is
 # not started in this mode; --port is the gRPC listener port when --grpc is set.
