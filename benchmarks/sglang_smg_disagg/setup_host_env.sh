@@ -50,6 +50,29 @@ uv pip install --prerelease=allow \
     "smg-grpc-servicer[sglang]>=0.5.2"
 uv pip uninstall -y deep-gemm deep_gemm || true
 
+python - <<'PY'
+from pathlib import Path
+import site
+
+for site_dir in site.getsitepackages():
+    configurer = (
+        Path(site_dir)
+        / "sglang"
+        / "srt"
+        / "layers"
+        / "deep_gemm_wrapper"
+        / "configurer.py"
+    )
+    if not configurer.exists():
+        continue
+
+    text = configurer.read_text()
+    patched = text.replace("except ImportError:", "except Exception:", 1)
+    if patched != text:
+        configurer.write_text(patched)
+        print(f"Patched optional DeepGEMM import guard in {configurer}")
+PY
+
 if ! command -v protoc >/dev/null 2>&1; then
     PROTOC_VERSION="${PROTOC_VERSION:-27.3}"
     PROTOC_ROOT="$ROOT/protoc-$PROTOC_VERSION"
