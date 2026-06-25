@@ -86,7 +86,7 @@ for root in site.getsitepackages():
 PY
 )}"
 
-protoc --version
+"$PROTOC" --version
 echo "LIBCLANG_PATH=$LIBCLANG_PATH"
 
 cd "$DYNAMO_SRC/lib/bindings/python"
