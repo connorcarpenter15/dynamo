@@ -85,9 +85,11 @@ for root in site.getsitepackages():
         break
 PY
 )}"
+export BINDGEN_EXTRA_CLANG_ARGS="${BINDGEN_EXTRA_CLANG_ARGS:---sysroot=/ -I/usr/lib/gcc/x86_64-linux-gnu/13/include -I/usr/include/x86_64-linux-gnu -I/usr/include}"
 
 "$PROTOC" --version
 echo "LIBCLANG_PATH=$LIBCLANG_PATH"
+echo "BINDGEN_EXTRA_CLANG_ARGS=$BINDGEN_EXTRA_CLANG_ARGS"
 
 cd "$DYNAMO_SRC/lib/bindings/python"
 maturin develop --uv
