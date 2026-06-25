@@ -37,6 +37,10 @@ if ! command -v cargo >/dev/null 2>&1; then
     source "$CARGO_HOME/env"
 fi
 
+if ! rustc --version >/dev/null 2>&1; then
+    rustup default stable
+fi
+
 rustc --version
 cargo --version
 
