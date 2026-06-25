@@ -46,7 +46,48 @@ cargo --version
 
 uv pip install --prerelease=allow \
     aiperf \
+    libclang \
     "smg-grpc-servicer[sglang]>=0.5.2"
+
+if ! command -v protoc >/dev/null 2>&1; then
+    PROTOC_VERSION="${PROTOC_VERSION:-27.3}"
+    PROTOC_ROOT="$ROOT/protoc-$PROTOC_VERSION"
+    PROTOC_ZIP="$ROOT/protoc-$PROTOC_VERSION-linux-x86_64.zip"
+    if [[ ! -x "$PROTOC_ROOT/bin/protoc" ]]; then
+        curl -fsSL \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip" \
+            -o "$PROTOC_ZIP"
+        python - "$PROTOC_ZIP" "$PROTOC_ROOT" <<'PY'
+import sys
+import zipfile
+from pathlib import Path
+
+zip_path = Path(sys.argv[1])
+out_dir = Path(sys.argv[2])
+out_dir.mkdir(parents=True, exist_ok=True)
+with zipfile.ZipFile(zip_path) as zf:
+    zf.extractall(out_dir)
+PY
+        chmod +x "$PROTOC_ROOT/bin/protoc"
+    fi
+    export PROTOC="$PROTOC_ROOT/bin/protoc"
+fi
+
+export LIBCLANG_PATH="${LIBCLANG_PATH:-$(python - <<'PY'
+import glob
+import site
+from pathlib import Path
+
+for root in site.getsitepackages():
+    matches = glob.glob(str(Path(root) / "clang" / "native" / "libclang.so*"))
+    if matches:
+        print(str(Path(matches[0]).parent))
+        break
+PY
+)}"
+
+protoc --version
+echo "LIBCLANG_PATH=$LIBCLANG_PATH"
 
 cd "$DYNAMO_SRC/lib/bindings/python"
 maturin develop --uv
