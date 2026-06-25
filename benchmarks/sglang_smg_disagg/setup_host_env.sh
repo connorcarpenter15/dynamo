@@ -48,6 +48,7 @@ uv pip install --prerelease=allow \
     aiperf \
     libclang \
     "smg-grpc-servicer[sglang]>=0.5.2"
+uv pip uninstall -y deep-gemm deep_gemm || true
 
 if ! command -v protoc >/dev/null 2>&1; then
     PROTOC_VERSION="${PROTOC_VERSION:-27.3}"
