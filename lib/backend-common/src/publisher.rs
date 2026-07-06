@@ -56,7 +56,19 @@ fn setup_kv_publishers(
         let (source_config, on_ready) = match source {
             KvEventSource::Zmq {
                 endpoint, topic, ..
-            } => (Some(KvEventSourceConfig::Zmq { endpoint, topic }), None),
+            } => (
+                // Each engine ZMQ publisher serves exactly one dp_rank, declared
+                // in the source. Trust that binding over the wire
+                // `data_parallel_rank`: the sidecar runs one worker_id for all
+                // ranks, so a collapsed wire rank would pile every rank into one
+                // index entry (parent_block_not_found). See [`KvEventSourceConfig`].
+                Some(KvEventSourceConfig::Zmq {
+                    endpoint,
+                    topic,
+                    authoritative_dp_rank: Some(dp_rank),
+                }),
+                None,
+            ),
             KvEventSource::Push { on_ready, .. } => (None, Some(on_ready)),
         };
         let publisher = KvEventPublisher::new_with_local_indexer(

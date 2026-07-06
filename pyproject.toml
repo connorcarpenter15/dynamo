@@ -50,6 +50,9 @@ trtllm =[
 vllm = [
     "uvloop",
     "nixl[cu12]==1.1.0",
+    # OpenEngine sidecar client (dynamo.vllm.sidecar) talks to a native
+    # vllm serve process over gRPC; the in-process path does not need this.
+    "grpcio>=1.60.0",
     "vllm[flashinfer,runai,otel]==0.21.0",
     # vllm-omni is not part of ai-dynamo[vllm]: container builds inherit the
     # framework stack from vllm/vllm-openai, and pip/uv dependency resolution

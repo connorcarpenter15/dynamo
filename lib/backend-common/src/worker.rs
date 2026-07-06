@@ -598,8 +598,8 @@ impl Worker {
                 model_type,
                 self.config.model_input,
                 None,
-                Some(worker_type),
-                needs,
+                Some(worker_type.clone()),
+                needs.clone(),
             )
             .await
             .map_err(|e| {
@@ -609,6 +609,30 @@ impl Worker {
                 )
             })?;
         tracing::debug!("model registered with discovery");
+
+        let lora_serve_fut = if engine_config.supports_lora {
+            let controller = crate::lora::LoraController::new(
+                self.engine.clone(),
+                endpoint.clone(),
+                local_model.clone(),
+                model_type,
+                Some(worker_type),
+                needs,
+            )
+            .await?;
+            Some(
+                crate::lora::serve_endpoints(endpoint.component(), controller).map_err(
+                    |error| {
+                        err(
+                            ErrorType::Backend(BackendError::Unknown),
+                            format!("LoRA endpoints: {error}"),
+                        )
+                    },
+                )?,
+            )
+        } else {
+            None
+        };
 
         let served = resolve_served_name(&self.config, engine_config)
             .unwrap_or_else(|| engine_config.model.clone());
@@ -693,7 +717,21 @@ impl Worker {
         let serve_fut = builder.start();
         tokio::pin!(serve_fut);
 
-        tokio::select! {
+        let lora_serve = async move {
+            match lora_serve_fut {
+                Some(future) => future.await,
+                None => std::future::pending::<anyhow::Result<()>>().await,
+            }
+        };
+        tokio::pin!(lora_serve);
+
+        let engine_watch = {
+            let engine = self.engine.clone();
+            async move { engine.watch().await }
+        };
+        tokio::pin!(engine_watch);
+
+        let engine_watch_result = tokio::select! {
             biased;
             result = &mut serve_fut => {
                 match result {
@@ -713,13 +751,48 @@ impl Worker {
                         ));
                     }
                 }
+                None
+            }
+            result = &mut lora_serve => {
+                match result {
+                    Ok(()) => {
+                        tracing::warn!("LoRA control endpoints completed unexpectedly");
+                    }
+                    Err(error) => {
+                        return Err(err(
+                            ErrorType::Backend(BackendError::Unknown),
+                            format!("LoRA endpoint serve: {error}"),
+                        ));
+                    }
+                }
+                None
             }
             _ = shutdown.cancelled() => {
                 tracing::info!("Received shutdown signal; running graceful orchestration");
+                None
             }
-        }
+            result = &mut engine_watch => {
+                match result.as_ref() {
+                    Ok(()) => {
+                        tracing::warn!(
+                            "Engine liveness watcher requested shutdown; running graceful orchestration"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "Engine liveness watcher failed; running graceful orchestration"
+                        );
+                    }
+                }
+                Some(result)
+            }
+        };
 
         self.orchestrator_steps(&endpoint).await;
+        if let Some(result) = engine_watch_result {
+            result?;
+        }
         Ok(())
     }
 
