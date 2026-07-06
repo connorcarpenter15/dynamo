@@ -22,9 +22,10 @@ use tokio::sync::watch;
 use crate::error::DynamoError;
 
 pub use dynamo_llm::kv_router::publisher::KvEventPublisher;
-pub use dynamo_llm::protocols::common::llm_backend::LLMEngineOutput;
+pub use dynamo_llm::protocols::common::llm_backend::{LLMEngineOutput, TopLogprob};
 pub use dynamo_llm::protocols::common::preprocessor::{
-    BootstrapInfo, PrefillResult, PreprocessedRequest,
+    BootstrapInfo, MultimodalData, MultimodalDataMap, PrefillResult, PreprocessedRequest,
+    RoutingHints,
 };
 pub use dynamo_llm::protocols::common::{
     FinishReason, OutputOptions, SamplingOptions, StopConditions,
