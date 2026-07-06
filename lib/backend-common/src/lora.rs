@@ -52,6 +52,7 @@ struct ModelDiscovery {
 impl LoraDiscovery for ModelDiscovery {
     async fn attach(&self, adapter: &LoraAdapter) -> anyhow::Result<()> {
         let mut model = self.base_model.clone();
+        model.set_name(&adapter.name);
         if let Err(error) = model
             .attach(
                 &self.endpoint,

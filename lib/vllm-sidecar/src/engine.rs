@@ -56,6 +56,8 @@ pub struct VllmSidecarEngine {
     /// Connection pool, set once in `start()`. Streaming calls round-robin
     /// across it; control RPCs use its stable connection.
     pool: OnceCell<Pool>,
+    /// Primary model name accepted by the OpenEngine server.
+    served_model_name: OnceCell<String>,
     /// Cancels in-flight `generate()` streams on `cleanup()`.
     cancel: CancellationToken,
     /// Set when the out-of-process OpenEngine server can no longer serve.
@@ -76,6 +78,7 @@ impl VllmSidecarEngine {
             transport,
             disaggregation_mode,
             pool: OnceCell::new(),
+            served_model_name: OnceCell::new(),
             cancel: CancellationToken::new(),
             fatal,
         }
@@ -192,6 +195,13 @@ impl LLMEngine for VllmSidecarEngine {
             .map_err(|_| client::engine_shutdown("vllm sidecar already started"))?;
 
         let config = build_engine_config(&discovery);
+        let served_model_name = config
+            .served_model_name
+            .clone()
+            .unwrap_or_else(|| config.model.clone());
+        self.served_model_name
+            .set(served_model_name)
+            .map_err(|_| client::engine_shutdown("vllm sidecar model already initialized"))?;
         tracing::info!(
             model = %config.model,
             context_length = ?config.context_length,
@@ -224,7 +234,12 @@ impl LLMEngine for VllmSidecarEngine {
 
         let is_prefill = self.disaggregation_mode.is_prefill();
         let prompt_len = request.token_ids.len() as u32;
-        let grpc_req = build_generate_request(&request, ctx.id(), is_prefill)?;
+        let mut grpc_req = build_generate_request(&request, ctx.id(), is_prefill)?;
+        grpc_req.model = self
+            .served_model_name
+            .get()
+            .ok_or_else(|| client::engine_shutdown("generate called before model discovery"))?
+            .clone();
         let cancel = self.cancel.clone();
         let fatal = self.fatal.clone();
         let current_failure = {
