@@ -20,10 +20,12 @@ use tonic::transport::{Channel, Endpoint};
 
 use crate::args::TransportConfig;
 use crate::proto as pb;
+use crate::proto::lora_manager_client::LoraManagerClient;
 use crate::proto::open_engine_client::OpenEngineClient;
 
 /// Connected OpenEngine client over a tonic [`Channel`].
 pub type Client = OpenEngineClient<Channel>;
+pub type LoraClient = LoraManagerClient<Channel>;
 
 /// Engine discovery snapshot: identity / role / parallelism plus model caps.
 #[derive(Clone, Debug)]
@@ -39,6 +41,10 @@ pub struct Discovery {
 /// attempts are retried every [`TransportConfig::poll_interval`] until
 /// [`TransportConfig::deadline`].
 pub async fn connect(uri: &str, cfg: &TransportConfig) -> Result<Client, DynamoError> {
+    connect_channel(uri, cfg).await.map(OpenEngineClient::new)
+}
+
+async fn connect_channel(uri: &str, cfg: &TransportConfig) -> Result<Channel, DynamoError> {
     let deadline = Instant::now() + cfg.deadline;
     let mut last_err;
     loop {
@@ -58,12 +64,12 @@ pub async fn connect(uri: &str, cfg: &TransportConfig) -> Result<Client, DynamoE
     }
 }
 
-async fn try_connect_once(uri: &str, cfg: &TransportConfig) -> Result<Client, String> {
+async fn try_connect_once(uri: &str, cfg: &TransportConfig) -> Result<Channel, String> {
     let endpoint = Endpoint::from_shared(uri.to_string())
         .map_err(|e| format!("invalid endpoint `{uri}`: {e}"))?
         .connect_timeout(cfg.connect_timeout);
     let channel = endpoint.connect().await.map_err(|e| e.to_string())?;
-    Ok(OpenEngineClient::new(channel))
+    Ok(channel)
 }
 
 /// A fixed-size pool of independent OpenEngine connections.
@@ -75,7 +81,7 @@ async fn try_connect_once(uri: &str, cfg: &TransportConfig) -> Result<Client, St
 /// control RPCs (discovery / health / abort / drain / kv-event-sources) use a
 /// stable connection via [`control_client`](Pool::control_client).
 pub struct Pool {
-    clients: Vec<Client>,
+    channels: Vec<Channel>,
     next: AtomicUsize,
 }
 
@@ -90,29 +96,37 @@ impl Pool {
         size: usize,
     ) -> Result<Self, DynamoError> {
         let size = size.max(1);
-        let mut clients = Vec::with_capacity(size);
+        let mut channels = Vec::with_capacity(size);
         for _ in 0..size {
-            clients.push(connect(uri, cfg).await?);
+            channels.push(connect_channel(uri, cfg).await?);
         }
-        Ok(Self { clients, next: AtomicUsize::new(0) })
+        Ok(Self {
+            channels,
+            next: AtomicUsize::new(0),
+        })
     }
 
     /// Number of connections in the pool (always ≥ 1).
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
-        self.clients.len()
+        self.channels.len()
     }
 
     /// Round-robin a client for a streaming `generate` call. The returned
     /// [`Client`] is a cheap clone sharing one of the pool's connections.
     pub fn stream_client(&self) -> Client {
-        let i = self.next.fetch_add(1, Ordering::Relaxed) % self.clients.len();
-        self.clients[i].clone()
+        let i = self.next.fetch_add(1, Ordering::Relaxed) % self.channels.len();
+        OpenEngineClient::new(self.channels[i].clone())
     }
 
     /// A stable client (the first connection) for low-frequency control RPCs.
     pub fn control_client(&self) -> Client {
-        self.clients[0].clone()
+        OpenEngineClient::new(self.channels[0].clone())
+    }
+
+    /// A stable LoRA lifecycle client on the control connection.
+    pub fn lora_client(&self) -> LoraClient {
+        LoraManagerClient::new(self.channels[0].clone())
     }
 }
 
@@ -160,15 +174,20 @@ pub fn cannot_connect(msg: impl Into<String>) -> DynamoError {
 /// Map a tonic transport-level [`Status`](tonic::Status) to a typed error.
 pub fn status_to_dynamo(rpc: &str, status: tonic::Status) -> DynamoError {
     let kind = match status.code() {
-        tonic::Code::InvalidArgument | tonic::Code::NotFound | tonic::Code::OutOfRange => {
-            BackendError::InvalidArgument
-        }
+        tonic::Code::InvalidArgument
+        | tonic::Code::NotFound
+        | tonic::Code::OutOfRange
+        | tonic::Code::FailedPrecondition
+        | tonic::Code::AlreadyExists => BackendError::InvalidArgument,
         tonic::Code::Unavailable => BackendError::CannotConnect,
         tonic::Code::Cancelled => BackendError::Cancelled,
         tonic::Code::DeadlineExceeded => BackendError::ConnectionTimeout,
         _ => BackendError::Unknown,
     };
-    backend(kind, format!("{rpc}: {} ({:?})", status.message(), status.code()))
+    backend(
+        kind,
+        format!("{rpc}: {} ({:?})", status.message(), status.code()),
+    )
 }
 
 /// Map a structured [`pb::EngineError`] stream event to a typed error.

@@ -17,6 +17,7 @@ pub mod args;
 pub mod disagg;
 pub mod engine;
 pub mod error;
+mod lora;
 pub mod metrics;
 mod publisher;
 pub mod run;
@@ -33,9 +34,10 @@ pub use disagg::DisaggregationMode;
 pub use engine::{
     AsyncEngineContext, BootstrapInfo, CompletionUsage, ComponentSnapshot, EngineConfig,
     FinishReason, GenerateContext, HEALTH_CHECK_KEY, KvEventPublisher, KvEventSource, LLMEngine,
-    LLMEngineOutput, LLMEngineOutputExt, Metrics, MetricsBindings, MetricsCtx, MultimodalData,
-    MultimodalDataMap, OnPublisherReady, OnSnapshotPublisherReady, OutputOptions, PrefillResult,
-    PreprocessedRequest, RoutingHints, SamplingOptions, StopConditions, chunk, usage,
+    LLMEngineOutput, LLMEngineOutputExt, LoraAdapter, Metrics, MetricsBindings, MetricsCtx,
+    MultimodalData, MultimodalDataMap, OnPublisherReady, OnSnapshotPublisherReady, OutputOptions,
+    PrefillResult, PreprocessedRequest, RoutingHints, SamplingOptions, StopConditions, chunk,
+    usage,
 };
 pub use error::{BackendError, DynamoError, ErrorType};
 pub use metrics::{ComponentGauges, EngineMetrics, LifecycleGauges};

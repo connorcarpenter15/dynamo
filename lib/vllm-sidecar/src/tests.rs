@@ -8,6 +8,7 @@
 //! no real vLLM engine or GPU is involved. The fake is configurable by role so
 //! the same harness drives the aggregated, prefill, and decode paths.
 
+use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -15,8 +16,8 @@ use std::time::Duration;
 
 use dynamo_backend_common::{
     BackendError, DisaggregationMode, ErrorType, FinishReason, GenerateContext, LLMEngine,
-    LLMEngineOutput, MultimodalData, MultimodalDataMap, PrefillResult, PreprocessedRequest,
-    RoutingHints, SamplingOptions, StopConditions,
+    LLMEngineOutput, LoraAdapter, MultimodalData, MultimodalDataMap, PrefillResult,
+    PreprocessedRequest, RoutingHints, SamplingOptions, StopConditions,
 };
 use dynamo_runtime::engine::AsyncEngineContext;
 use dynamo_runtime::pipeline::{AsyncEngineContextProvider, Context};
@@ -29,6 +30,7 @@ use crate::engine::{
     kv_session_to_disagg_json, prost_struct_to_json,
 };
 use crate::proto as pb;
+use crate::proto::lora_manager_server::{LoraManager, LoraManagerServer};
 use crate::proto::open_engine_server::{OpenEngine, OpenEngineServer};
 
 // ============================================================================
@@ -45,6 +47,7 @@ struct FakeConfig {
     tokens: u32,
     model_id: String,
     served_model_name: String,
+    supports_lora: bool,
 }
 
 impl Default for FakeConfig {
@@ -54,6 +57,7 @@ impl Default for FakeConfig {
             tokens: 4,
             model_id: "fake-model".to_string(),
             served_model_name: "fake-served".to_string(),
+            supports_lora: false,
         }
     }
 }
@@ -68,6 +72,7 @@ struct FakeOpenEngine {
     /// Captures the `data_parallel_rank` of the most recent `Generate` request
     /// so the KV-routing test can assert the router's forced rank is forwarded.
     last_dp_rank: Arc<Mutex<Option<u32>>>,
+    last_lora_name: Arc<Mutex<Option<String>>>,
 }
 
 #[tonic::async_trait]
@@ -84,6 +89,7 @@ impl OpenEngine for FakeOpenEngine {
         let req = request.into_inner();
         *self.last_kv_session.lock().unwrap() = req.kv_session.clone();
         *self.last_dp_rank.lock().unwrap() = req.data_parallel_rank;
+        *self.last_lora_name.lock().unwrap() = Some(req.lora_name.clone());
         let request_id = req.request_id;
         let cfg = self.cfg.clone();
 
@@ -191,7 +197,7 @@ impl OpenEngine for FakeOpenEngine {
             supports_token_ids_input: true,
             supports_logprobs: true,
             supports_guided_decoding: false,
-            supports_lora: false,
+            supports_lora: self.cfg.supports_lora,
             supports_multimodal: false,
             reasoning_parser: String::new(),
             tool_call_parser: String::new(),
@@ -285,11 +291,65 @@ impl OpenEngine for FakeOpenEngine {
     }
 }
 
+struct FakeLoraManager {
+    enabled: bool,
+    adapters: Arc<Mutex<BTreeMap<String, pb::LoraAdapter>>>,
+}
+
+#[tonic::async_trait]
+impl LoraManager for FakeLoraManager {
+    async fn load_lora(
+        &self,
+        request: Request<pb::LoadLoraRequest>,
+    ) -> Result<Response<pb::LoadLoraResponse>, Status> {
+        if !self.enabled {
+            return Err(Status::failed_precondition("LoRA disabled"));
+        }
+        let adapter = request
+            .into_inner()
+            .adapter
+            .ok_or_else(|| Status::invalid_argument("adapter required"))?;
+        let mut adapters = self.adapters.lock().unwrap();
+        let already_loaded = adapters.get(&adapter.lora_name) == Some(&adapter);
+        adapters.insert(adapter.lora_name.clone(), adapter.clone());
+        Ok(Response::new(pb::LoadLoraResponse {
+            adapter: Some(adapter),
+            already_loaded,
+        }))
+    }
+
+    async fn unload_lora(
+        &self,
+        request: Request<pb::UnloadLoraRequest>,
+    ) -> Result<Response<pb::UnloadLoraResponse>, Status> {
+        let name = request.into_inner().lora_name;
+        let adapter = self
+            .adapters
+            .lock()
+            .unwrap()
+            .remove(&name)
+            .ok_or_else(|| Status::not_found("adapter not loaded"))?;
+        Ok(Response::new(pb::UnloadLoraResponse {
+            adapter: Some(adapter),
+        }))
+    }
+
+    async fn list_loras(
+        &self,
+        _request: Request<pb::ListLorasRequest>,
+    ) -> Result<Response<pb::ListLorasResponse>, Status> {
+        Ok(Response::new(pb::ListLorasResponse {
+            adapters: self.adapters.lock().unwrap().values().cloned().collect(),
+        }))
+    }
+}
+
 struct FakeHandle {
     endpoint: String,
     abort_count: Arc<AtomicUsize>,
     last_kv_session: Arc<Mutex<Option<pb::KvSessionRef>>>,
     last_dp_rank: Arc<Mutex<Option<u32>>>,
+    last_lora_name: Arc<Mutex<Option<String>>>,
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
@@ -313,12 +373,16 @@ fn spawn_fake_engine(cfg: FakeConfig) -> FakeHandle {
     let abort_count = Arc::new(AtomicUsize::new(0));
     let last_kv_session = Arc::new(Mutex::new(None));
     let last_dp_rank = Arc::new(Mutex::new(None));
+    let last_lora_name = Arc::new(Mutex::new(None));
+    let adapters = Arc::new(Mutex::new(BTreeMap::new()));
     let (tx, rx) = std::sync::mpsc::channel();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
     let svc_abort = abort_count.clone();
     let svc_kv = last_kv_session.clone();
     let svc_dp = last_dp_rank.clone();
+    let svc_lora_name = last_lora_name.clone();
+    let svc_adapters = adapters.clone();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -331,14 +395,20 @@ fn spawn_fake_engine(cfg: FakeConfig) -> FakeHandle {
             let addr = listener.local_addr().expect("local_addr");
             tx.send(addr).expect("send addr");
 
+            let lora_enabled = cfg.supports_lora;
             let svc = FakeOpenEngine {
                 cfg,
                 abort_count: svc_abort,
                 last_kv_session: svc_kv,
                 last_dp_rank: svc_dp,
+                last_lora_name: svc_lora_name,
             };
             tonic::transport::Server::builder()
                 .add_service(OpenEngineServer::new(svc))
+                .add_service(LoraManagerServer::new(FakeLoraManager {
+                    enabled: lora_enabled,
+                    adapters: svc_adapters,
+                }))
                 .serve_with_incoming_shutdown(
                     tokio_stream::wrappers::TcpListenerStream::new(listener),
                     async move {
@@ -356,6 +426,7 @@ fn spawn_fake_engine(cfg: FakeConfig) -> FakeHandle {
         abort_count,
         last_kv_session,
         last_dp_rank,
+        last_lora_name,
         shutdown_tx: Some(shutdown_tx),
     }
 }
@@ -648,6 +719,56 @@ async fn abort_before_start_is_noop() {
     // No client yet — must not panic or call the engine.
     engine.abort(fresh_ctx()).await;
     assert_eq!(handle.abort_count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn lora_lifecycle_proxies_to_openengine() {
+    let handle = spawn_fake_engine(FakeConfig {
+        supports_lora: true,
+        ..FakeConfig::default()
+    });
+    let engine = engine_for(&handle, DisaggregationMode::Aggregated);
+    let config = engine.start(0).await.unwrap();
+    assert!(config.supports_lora);
+
+    let adapter = LoraAdapter {
+        id: 17,
+        name: "adapter-a".to_string(),
+        path: "/tmp/adapter-a".to_string(),
+    };
+    assert_eq!(engine.load_lora(adapter.clone()).await.unwrap(), adapter);
+    assert_eq!(engine.list_loras().await.unwrap(), vec![adapter.clone()]);
+    assert_eq!(engine.unload_lora("adapter-a").await.unwrap(), adapter);
+    assert!(engine.list_loras().await.unwrap().is_empty());
+
+    engine.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn generate_forwards_lora_routing_hint() {
+    let handle = spawn_fake_engine(FakeConfig {
+        supports_lora: true,
+        ..FakeConfig::default()
+    });
+    let engine = engine_for(&handle, DisaggregationMode::Aggregated);
+    engine.start(0).await.unwrap();
+
+    let mut req = request(Some(1));
+    req.routing = Some(RoutingHints {
+        lora_name: Some("adapter-a".to_string()),
+        ..Default::default()
+    });
+    let stream = engine
+        .generate(req, gen_ctx(fresh_ctx()))
+        .await
+        .expect("stream");
+    let _ = collect_ok(stream).await;
+
+    assert_eq!(
+        handle.last_lora_name.lock().unwrap().as_deref(),
+        Some("adapter-a")
+    );
+    engine.cleanup().await.unwrap();
 }
 
 #[tokio::test]

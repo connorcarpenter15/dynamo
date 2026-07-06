@@ -598,8 +598,8 @@ impl Worker {
                 model_type,
                 self.config.model_input,
                 None,
-                Some(worker_type),
-                needs,
+                Some(worker_type.clone()),
+                needs.clone(),
             )
             .await
             .map_err(|e| {
@@ -609,6 +609,30 @@ impl Worker {
                 )
             })?;
         tracing::debug!("model registered with discovery");
+
+        let lora_serve_fut = if engine_config.supports_lora {
+            let controller = crate::lora::LoraController::new(
+                self.engine.clone(),
+                endpoint.clone(),
+                local_model.clone(),
+                model_type,
+                Some(worker_type),
+                needs,
+            )
+            .await?;
+            Some(
+                crate::lora::serve_endpoints(endpoint.component(), controller).map_err(
+                    |error| {
+                        err(
+                            ErrorType::Backend(BackendError::Unknown),
+                            format!("LoRA endpoints: {error}"),
+                        )
+                    },
+                )?,
+            )
+        } else {
+            None
+        };
 
         let served = resolve_served_name(&self.config, engine_config)
             .unwrap_or_else(|| engine_config.model.clone());
@@ -693,6 +717,14 @@ impl Worker {
         let serve_fut = builder.start();
         tokio::pin!(serve_fut);
 
+        let lora_serve = async move {
+            match lora_serve_fut {
+                Some(future) => future.await,
+                None => std::future::pending::<anyhow::Result<()>>().await,
+            }
+        };
+        tokio::pin!(lora_serve);
+
         let engine_watch = {
             let engine = self.engine.clone();
             async move { engine.watch().await }
@@ -716,6 +748,20 @@ impl Worker {
                         return Err(err(
                             ErrorType::Backend(BackendError::Unknown),
                             format!("serve: {e}"),
+                        ));
+                    }
+                }
+                None
+            }
+            result = &mut lora_serve => {
+                match result {
+                    Ok(()) => {
+                        tracing::warn!("LoRA control endpoints completed unexpectedly");
+                    }
+                    Err(error) => {
+                        return Err(err(
+                            ErrorType::Backend(BackendError::Unknown),
+                            format!("LoRA endpoint serve: {error}"),
                         ));
                     }
                 }

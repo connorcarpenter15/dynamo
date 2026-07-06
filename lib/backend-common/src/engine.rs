@@ -139,6 +139,8 @@ pub struct EngineConfig {
     /// multiple nodes). The router enumerates ranks
     /// `[data_parallel_start_rank, data_parallel_start_rank + data_parallel_size)`.
     pub data_parallel_start_rank: Option<u32>,
+    /// Whether the engine supports dynamic LoRA lifecycle and request selection.
+    pub supports_lora: bool,
     /// Bootstrap host this prefill worker advertises to decode peers.
     ///
     /// Only meaningful for backends with a Dynamo-level host/port
@@ -160,6 +162,14 @@ pub struct EngineConfig {
     pub bootstrap_port: Option<u16>,
     /// Engine-specific metadata copied into `ModelRuntimeConfig.runtime_data`.
     pub runtime_data: HashMap<String, serde_json::Value>,
+}
+
+/// Engine-readable LoRA descriptor used by the shared worker control plane.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoraAdapter {
+    pub id: i64,
+    pub name: String,
+    pub path: String,
 }
 
 /// Inference engine trait.
@@ -243,6 +253,21 @@ pub trait LLMEngine: Send + Sync + 'static {
     /// `abort` only for out-of-band notifications (e.g. telling a remote
     /// scheduler to cancel compute early).
     async fn abort(&self, _ctx: Arc<dyn AsyncEngineContext>) {}
+
+    /// Load and validate one LoRA adapter.
+    async fn load_lora(&self, _adapter: LoraAdapter) -> Result<LoraAdapter, DynamoError> {
+        Err(unsupported_lora())
+    }
+
+    /// Unload one logical LoRA adapter by name.
+    async fn unload_lora(&self, _name: &str) -> Result<LoraAdapter, DynamoError> {
+        Err(unsupported_lora())
+    }
+
+    /// List logical LoRA adapters available for request selection.
+    async fn list_loras(&self) -> Result<Vec<LoraAdapter>, DynamoError> {
+        Err(unsupported_lora())
+    }
 
     /// Drain in-flight engine work before shutdown (optional, default no-op).
     ///
@@ -339,6 +364,15 @@ pub trait LLMEngine: Send + Sync + 'static {
     async fn health_check_payload(&self) -> Result<Option<serde_json::Value>, DynamoError> {
         Ok(None)
     }
+}
+
+fn unsupported_lora() -> DynamoError {
+    DynamoError::builder()
+        .error_type(crate::error::ErrorType::Backend(
+            crate::error::BackendError::InvalidArgument,
+        ))
+        .message("engine does not support LoRA lifecycle")
+        .build()
 }
 
 /// Marker key stamped on canary payloads. Handlers may inspect it to branch

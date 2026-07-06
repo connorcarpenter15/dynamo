@@ -159,6 +159,7 @@ impl EngineConfig {
                 max_num_batched_tokens,
                 data_parallel_size,
                 data_parallel_start_rank,
+                supports_lora: false,
                 bootstrap_host,
                 bootstrap_port,
                 runtime_data,
@@ -649,6 +650,11 @@ impl LLMEngine for PyLLMEngine {
                 max_num_batched_tokens: opt_attr::<u64>(bound, "max_num_batched_tokens")?,
                 data_parallel_size: opt_attr::<u32>(bound, "data_parallel_size")?,
                 data_parallel_start_rank: opt_attr::<u32>(bound, "data_parallel_start_rank")?,
+                supports_lora: bound
+                    .getattr("supports_lora")
+                    .ok()
+                    .and_then(|value| value.extract::<bool>().ok())
+                    .unwrap_or(false),
                 bootstrap_host: opt_attr::<String>(bound, "bootstrap_host")?,
                 bootstrap_port: opt_attr::<u16>(bound, "bootstrap_port")?,
                 runtime_data: match bound.getattr("runtime_data") {

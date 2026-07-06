@@ -32,7 +32,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use dynamo_backend_common::{
     AsyncEngineContext, DisaggregationMode, DynamoError, EngineConfig, GenerateContext,
-    HEALTH_CHECK_KEY, KvEventSource, LLMEngine, LLMEngineOutput, LLMEngineOutputExt,
+    HEALTH_CHECK_KEY, KvEventSource, LLMEngine, LLMEngineOutput, LLMEngineOutputExt, LoraAdapter,
     MultimodalData, PreprocessedRequest, WorkerConfig, usage,
 };
 use futures::stream::BoxStream;
@@ -381,6 +381,60 @@ impl LLMEngine for VllmSidecarEngine {
         }
     }
 
+    async fn load_lora(&self, adapter: LoraAdapter) -> Result<LoraAdapter, DynamoError> {
+        let mut client = self
+            .pool
+            .get()
+            .map(Pool::lora_client)
+            .ok_or_else(|| client::engine_shutdown("load_lora called before start"))?;
+        let response = client
+            .load_lora(pb::LoadLoraRequest {
+                adapter: Some(pb::LoraAdapter {
+                    lora_id: adapter.id,
+                    lora_name: adapter.name,
+                    source_path: adapter.path,
+                }),
+            })
+            .await
+            .map_err(|status| client::status_to_dynamo("LoadLora", status))?
+            .into_inner()
+            .adapter
+            .ok_or_else(|| client::engine_shutdown("LoadLora returned no adapter"))?;
+        Ok(lora_from_proto(response))
+    }
+
+    async fn unload_lora(&self, name: &str) -> Result<LoraAdapter, DynamoError> {
+        let mut client = self
+            .pool
+            .get()
+            .map(Pool::lora_client)
+            .ok_or_else(|| client::engine_shutdown("unload_lora called before start"))?;
+        let response = client
+            .unload_lora(pb::UnloadLoraRequest {
+                lora_name: name.to_string(),
+            })
+            .await
+            .map_err(|status| client::status_to_dynamo("UnloadLora", status))?
+            .into_inner()
+            .adapter
+            .ok_or_else(|| client::engine_shutdown("UnloadLora returned no adapter"))?;
+        Ok(lora_from_proto(response))
+    }
+
+    async fn list_loras(&self) -> Result<Vec<LoraAdapter>, DynamoError> {
+        let mut client = self
+            .pool
+            .get()
+            .map(Pool::lora_client)
+            .ok_or_else(|| client::engine_shutdown("list_loras called before start"))?;
+        let response = client
+            .list_loras(pb::ListLorasRequest {})
+            .await
+            .map_err(|status| client::status_to_dynamo("ListLoras", status))?
+            .into_inner();
+        Ok(response.adapters.into_iter().map(lora_from_proto).collect())
+    }
+
     async fn drain(&self) -> Result<(), DynamoError> {
         let Some(mut client) = self.pool.get().map(Pool::control_client) else {
             return Ok(());
@@ -635,11 +689,20 @@ fn build_engine_config(discovery: &Discovery) -> EngineConfig {
             .then_some(parallelism.data_parallel_size),
         data_parallel_start_rank: (parallelism.data_parallel_start_rank != 0)
             .then_some(parallelism.data_parallel_start_rank),
+        supports_lora: model.supports_lora,
         // vLLM's KV transport (NixlConnector) is internal — no Dynamo-level
         // bootstrap host/port handshake.
         bootstrap_host: None,
         bootstrap_port: None,
         runtime_data: Default::default(),
+    }
+}
+
+fn lora_from_proto(adapter: pb::LoraAdapter) -> LoraAdapter {
+    LoraAdapter {
+        id: adapter.lora_id,
+        name: adapter.lora_name,
+        path: adapter.source_path,
     }
 }
 
@@ -712,6 +775,11 @@ pub(crate) fn build_generate_request(
     let data_parallel_rank = request.routing.as_ref().and_then(|r| r.dp_rank);
 
     let media = build_media(request)?;
+    let lora_name = request
+        .routing
+        .as_ref()
+        .and_then(|routing| routing.lora_name.clone())
+        .unwrap_or_default();
 
     Ok(pb::GenerateRequest {
         request_id: request_id.to_string(),
@@ -723,11 +791,12 @@ pub(crate) fn build_generate_request(
         stop,
         stream: true,
         media,
+        lora_name,
         data_parallel_rank,
         kv_session,
         metadata: Default::default(),
-        // openengine.v1 additive request fields. The vLLM sidecar does not map
-        // guided decoding / LoRA / logprobs yet (parallel to the SGLang work).
+        // openengine.v1 additive request fields. Guided decoding and logprobs
+        // are not mapped yet.
         ..Default::default()
     })
 }

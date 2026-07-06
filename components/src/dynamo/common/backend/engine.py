@@ -83,6 +83,7 @@ class EngineConfig:
     # multiple nodes. The router enumerates ranks
     # `[data_parallel_start_rank, data_parallel_start_rank + data_parallel_size)`.
     data_parallel_start_rank: Optional[int] = None
+    supports_lora: bool = False
     # Bootstrap address advertised to decode peers. Only meaningful for
     # backends with a Dynamo-level host/port handshake (today: SGLang).
     # Backends whose KV transport is internal — TRT-LLM, vLLM
