@@ -337,6 +337,38 @@ pub(crate) fn output_ids_to_u32(ids: &[i32]) -> Result<Vec<u32>, DynamoError> {
         .collect()
 }
 
+pub(crate) fn output_ids_delta(
+    ids: &[i32],
+    emitted: u32,
+    completion_tokens: Option<u32>,
+) -> Result<Vec<u32>, DynamoError> {
+    let output_ids = output_ids_to_u32(ids)?;
+    let Some(completion_tokens) = completion_tokens else {
+        return Ok(output_ids);
+    };
+    let raw_len = u32::try_from(output_ids.len())
+        .map_err(|_| client::protocol_error("SGLang output_ids length does not fit u32"))?;
+
+    // SGLang's default stream is cumulative, while
+    // --incremental-streaming-output emits disjoint deltas. The cumulative
+    // completion count identifies both forms without depending on token values.
+    if completion_tokens == raw_len {
+        let offset = usize::try_from(emitted)
+            .map_err(|_| client::protocol_error("emitted token count does not fit usize"))?;
+        return output_ids.get(offset..).map(Vec::from).ok_or_else(|| {
+            client::protocol_error(format!(
+                "SGLang cumulative output regressed from {emitted} to {completion_tokens} tokens"
+            ))
+        });
+    }
+    if emitted.checked_add(raw_len) == Some(completion_tokens) {
+        return Ok(output_ids);
+    }
+    Err(client::protocol_error(format!(
+        "SGLang output_ids length {raw_len} is inconsistent with {emitted} emitted and {completion_tokens} completed tokens"
+    )))
+}
+
 fn meta_value(meta: &HashMap<String, String>, key: &str) -> Option<Value> {
     meta.get(key)
         .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
@@ -550,7 +582,7 @@ mod tests {
 
     use super::{
         build_generate_request, disaggregated_params_to_json, engine_data_from_meta,
-        extract_logprobs, terminal_from_meta,
+        extract_logprobs, output_ids_delta, terminal_from_meta,
     };
 
     fn request() -> PreprocessedRequest {
@@ -659,6 +691,24 @@ mod tests {
         assert_eq!(logprobs.unwrap(), vec![-0.2]);
         assert_eq!(top.unwrap()[0][0].token_id, 11);
         assert_eq!(next, 2);
+    }
+
+    #[test]
+    fn output_ids_are_sliced_for_cumulative_and_preserved_for_incremental_streams() {
+        assert_eq!(
+            output_ids_delta(&[10, 11, 12], 2, Some(3)).unwrap(),
+            vec![12]
+        );
+        assert_eq!(
+            output_ids_delta(&[12, 13], 2, Some(4)).unwrap(),
+            vec![12, 13]
+        );
+        assert_eq!(
+            output_ids_delta(&[], 4, Some(4)).unwrap(),
+            Vec::<u32>::new()
+        );
+        assert!(output_ids_delta(&[12], 2, Some(9)).is_err());
+        assert!(output_ids_delta(&[10], 2, Some(1)).is_err());
     }
 
     #[test]

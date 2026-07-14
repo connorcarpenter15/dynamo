@@ -24,7 +24,7 @@ use crate::client::{self, Client, Discovery, Pool};
 use crate::proto as pb;
 use crate::protocol::{
     build_generate_request, disaggregated_params_to_json, engine_data_from_meta, extract_logprobs,
-    meta_u32, output_ids_to_u32, terminal_from_meta,
+    meta_u32, output_ids_delta, terminal_from_meta,
 };
 
 pub struct SglangSidecarEngine {
@@ -273,7 +273,11 @@ impl LLMEngine for SglangSidecarEngine {
                         if let Some(value) = meta_u32(&response.meta_info, "prompt_tokens") {
                             observed_prompt_tokens = value;
                         }
-                        let token_ids = match output_ids_to_u32(&response.output_ids) {
+                        let token_ids = match output_ids_delta(
+                            &response.output_ids,
+                            generated,
+                            meta_u32(&response.meta_info, "completion_tokens"),
+                        ) {
                             Ok(ids) => ids,
                             Err(err) => {
                                 yield Err(err);
