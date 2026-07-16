@@ -990,6 +990,23 @@ mod tests {
     }
 
     #[test]
+    fn request_maps_explicit_string_stop_visibility() {
+        for (include, expected) in [(Some(false), false), (Some(true), true)] {
+            let mut request = request();
+            request.stop_conditions.stop = Some(vec!["END".to_string()]);
+            request.sampling_options.include_stop_str_in_output = include;
+
+            let mapped =
+                build_generate_request(&request, "rid", DisaggregationMode::Aggregated, None, None)
+                    .unwrap();
+            let string_stops = mapped.sampling_params.unwrap().string_stops;
+            assert_eq!(string_stops.len(), 1);
+            assert_eq!(string_stops[0].value, "END");
+            assert_eq!(string_stops[0].include_in_output, expected);
+        }
+    }
+
+    #[test]
     fn request_maps_generation_limits_and_logprobs() {
         let mut request = request();
         request.stop_conditions.min_tokens = Some(8);

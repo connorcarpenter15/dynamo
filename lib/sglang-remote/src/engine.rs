@@ -325,6 +325,8 @@ impl LLMEngine for SglangRemoteEngine {
             logprobs = ?request.output_options.logprobs,
             prompt_logprobs = ?request.output_options.prompt_logprobs,
             priority = ?request.routing.as_ref().and_then(|routing| routing.priority),
+            include_stop_str_in_output = ?request.sampling_options.include_stop_str_in_output,
+            string_stops = ?request.stop_conditions.stop,
             "lowering request to SGLang gRPC"
         );
         let grpc_request = build_generate_request(
