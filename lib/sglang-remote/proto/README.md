@@ -12,7 +12,7 @@ matching `sglang` wheel as a build dependency, and compile the packaged proto
 instead.
 
 The contract is an exact copy from Connor Carpenter's SGLang fork commit
-[`024402b532779f90722c18517cafeb53511c7a93`](https://github.com/connorcarpenter15/sglang/blob/024402b532779f90722c18517cafeb53511c7a93/proto/sglang/runtime/v1/sglang.proto).
+[`44fd10a60d35d7cdff3749b996b47e41765bfdb0`](https://github.com/connorcarpenter15/sglang/blob/44fd10a60d35d7cdff3749b996b47e41765bfdb0/proto/sglang/runtime/v1/sglang.proto).
 Both files have SHA-256
 `23e16a9ee5e1eb0bcaabb0bb7fa6039b6d6ccb41ff0de2f571cc24fedd879806`.
 The adjacent `SCHEMA.sha256` is copied from the same commit and pins the

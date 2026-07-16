@@ -49,6 +49,8 @@ sha2 = "0.10"
 tonic = { version = "0.13.1" }
 
 [build-dependencies]
+prost-build = { version = "0.13.5" }
+protoc-bin-vendored = "3"
 tonic-build = { version = "0.13.1" }
 
 [dev-dependencies]
