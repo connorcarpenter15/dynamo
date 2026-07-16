@@ -5,15 +5,19 @@ SPDX-License-Identifier: Apache-2.0
 
 # Temporary SGLang gRPC contract
 
-This copy is temporary while Dynamo waits for SGLang to include
-`sglang/srt/grpc/sglang.proto` in a release wheel. Once the contract is
+This copy is temporary while Dynamo waits for SGLang to include the source
+`sglang/runtime/v1/sglang.proto` contract in a release wheel. Once the contract is
 available there, Dynamo should remove this directory, pin and install the
 matching `sglang` wheel as a build dependency, and compile the packaged proto
 instead.
 
-The contract was copied from SGLang commit
-[`cc7d6659fd68694797892d0d863b2549a5b61b69`](https://github.com/sgl-project/sglang/blob/cc7d6659fd68694797892d0d863b2549a5b61b69/proto/sglang/runtime/v1/sglang.proto).
-The upstream file's SHA-256 is
-`a2e14952ddb2b34b6e22cbbc4e76d76d70c44f2dbf087cb9918aed3399d9ef42`.
-The local file adds SPDX and temporary-copy comments and applies Dynamo's
-`clang-format` style; these changes do not alter the protobuf descriptor.
+The contract is an exact copy from Connor Carpenter's SGLang fork commit
+[`024402b532779f90722c18517cafeb53511c7a93`](https://github.com/connorcarpenter15/sglang/blob/024402b532779f90722c18517cafeb53511c7a93/proto/sglang/runtime/v1/sglang.proto).
+Both files have SHA-256
+`23e16a9ee5e1eb0bcaabb0bb7fa6039b6d6ccb41ff0de2f571cc24fedd879806`.
+The adjacent `SCHEMA.sha256` is copied from the same commit and pins the
+intentional v1 source, generated descriptor, and protocol-revision baseline.
+
+The generated descriptor hash is embedded in the sidecar and compared with
+`GetRuntimeInfo.descriptor_sha256` before the Dynamo worker registers. A mismatch
+is a startup error rather than a best-effort compatibility mode.
