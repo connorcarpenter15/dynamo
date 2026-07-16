@@ -967,6 +967,26 @@ mod tests {
     }
 
     #[test]
+    fn request_maps_generation_limits_and_logprobs() {
+        let mut request = request();
+        request.stop_conditions.min_tokens = Some(8);
+        request.stop_conditions.ignore_eos = Some(true);
+        request.output_options.logprobs = Some(2);
+
+        let mapped =
+            build_generate_request(&request, "rid", DisaggregationMode::Aggregated, None, None)
+                .unwrap();
+        let sampling = mapped.sampling_params.unwrap();
+        assert_eq!(sampling.max_new_tokens, Some(8));
+        assert_eq!(sampling.min_new_tokens, Some(8));
+        assert_eq!(sampling.ignore_eos, Some(true));
+
+        let logprobs = mapped.logprob_options.unwrap();
+        assert!(logprobs.return_logprobs);
+        assert_eq!(logprobs.top_logprobs, 2);
+    }
+
+    #[test]
     fn request_rejects_explicit_best_of_that_differs_from_n() {
         let mut request = request();
         request.sampling_options.n = Some(2);

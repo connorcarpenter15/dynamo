@@ -559,6 +559,50 @@ mod tests {
     }
 
     #[test]
+    fn test_generation_controls_propagate() {
+        let request_json = json!({
+            "model": "test-model",
+            "prompt": "Continue this list: one, two, three,",
+            "max_tokens": 8,
+            "min_tokens": 8,
+            "ignore_eos": true,
+            "temperature": 0.2,
+            "seed": 1234,
+            "n": 2,
+            "logprobs": 2,
+            "nvext": {"agent_hints": {"priority": 5}}
+        });
+        let request: NvCreateCompletionRequest =
+            serde_json::from_value(request_json).expect("deserialize completion request");
+
+        let stop_conditions = request
+            .extract_stop_conditions()
+            .expect("extract stop conditions");
+        assert_eq!(stop_conditions.max_tokens, Some(8));
+        assert_eq!(stop_conditions.min_tokens, Some(8));
+        assert_eq!(stop_conditions.ignore_eos, Some(true));
+
+        let output_options = request
+            .extract_output_options()
+            .expect("extract output options");
+        assert_eq!(output_options.logprobs, Some(2));
+
+        let sampling_options = request
+            .extract_sampling_options()
+            .expect("extract sampling options");
+        assert_eq!(sampling_options.n, Some(2));
+        assert_eq!(sampling_options.seed, Some(1234));
+        assert_eq!(
+            request
+                .nvext
+                .as_ref()
+                .and_then(|ext| ext.agent_hints.as_ref())
+                .and_then(|hints| hints.priority),
+            Some(5)
+        );
+    }
+
+    #[test]
     fn test_prompt_embeds_only() {
         // Create valid embeddings: > 100 bytes (PyTorch format)
         let valid_data = vec![0u8; 256];

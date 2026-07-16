@@ -292,6 +292,17 @@ impl LLMEngine for SglangRemoteEngine {
             .output_options
             .return_tokens_as_token_ids
             .unwrap_or(false);
+        tracing::debug!(
+            request_id = %ctx.id(),
+            max_tokens = ?request.stop_conditions.max_tokens,
+            min_tokens = ?request.stop_conditions.min_tokens,
+            ignore_eos = ?request.stop_conditions.ignore_eos,
+            choices = ?request.sampling_options.n,
+            logprobs = ?request.output_options.logprobs,
+            prompt_logprobs = ?request.output_options.prompt_logprobs,
+            priority = ?request.routing.as_ref().and_then(|routing| routing.priority),
+            "lowering request to SGLang gRPC"
+        );
         let grpc_request = build_generate_request(
             &request,
             ctx.id(),
