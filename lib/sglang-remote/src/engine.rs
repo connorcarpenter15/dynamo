@@ -446,14 +446,6 @@ impl LLMEngine for SglangRemoteEngine {
                         }
                         let delta_len = u32::try_from(response.delta_output_ids.len())
                             .unwrap_or(u32::MAX);
-                        tracing::debug!(
-                            request_id = %ctx.id(),
-                            choice,
-                            delta_output_ids = ?response.delta_output_ids,
-                            delta_text = ?response.delta_text,
-                            terminal = response.terminal.is_some(),
-                            "received SGLang gRPC stream chunk"
-                        );
                         let generated = generated_by_choice
                             .entry(choice)
                             .or_default();
@@ -477,15 +469,6 @@ impl LLMEngine for SglangRemoteEngine {
                         if is_terminal {
                             terminal_choices.insert(choice);
                         }
-                        tracing::debug!(
-                            request_id = %ctx.id(),
-                            choice,
-                            mapped_token_ids = ?mapped.token_ids,
-                            mapped_text = ?mapped.text,
-                            mapped_finish_reason = ?mapped.finish_reason,
-                            mapped_stop_reason = ?mapped.stop_reason,
-                            "mapped SGLang gRPC stream chunk"
-                        );
                         yield Ok(mapped);
                         if terminal_choices.len() == expected_choices as usize {
                             break;
