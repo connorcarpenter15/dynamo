@@ -252,7 +252,8 @@ fn validate_request(request: &PreprocessedRequest) -> Result<(), DynamoError> {
             "token_ids must not be empty unless prompt_embeds is provided",
         ));
     }
-    if request.sampling_options.best_of.unwrap_or(1) != request.sampling_options.n.unwrap_or(1) {
+    let n = request.sampling_options.n.unwrap_or(1);
+    if request.sampling_options.best_of.unwrap_or(n) != n {
         return Err(client::invalid_arg(
             "best_of is unsupported unless it equals n; SGLang does not implement beam-search selection",
         ));
@@ -939,7 +940,6 @@ mod tests {
         let mut request = request();
         request.sampling_options.seed = Some(42);
         request.sampling_options.n = Some(2);
-        request.sampling_options.best_of = Some(2);
         request.sampling_options.guided_decoding =
             Some(dynamo_backend_common::GuidedDecodingOptions::new(
                 None,
@@ -964,6 +964,20 @@ mod tests {
             sampling.guided_decoding.unwrap().constraint,
             Some(pb::guided_decoding::Constraint::Choice(_))
         ));
+    }
+
+    #[test]
+    fn request_rejects_explicit_best_of_that_differs_from_n() {
+        let mut request = request();
+        request.sampling_options.n = Some(2);
+        request.sampling_options.best_of = Some(3);
+
+        assert!(
+            build_generate_request(&request, "rid", DisaggregationMode::Aggregated, None, None)
+                .unwrap_err()
+                .to_string()
+                .contains("best_of is unsupported unless it equals n")
+        );
     }
 
     #[test]
