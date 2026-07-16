@@ -13,6 +13,7 @@ source "$SCRIPT_DIR/../../../common/gpu_utils.sh"
 source "$SCRIPT_DIR/../../../common/launch_utils.sh"
 
 MODEL="Qwen/Qwen3-0.6B"
+FRONTEND_DECODING=false
 EXTRA_ARGS=()
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -20,8 +21,12 @@ while [[ $# -gt 0 ]]; do
             MODEL="$2"
             shift 2
             ;;
+        --frontend-decoding)
+            FRONTEND_DECODING=true
+            shift
+            ;;
         -h|--help)
-            echo "Usage: $0 [--model-path <name>] [SGLang options...]"
+            echo "Usage: $0 [--model-path <name>] [--frontend-decoding] [SGLang options...]"
             exit 0
             ;;
         *)
@@ -50,8 +55,14 @@ python3 -m sglang.launch_server \
     $GPU_MEM_ARGS \
     "${EXTRA_ARGS[@]}" &
 
+SIDECAR_ARGS=()
+if [[ "${FRONTEND_DECODING}" == true ]]; then
+    SIDECAR_ARGS+=(--frontend-decoding)
+fi
+
 DYN_SYSTEM_PORT=${DYN_SYSTEM_PORT:-8081} \
     dynamo-sglang-remote \
-    --sglang-endpoint "${SGLANG_HOST}:${SGLANG_GRPC_PORT}" &
+    --sglang-endpoint "${SGLANG_HOST}:${SGLANG_GRPC_PORT}" \
+    "${SIDECAR_ARGS[@]}" &
 
 wait_any_exit

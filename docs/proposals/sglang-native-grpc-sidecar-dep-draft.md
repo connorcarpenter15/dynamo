@@ -40,7 +40,10 @@ considered a feature-preserving replacement.
   routing hashes, prompt embeddings, and disaggregated handoff.
 - Carry decoded media and prompt tensors inline for small payloads or through
   typed NIXL external-buffer descriptors. Retain source registrations until the
-  request terminates and propagate cancellation through gRPC cleanup.
+  request terminates and propagate cancellation through gRPC cleanup. The
+  sidecar's `--frontend-decoding` option publishes Dynamo's image decoder and
+  fetch policy on the model card so decoded image registrations reach SGLang
+  without a second fetch or decode.
 - Reuse Dynamo's LoRA downloader/cache. Serialize operations per adapter,
   publish topology-matching discovery cards, and roll back either SGLang or
   discovery state when the other side fails.

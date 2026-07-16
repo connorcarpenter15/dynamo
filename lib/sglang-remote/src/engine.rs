@@ -19,6 +19,8 @@ use tokio::sync::{Mutex, OnceCell};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+use dynamo_llm::preprocessor::media::{MediaDecoder, MediaFetcher};
+
 use crate::admin;
 use crate::args::{Args, TransportConfig, normalize_endpoint};
 use crate::client::{self, Client, Discovery, Pool};
@@ -91,6 +93,11 @@ impl SglangRemoteEngine {
                 "embedding and media runtimes must report the aggregated worker role",
             ));
         }
+        if args.frontend_decoding && discovery.runtime_kind != pb::RuntimeKind::Llm {
+            return Err(client::invalid_arg(
+                "--frontend-decoding is only valid for LLM multimodal runtimes",
+            ));
+        }
         let bootstrap_host = if disaggregation_mode.is_prefill() {
             resolve_bootstrap_host(args.bootstrap_host.as_deref(), &endpoint, &discovery)?
         } else {
@@ -125,6 +132,7 @@ impl SglangRemoteEngine {
             }
         };
         let lora_endpoint_types = endpoint_types.clone();
+        let (media_decoder, media_fetcher) = frontend_media_io(args.frontend_decoding);
         let config = WorkerConfig {
             namespace: args.namespace,
             component: component_for_mode(disaggregation_mode).to_string(),
@@ -137,6 +145,8 @@ impl SglangRemoteEngine {
             model_input,
             reasoning_parser: discovery.reasoning_parser.clone(),
             tool_call_parser: discovery.tool_call_parser.clone(),
+            media_decoder,
+            media_fetcher,
             ..Default::default()
         };
 
@@ -217,6 +227,20 @@ impl SglangRemoteEngine {
         }
         Ok(())
     }
+}
+
+fn frontend_media_io(enabled: bool) -> (Option<MediaDecoder>, Option<MediaFetcher>) {
+    enabled
+        .then(|| {
+            let decoder = MediaDecoder {
+                image: Some(Default::default()),
+                ..Default::default()
+            };
+            (decoder, MediaFetcher::from_env())
+        })
+        .map_or((None, None), |(decoder, fetcher)| {
+            (Some(decoder), Some(fetcher))
+        })
 }
 
 #[async_trait]
@@ -881,7 +905,7 @@ fn build_engine_config(
 
 #[cfg(test)]
 mod tests {
-    use super::{Discovery, resolve_bootstrap_host_with_local};
+    use super::{Discovery, frontend_media_io, resolve_bootstrap_host_with_local};
     use crate::proto as pb;
 
     fn discovery(bootstrap_host: Option<&str>) -> Discovery {
@@ -917,6 +941,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(host.as_deref(), Some("prefill.example"));
+    }
+
+    #[test]
+    fn frontend_decoding_advertises_image_transport() {
+        let (decoder, fetcher) = frontend_media_io(true);
+        assert!(decoder.and_then(|decoder| decoder.image).is_some());
+        assert!(fetcher.is_some());
+        let (decoder, fetcher) = frontend_media_io(false);
+        assert!(decoder.is_none());
+        assert!(fetcher.is_none());
     }
 
     #[test]

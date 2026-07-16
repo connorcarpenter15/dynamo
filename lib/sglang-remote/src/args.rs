@@ -44,6 +44,11 @@ pub struct Args {
     #[arg(long, env = "DYN_CUSTOM_JINJA_TEMPLATE")]
     pub custom_jinja_template: Option<PathBuf>,
 
+    /// Decode image inputs in Dynamo's Rust frontend and forward the decoded
+    /// tensor through NIXL instead of asking SGLang to fetch the source URL.
+    #[arg(long, env = "DYN_SGL_FRONTEND_DECODING", default_value_t = false)]
+    pub frontend_decoding: bool,
+
     /// Per-attempt connection timeout in seconds.
     #[arg(long, default_value_t = 30)]
     pub connect_timeout_secs: u64,
@@ -120,7 +125,21 @@ pub fn normalize_endpoint(raw: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_endpoint;
+    use clap::Parser;
+
+    use super::{Args, normalize_endpoint};
+
+    #[test]
+    fn parses_frontend_decoding_flag() {
+        let args = Args::try_parse_from([
+            "dynamo-sglang-remote",
+            "--sglang-endpoint",
+            "127.0.0.1:50051",
+            "--frontend-decoding",
+        ])
+        .unwrap();
+        assert!(args.frontend_decoding);
+    }
 
     #[test]
     fn normalizes_bare_and_grpc_endpoints() {

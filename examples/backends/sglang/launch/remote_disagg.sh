@@ -12,6 +12,7 @@ source "$SCRIPT_DIR/../../../common/gpu_utils.sh"
 source "$SCRIPT_DIR/../../../common/launch_utils.sh"
 
 MODEL="Qwen/Qwen3-0.6B"
+FRONTEND_DECODING=false
 EXTRA_ARGS=()
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -24,8 +25,12 @@ while [[ $# -gt 0 ]]; do
             MODEL="$2"
             shift 2
             ;;
+        --frontend-decoding)
+            FRONTEND_DECODING=true
+            shift
+            ;;
         -h|--help)
-            echo "Usage: $0 [--model-path <name>] [SGLang options...]"
+            echo "Usage: $0 [--model-path <name>] [--frontend-decoding] [SGLang options...]"
             echo
             echo "Set SGLANG_PYTHON to the Python executable containing the patched SGLang build."
             exit 0
@@ -81,15 +86,22 @@ CUDA_VISIBLE_DEVICES="$SGLANG_DECODE_GPU" \
     $GPU_MEM_ARGS \
     "${EXTRA_ARGS[@]}" &
 
+SIDECAR_ARGS=()
+if [[ "${FRONTEND_DECODING}" == true ]]; then
+    SIDECAR_ARGS+=(--frontend-decoding)
+fi
+
 OTEL_SERVICE_NAME=dynamo-worker-prefill \
 DYN_SYSTEM_PORT="${DYN_SYSTEM_PORT1:-8081}" \
     dynamo-sglang-remote \
     --sglang-endpoint "${SGLANG_HOST}:${SGLANG_PREFILL_GRPC_PORT}" \
-    --bootstrap-host "$SGLANG_BOOTSTRAP_HOST" &
+    --bootstrap-host "$SGLANG_BOOTSTRAP_HOST" \
+    "${SIDECAR_ARGS[@]}" &
 
 OTEL_SERVICE_NAME=dynamo-worker-decode \
 DYN_SYSTEM_PORT="${DYN_SYSTEM_PORT2:-8082}" \
     dynamo-sglang-remote \
-    --sglang-endpoint "${SGLANG_HOST}:${SGLANG_DECODE_GRPC_PORT}" &
+    --sglang-endpoint "${SGLANG_HOST}:${SGLANG_DECODE_GRPC_PORT}" \
+    "${SIDECAR_ARGS[@]}" &
 
 wait_any_exit
