@@ -4,7 +4,7 @@
 //! Debug-build stream validator.
 //!
 //! Wraps the engine's returned stream and panics on contract violations:
-//! - a chunk yielded after a terminal chunk (one carrying `finish_reason`)
+//! - a chunk yielded after a terminal chunk for the same choice
 //! - an Encode-mode non-cancelled terminal that lacks an
 //!   `encoder_result: Some(Value::Object(_))` payload (engines that build
 //!   the terminal via `LLMEngineOutput::stop()` instead of
@@ -22,24 +22,35 @@ use crate::disagg::DisaggregationMode;
 use crate::error::DynamoError;
 use dynamo_llm::protocols::common::FinishReason;
 use dynamo_llm::protocols::common::llm_backend::LLMEngineOutput;
+use dynamo_runtime::engine::AsyncEngineContext;
 use futures::StreamExt;
 use futures::stream::BoxStream;
+use std::collections::HashSet;
+use std::sync::Arc;
 
 pub(crate) fn wrap(
     stream: BoxStream<'static, Result<LLMEngineOutput, DynamoError>>,
     mode: DisaggregationMode,
+    expected_terminals: usize,
+    cancellation_ctx: Option<Arc<dyn AsyncEngineContext>>,
 ) -> BoxStream<'static, Result<LLMEngineOutput, DynamoError>> {
-    let mut terminal_seen = false;
+    let mut terminal_choices = HashSet::<u32>::new();
+    let mut stream_error_seen = false;
     Box::pin(async_stream::stream! {
         let mut inner = stream;
         while let Some(item) = inner.next().await {
-            assert!(
-                !terminal_seen,
-                "LLMEngine contract violation: item yielded after terminal item \
-                 (a chunk with finish_reason set, or an Err, must be the last item)"
-            );
+            assert!(!stream_error_seen, "LLMEngine contract violation: item yielded after Err");
             match &item {
                 Ok(chunk) if chunk.finish_reason.is_some() => {
+                    let choice = chunk.index.unwrap_or(0);
+                    assert!(
+                        choice < expected_terminals as u32,
+                        "LLMEngine contract violation: terminal choice {choice} is outside 0..{expected_terminals}"
+                    );
+                    assert!(
+                        terminal_choices.insert(choice),
+                        "LLMEngine contract violation: duplicate terminal for choice {choice}"
+                    );
                     // Encode-mode terminal rule: successful terminals MUST
                     // carry an object-shaped encoder_result. Cancelled is
                     // exempt because cancellation can land before the encoder
@@ -66,12 +77,31 @@ pub(crate) fn wrap(
                             chunk.encoder_result,
                         );
                     }
-                    terminal_seen = true;
                 }
-                Err(_) => terminal_seen = true,
-                _ => {}
+                Ok(chunk) => {
+                    let choice = chunk.index.unwrap_or(0);
+                    assert!(
+                        choice < expected_terminals as u32,
+                        "LLMEngine contract violation: choice {choice} is outside 0..{expected_terminals}"
+                    );
+                    assert!(
+                        !terminal_choices.contains(&choice),
+                        "LLMEngine contract violation: item yielded after terminal for the same choice"
+                    )
+                }
+                Err(_) => stream_error_seen = true,
             }
             yield item;
+        }
+        let cancelled = cancellation_ctx
+            .as_ref()
+            .is_some_and(|ctx| ctx.is_stopped() || ctx.is_killed());
+        if !stream_error_seen && !cancelled {
+            assert_eq!(
+                terminal_choices.len(),
+                expected_terminals,
+                "LLMEngine contract violation: stream ended with an incomplete set of choice terminals"
+            );
         }
     })
 }
@@ -103,6 +133,8 @@ mod tests {
                 LLMEngineOutput::length(),
             ]),
             DisaggregationMode::Aggregated,
+            1,
+            None,
         );
         let collected: Vec<_> = wrapped.collect().await;
         assert_eq!(collected.len(), 3);
@@ -113,6 +145,8 @@ mod tests {
         let wrapped = wrap(
             to_stream(vec![chunk::token(1), LLMEngineOutput::cancelled()]),
             DisaggregationMode::Aggregated,
+            1,
+            None,
         );
         let collected: Vec<_> = wrapped.collect().await;
         assert_eq!(collected.len(), 2);
@@ -123,17 +157,19 @@ mod tests {
     }
 
     #[tokio::test]
-    #[should_panic(expected = "item yielded after terminal item")]
+    #[should_panic(expected = "item yielded after terminal for the same choice")]
     async fn panics_on_chunk_after_terminal() {
         let wrapped = wrap(
             to_stream(vec![LLMEngineOutput::length(), chunk::token(2)]),
             DisaggregationMode::Aggregated,
+            1,
+            None,
         );
         let _collected: Vec<_> = wrapped.collect().await;
     }
 
     #[tokio::test]
-    #[should_panic(expected = "item yielded after terminal item")]
+    #[should_panic(expected = "item yielded after Err")]
     async fn panics_on_chunk_after_err() {
         let wrapped = wrap(
             to_stream_with_err(vec![
@@ -141,6 +177,8 @@ mod tests {
                 Ok(chunk::token(1)),
             ]),
             DisaggregationMode::Aggregated,
+            1,
+            None,
         );
         let _collected: Vec<_> = wrapped.collect().await;
     }
@@ -155,6 +193,8 @@ mod tests {
         let wrapped = wrap(
             to_stream(vec![LLMEngineOutput::stop()]),
             DisaggregationMode::Encode,
+            1,
+            None,
         );
         let _collected: Vec<_> = wrapped.collect().await;
     }
@@ -168,6 +208,8 @@ mod tests {
         let wrapped = wrap(
             to_stream(vec![LLMEngineOutput::encode_terminal(map)]),
             DisaggregationMode::Encode,
+            1,
+            None,
         );
         let collected: Vec<_> = wrapped.collect().await;
         assert_eq!(collected.len(), 1);
@@ -186,6 +228,8 @@ mod tests {
         let wrapped = wrap(
             to_stream(vec![LLMEngineOutput::cancelled()]),
             DisaggregationMode::Encode,
+            1,
+            None,
         );
         let collected: Vec<_> = wrapped.collect().await;
         assert_eq!(collected.len(), 1);
@@ -199,8 +243,27 @@ mod tests {
         let wrapped = wrap(
             to_stream(vec![LLMEngineOutput::stop()]),
             DisaggregationMode::Aggregated,
+            1,
+            None,
         );
         let collected: Vec<_> = wrapped.collect().await;
         assert_eq!(collected.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn independently_interleaved_choices_allow_one_terminal_each() {
+        let mut terminal_zero = LLMEngineOutput::stop();
+        terminal_zero.index = Some(0);
+        let mut choice_one = chunk::token(2);
+        choice_one.index = Some(1);
+        let mut terminal_one = LLMEngineOutput::length();
+        terminal_one.index = Some(1);
+        let wrapped = wrap(
+            to_stream(vec![choice_one, terminal_zero, terminal_one]),
+            DisaggregationMode::Aggregated,
+            2,
+            None,
+        );
+        assert_eq!(wrapped.collect::<Vec<_>>().await.len(), 3);
     }
 }
