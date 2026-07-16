@@ -664,7 +664,30 @@ pub(crate) fn map_generate_response(
         });
     }
     if let Some(logprobs) = response.logprobs.as_ref() {
+        if logprobs.output.len() != mapped.token_ids.len() {
+            return Err(client::protocol_error(format!(
+                "SGLang returned {} output logprobs for {} delta token IDs",
+                logprobs.output.len(),
+                mapped.token_ids.len()
+            )));
+        }
+        for (entry, token_id) in logprobs.output.iter().zip(&mapped.token_ids) {
+            let entry_token_id = u32::try_from(entry.token_id)
+                .map_err(|_| client::protocol_error("output-logprob token id does not fit u32"))?;
+            if entry_token_id != *token_id {
+                return Err(client::protocol_error(format!(
+                    "SGLang output-logprob token ID {entry_token_id} does not align with delta token ID {token_id}"
+                )));
+            }
+        }
         let (selected, top) = map_output_logprobs(&logprobs.output, return_tokens_as_ids)?;
+        mapped.tokens = Some(
+            logprobs
+                .output
+                .iter()
+                .map(|entry| entry.text.clone())
+                .collect(),
+        );
         mapped.log_probs = (!selected.is_empty()).then_some(selected);
         mapped.top_logprobs = (!top.is_empty()).then_some(top);
     }
@@ -1126,6 +1149,7 @@ mod tests {
         let log_probs = mapped.log_probs.unwrap();
         assert_eq!(log_probs.len(), 1);
         assert!((log_probs[0] + 0.2).abs() < 1e-6);
+        assert_eq!(mapped.tokens, Some(vec![Some("x".into())]));
         assert!(mapped.disaggregated_params.is_some());
         assert_eq!(
             mapped
@@ -1136,6 +1160,26 @@ mod tests {
                 .cached_tokens,
             Some(2)
         );
+    }
+
+    #[test]
+    fn response_rejects_misaligned_output_logprobs() {
+        let response = pb::GenerateResponse {
+            choice_index: 0,
+            delta_output_ids: vec![7],
+            logprobs: Some(pb::Logprobs {
+                output: vec![pb::TokenLogprob {
+                    logprob: -0.2,
+                    token_id: 8,
+                    text: Some("y".into()),
+                    top_logprobs: vec![],
+                }],
+                prompt: vec![],
+            }),
+            ..Default::default()
+        };
+        let error = map_generate_response(response, 0, 0, false).unwrap_err();
+        assert!(error.to_string().contains("does not align"));
     }
 
     #[test]
