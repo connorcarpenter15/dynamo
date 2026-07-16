@@ -12,9 +12,12 @@
 //! The crate never depends on `sglang` or any engine crate — only
 //! `dynamo-backend-common`, `tonic`/`prost`, `clap`, and tokio.
 
+mod admin;
 pub mod args;
 pub mod client;
 pub mod engine;
+mod lora;
+mod observability;
 pub mod proto;
 mod protocol;
 

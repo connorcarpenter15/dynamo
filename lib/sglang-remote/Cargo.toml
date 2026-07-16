@@ -21,6 +21,7 @@ path = "src/main.rs"
 
 [dependencies]
 dynamo-backend-common = { workspace = true }
+dynamo-llm = { workspace = true }
 dynamo-runtime = { workspace = true }
 
 anyhow = { workspace = true }
@@ -28,7 +29,10 @@ async-stream = { workspace = true }
 async-trait = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }
 futures = { workspace = true }
+base64 = "0.22"
 rand = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -40,6 +44,8 @@ url = { workspace = true }
 # bundles prost codegen via `compile_protos` (the 0.14 split to
 # tonic-prost-build does not apply here).
 prost = { version = "0.13.5" }
+prost-types = { version = "0.13.5" }
+sha2 = "0.10"
 tonic = { version = "0.13.1" }
 
 [build-dependencies]

@@ -11,5 +11,17 @@ use std::sync::Arc;
 
 fn main() -> anyhow::Result<()> {
     let (engine, config) = dynamo_sglang_remote::SglangRemoteEngine::from_args(None)?;
-    dynamo_backend_common::run(Arc::new(engine), config)
+    let runtime_kind = engine.runtime_kind();
+    let engine = Arc::new(engine);
+    match runtime_kind {
+        dynamo_sglang_remote::proto::RuntimeKind::Llm => dynamo_backend_common::run(engine, config),
+        dynamo_sglang_remote::proto::RuntimeKind::Embedding
+        | dynamo_sglang_remote::proto::RuntimeKind::Image
+        | dynamo_sglang_remote::proto::RuntimeKind::Video => {
+            dynamo_backend_common::run_raw(engine, config)
+        }
+        dynamo_sglang_remote::proto::RuntimeKind::Unspecified => {
+            anyhow::bail!("SGLang runtime kind is unspecified")
+        }
+    }
 }

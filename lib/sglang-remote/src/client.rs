@@ -8,7 +8,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use dynamo_backend_common::{BackendError, DynamoError, ErrorType};
-use serde_json::Value;
 use tokio::time::{Instant, timeout_at};
 use tonic::transport::{Channel, Endpoint};
 
@@ -27,8 +26,15 @@ pub struct Discovery {
     pub tokenizer_path: String,
     pub served_model_name: Option<String>,
     pub max_model_len: Option<u32>,
-    pub model_info: Value,
-    pub server_info: Value,
+    pub runtime_kind: pb::RuntimeKind,
+    pub worker_role: pb::WorkerRole,
+    pub capacity: pb::RuntimeCapacity,
+    pub dp_topology: pb::DataParallelTopology,
+    pub bootstrap: Option<pb::DisaggregatedParams>,
+    pub observability: Vec<pb::ObservabilityEndpoint>,
+    pub reasoning_parser: Option<String>,
+    pub tool_call_parser: Option<String>,
+    pub weight_version: Option<String>,
 }
 
 pub async fn connect(
@@ -122,30 +128,14 @@ impl Pool {
 }
 
 pub async fn discover(client: &mut Client, deadline: Instant) -> Result<Discovery, DynamoError> {
-    let model = rpc_with_deadline(
-        "GetModelInfo",
+    let runtime = rpc_with_deadline(
+        "GetRuntimeInfo",
         deadline,
-        client.get_model_info(pb::GetModelInfoRequest {}),
+        client.get_runtime_info(pb::GetRuntimeInfoRequest {}),
     )
     .await?
     .into_inner();
-    let server = rpc_with_deadline(
-        "GetServerInfo",
-        deadline,
-        client.get_server_info(pb::GetServerInfoRequest {}),
-    )
-    .await?
-    .into_inner();
-    let models = rpc_with_deadline(
-        "ListModels",
-        deadline,
-        client.list_models(pb::ListModelsRequest {}),
-    )
-    .await?
-    .into_inner()
-    .models;
-
-    parse_discovery(model, server, models)
+    parse_discovery(runtime)
 }
 
 pub async fn health_check(client: &mut Client, deadline: Instant) -> Result<bool, DynamoError> {
@@ -181,85 +171,68 @@ where
     }
 }
 
-fn parse_discovery(
-    model: pb::GetModelInfoResponse,
-    server: pb::GetServerInfoResponse,
-    models: Vec<pb::ModelCard>,
-) -> Result<Discovery, DynamoError> {
-    let model_info = parse_json_object("GetModelInfo.json_info", &model.json_info)?;
-    let server_info = parse_json_object("GetServerInfo.json_info", &server.json_info)?;
-    let model_path = if model.model_path.trim().is_empty() {
-        model_info
-            .get("model_path")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string()
-    } else {
-        model.model_path
-    };
+fn parse_discovery(runtime: pb::GetRuntimeInfoResponse) -> Result<Discovery, DynamoError> {
+    let model_path = runtime.model_path;
     if model_path.trim().is_empty() {
         return Err(protocol_error(
-            "SGLang GetModelInfo returned an empty model_path",
+            "SGLang GetRuntimeInfo returned an empty model_path",
         ));
     }
-    let tokenizer_path = model_info
-        .get("tokenizer_path")
-        .and_then(Value::as_str)
-        .filter(|path| !path.trim().is_empty())
-        .unwrap_or(&model_path)
-        .to_string();
-
-    let primary = models
-        .iter()
-        .find(|candidate| candidate.root == model_path || candidate.id == model_path)
-        .or_else(|| models.first());
-    let served_model_name = server_info
-        .get("served_model_name")
-        .and_then(Value::as_str)
-        .filter(|name| !name.is_empty())
-        .map(str::to_string)
-        .or_else(|| {
-            primary
-                .map(|card| card.id.as_str())
-                .filter(|name| !name.is_empty() && *name != model_path)
-                .map(str::to_string)
-        });
-    let max_model_len = primary
-        .and_then(|card| card.max_model_len)
-        .and_then(|value| u32::try_from(value).ok())
-        .or_else(|| json_u32(&server_info, "context_length"))
-        .or_else(|| json_u32(&server_info, "max_req_input_len"));
+    if runtime.protocol_revision != pb::PROTOCOL_REVISION {
+        return Err(protocol_error(format!(
+            "SGLang protocol revision mismatch: sidecar expects `{}`, server reports `{}`",
+            pb::PROTOCOL_REVISION,
+            runtime.protocol_revision
+        )));
+    }
+    let expected_descriptor = pb::descriptor_sha256();
+    if runtime.descriptor_sha256 != expected_descriptor {
+        return Err(protocol_error(format!(
+            "SGLang descriptor mismatch: sidecar expects {expected_descriptor}, server reports {}; rebuild the sidecar and SGLang from the same proto",
+            runtime.descriptor_sha256
+        )));
+    }
+    let runtime_kind = pb::RuntimeKind::try_from(runtime.runtime_kind).map_err(|_| {
+        protocol_error(format!(
+            "SGLang reported unknown runtime kind {}",
+            runtime.runtime_kind
+        ))
+    })?;
+    if runtime_kind == pb::RuntimeKind::Unspecified {
+        return Err(protocol_error("SGLang runtime kind is unspecified"));
+    }
+    let worker_role = pb::WorkerRole::try_from(runtime.worker_role).map_err(|_| {
+        protocol_error(format!(
+            "SGLang reported unknown worker role {}",
+            runtime.worker_role
+        ))
+    })?;
+    if worker_role == pb::WorkerRole::Unspecified {
+        return Err(protocol_error("SGLang worker role is unspecified"));
+    }
+    let capacity = runtime.capacity.unwrap_or_default();
+    let max_model_len = u32::try_from(capacity.max_context_length).ok();
+    let tokenizer_path = if runtime.tokenizer_path.trim().is_empty() {
+        model_path.clone()
+    } else {
+        runtime.tokenizer_path
+    };
 
     Ok(Discovery {
         model_path,
         tokenizer_path,
-        served_model_name,
+        served_model_name: runtime.served_model_name,
         max_model_len,
-        model_info,
-        server_info,
+        runtime_kind,
+        worker_role,
+        capacity,
+        dp_topology: runtime.dp_topology.unwrap_or_default(),
+        bootstrap: runtime.bootstrap,
+        observability: runtime.observability,
+        reasoning_parser: runtime.reasoning_parser,
+        tool_call_parser: runtime.tool_call_parser,
+        weight_version: runtime.weight_version,
     })
-}
-
-fn parse_json_object(label: &str, raw: &str) -> Result<Value, DynamoError> {
-    let value: Value = serde_json::from_str(raw)
-        .map_err(|err| protocol_error(format!("invalid {label}: {err}")))?;
-    if !value.is_object() {
-        return Err(protocol_error(format!("{label} must be a JSON object")));
-    }
-    Ok(value)
-}
-
-pub(crate) fn json_u64(value: &Value, key: &str) -> Option<u64> {
-    value.get(key).and_then(|entry| {
-        entry
-            .as_u64()
-            .or_else(|| entry.as_i64().and_then(|number| u64::try_from(number).ok()))
-            .or_else(|| entry.as_str().and_then(|number| number.parse().ok()))
-    })
-}
-
-pub(crate) fn json_u32(value: &Value, key: &str) -> Option<u32> {
-    json_u64(value, key).and_then(|number| u32::try_from(number).ok())
 }
 
 fn backend(kind: BackendError, message: impl Into<String>) -> DynamoError {
@@ -310,38 +283,56 @@ mod tests {
     use std::time::Duration;
 
     use dynamo_backend_common::{BackendError, ErrorType};
-    use serde_json::json;
     use tokio::net::TcpListener;
     use tokio::time::{Instant, timeout};
     use tonic::transport::Endpoint;
 
-    use super::{client_from_channel, connect, discover, json_u32, json_u64, parse_discovery};
+    use super::{client_from_channel, connect, discover, parse_discovery};
     use crate::args::TransportConfig;
     use crate::proto as pb;
 
     #[test]
-    fn numeric_discovery_fields_accept_numbers_and_strings() {
-        let value = json!({"a": 16, "b": "32", "c": -1});
-        assert_eq!(json_u64(&value, "a"), Some(16));
-        assert_eq!(json_u32(&value, "b"), Some(32));
-        assert_eq!(json_u64(&value, "c"), None);
-    }
-
-    #[test]
-    fn discovery_preserves_distinct_tokenizer_path() {
-        let discovery = parse_discovery(
-            pb::GetModelInfoResponse {
-                model_path: "model-repo".to_string(),
-                json_info: json!({"tokenizer_path": "tokenizer-repo"}).to_string(),
-            },
-            pb::GetServerInfoResponse {
-                json_info: json!({}).to_string(),
-            },
-            Vec::new(),
-        )
+    fn discovery_preserves_distinct_tokenizer_path_and_checks_descriptor() {
+        let discovery = parse_discovery(pb::GetRuntimeInfoResponse {
+            model_path: "model-repo".to_string(),
+            tokenizer_path: "tokenizer-repo".to_string(),
+            runtime_kind: pb::RuntimeKind::Llm.into(),
+            worker_role: pb::WorkerRole::Aggregated.into(),
+            protocol_revision: pb::PROTOCOL_REVISION.to_string(),
+            descriptor_sha256: pb::descriptor_sha256(),
+            ..Default::default()
+        })
         .unwrap();
         assert_eq!(discovery.model_path, "model-repo");
         assert_eq!(discovery.tokenizer_path, "tokenizer-repo");
+    }
+
+    #[test]
+    fn discovery_rejects_descriptor_mismatch() {
+        let error = parse_discovery(pb::GetRuntimeInfoResponse {
+            model_path: "model-repo".to_string(),
+            runtime_kind: pb::RuntimeKind::Llm.into(),
+            worker_role: pb::WorkerRole::Aggregated.into(),
+            protocol_revision: pb::PROTOCOL_REVISION.to_string(),
+            descriptor_sha256: "wrong".to_string(),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("descriptor mismatch"));
+    }
+
+    #[test]
+    fn discovery_rejects_unknown_runtime_before_registration() {
+        let error = parse_discovery(pb::GetRuntimeInfoResponse {
+            model_path: "model-repo".to_string(),
+            runtime_kind: 999,
+            worker_role: pb::WorkerRole::Aggregated.into(),
+            protocol_revision: pb::PROTOCOL_REVISION.to_string(),
+            descriptor_sha256: pb::descriptor_sha256(),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown runtime kind"));
     }
 
     #[tokio::test]

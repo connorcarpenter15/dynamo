@@ -1,14 +1,16 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Pure request lowering and response conversion for SGLang's native gRPC protocol.
+//! Typed request lowering and response conversion for SGLang's native gRPC protocol.
 
 use std::collections::HashMap;
 
+use base64::Engine as _;
 use dynamo_backend_common::{
-    DisaggregationMode, DynamoError, LLMEngineOutput, LLMEngineOutputExt, PreprocessedRequest,
-    StopReason, TopLogprob, usage,
+    DisaggregationMode, DynamoError, LLMEngineOutput, LLMEngineOutputExt, MultimodalData,
+    PreprocessedRequest, StopReason, TopLogprob, usage,
 };
+use prost_types::{ListValue, Struct, Value as ProstValue, value::Kind};
 use serde_json::{Map, Value};
 
 use crate::client;
@@ -22,14 +24,33 @@ pub(crate) fn build_generate_request(
     bootstrap_port: Option<u16>,
 ) -> Result<pb::GenerateRequest, DynamoError> {
     validate_request(request)?;
-    let input_ids = request
-        .token_ids
-        .iter()
-        .map(|token| {
-            i32::try_from(*token)
-                .map_err(|_| client::invalid_arg(format!("token id {token} does not fit in i32")))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let input = if let Some(serialized) = request.prompt_embeds.as_ref() {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(serialized)
+            .map_err(|err| client::invalid_arg(format!("invalid prompt_embeds base64: {err}")))?;
+        Some(pb::generate_request::Input::InputEmbeds(pb::Tensor {
+            dtype: pb::TensorDataType::Unspecified.into(),
+            shape: Vec::new(),
+            strides: Vec::new(),
+            storage: Some(pb::tensor::Storage::Serialized(pb::SerializedTensor {
+                format: "pytorch".to_string(),
+                data: bytes,
+            })),
+        }))
+    } else {
+        Some(pb::generate_request::Input::InputIds(pb::TokenIds {
+            values: request
+                .token_ids
+                .iter()
+                .map(|token| {
+                    i32::try_from(*token).map_err(|_| {
+                        client::invalid_arg(format!("token id {token} does not fit in i32"))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        }))
+    };
+
     let max_new_tokens = if mode.is_prefill() {
         Some(1)
     } else {
@@ -50,26 +71,68 @@ pub(crate) fn build_generate_request(
             .transpose()
             .map_err(|_| client::invalid_arg("min_tokens does not fit in i32"))?
     };
-
-    let mut stop_token_ids = Vec::new();
-    for tokens in [
-        request.stop_conditions.stop_token_ids.as_ref(),
-        request.stop_conditions.stop_token_ids_hidden.as_ref(),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        for token in tokens {
-            let token = i32::try_from(*token).map_err(|_| {
+    let include_strings = request
+        .sampling_options
+        .include_stop_str_in_output
+        .unwrap_or(false);
+    let string_stops = request
+        .stop_conditions
+        .stop
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|value| pb::StringStop {
+            value: value.clone(),
+            include_in_output: include_strings,
+        })
+        .collect();
+    let mut token_stops = Vec::new();
+    let mut seen_tokens = HashMap::new();
+    for (tokens, include_in_output) in [
+        (request.stop_conditions.stop_token_ids.as_ref(), false),
+        (
+            request.stop_conditions.stop_token_ids_hidden.as_ref(),
+            false,
+        ),
+        (
+            request.stop_conditions.stop_token_ids_visible.as_ref(),
+            true,
+        ),
+    ] {
+        for token in tokens.into_iter().flatten() {
+            let token_id = i32::try_from(*token).map_err(|_| {
                 client::invalid_arg(format!("stop token id {token} does not fit in i32"))
             })?;
-            if !stop_token_ids.contains(&token) {
-                stop_token_ids.push(token);
+            if let Some(previous) = seen_tokens.insert(token_id, include_in_output) {
+                if previous != include_in_output {
+                    return Err(client::invalid_arg(format!(
+                        "stop token id {token_id} is configured as both visible and hidden"
+                    )));
+                }
+                continue;
             }
+            token_stops.push(pb::TokenStop {
+                token_id,
+                include_in_output,
+            });
         }
     }
-
-    let guided = request.sampling_options.guided_decoding.as_ref();
+    let guided_decoding = request
+        .sampling_options
+        .guided_decoding
+        .as_ref()
+        .map(guided_decoding_to_proto)
+        .transpose()?;
+    let require_reasoning = request
+        .extra_args
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|extra| {
+            extra
+                .get("require_reasoning")
+                .or_else(|| extra.get("reasoning"))
+        })
+        .and_then(Value::as_bool);
     let sampling_params = pb::SamplingParams {
         temperature: request.sampling_options.temperature,
         top_p: request.sampling_options.top_p,
@@ -80,34 +143,65 @@ pub(crate) fn build_generate_request(
         repetition_penalty: request.sampling_options.repetition_penalty,
         max_new_tokens,
         min_new_tokens,
-        stop: request.stop_conditions.stop.clone().unwrap_or_default(),
-        stop_token_ids,
+        string_stops,
+        token_stops,
         ignore_eos: request.stop_conditions.ignore_eos,
-        n: request.sampling_options.n.map(i32::from),
-        json_schema: guided
-            .and_then(|value| value.json.as_ref())
-            .map(json_value_to_string),
-        regex: guided.and_then(|value| value.regex.clone()),
+        n: Some(if mode.is_prefill() {
+            1
+        } else {
+            i32::from(request.sampling_options.n.unwrap_or(1))
+        }),
+        seed: request.sampling_options.seed,
+        guided_decoding,
+        require_reasoning,
+        max_thinking_tokens: request
+            .stop_conditions
+            .max_thinking_tokens
+            .map(i32::try_from)
+            .transpose()
+            .map_err(|_| client::invalid_arg("max_thinking_tokens does not fit in i32"))?,
     };
 
     let output_options = &request.output_options;
-    let return_logprob = !mode.is_prefill()
+    let return_logprobs = !mode.is_prefill()
         && (output_options.logprobs.is_some() || output_options.prompt_logprobs.is_some());
-    let top_logprobs_num = if mode.is_prefill() {
+    let top_logprobs = if mode.is_prefill() {
         0
     } else {
-        output_options
-            .logprobs
-            .unwrap_or(0)
-            .max(output_options.prompt_logprobs.unwrap_or(0))
+        i32::try_from(
+            output_options
+                .logprobs
+                .unwrap_or(0)
+                .max(output_options.prompt_logprobs.unwrap_or(0)),
+        )
+        .map_err(|_| client::invalid_arg("requested logprobs does not fit in i32"))?
     };
-    let top_logprobs_num = i32::try_from(top_logprobs_num)
-        .map_err(|_| client::invalid_arg("requested logprobs does not fit in i32"))?;
-    let logprob_start_len = if mode.is_prefill() {
-        -1
-    } else {
-        output_options.prompt_logprobs.map(|_| 0).unwrap_or(-1)
+    let logprob_options = pb::LogprobOptions {
+        return_logprobs,
+        top_logprobs,
+        prompt_logprob_start: (!mode.is_prefill() && output_options.prompt_logprobs.is_some())
+            .then_some(0),
+        token_ids: Vec::new(),
+        return_text: !output_options.return_tokens_as_token_ids.unwrap_or(false),
+        return_routed_experts: request
+            .annotations
+            .iter()
+            .any(|annotation| annotation == "routed_experts"),
+        routed_experts_start: 0,
+        return_prompt_token_ids: false,
     };
+    let multimodal_inputs = multimodal_inputs(request)?;
+    let processor_options = request
+        .mm_processor_kwargs
+        .as_ref()
+        .map(json_object_to_struct)
+        .transpose()?;
+    let use_audio_in_video = request
+        .mm_processor_kwargs
+        .as_ref()
+        .and_then(|value| value.get("use_audio_in_video"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let routed_dp_rank = request
         .routing
         .as_ref()
@@ -115,25 +209,32 @@ pub(crate) fn build_generate_request(
         .map(i32::try_from)
         .transpose()
         .map_err(|_| client::invalid_arg("routed dp_rank does not fit in i32"))?;
+    let priority = request
+        .routing
+        .as_ref()
+        .and_then(|routing| routing.priority)
+        .unwrap_or_default();
     let lora_path = request
         .routing
         .as_ref()
         .and_then(|routing| routing.lora_name.clone());
-
     let mut trace_headers = HashMap::new();
     dynamo_runtime::logging::inject_trace_headers_into_map(&mut trace_headers);
 
     Ok(pb::GenerateRequest {
-        input_ids,
+        input,
         sampling_params: Some(sampling_params),
-        stream: Some(true),
-        return_logprob: Some(return_logprob),
-        top_logprobs_num: Some(top_logprobs_num),
-        logprob_start_len: Some(logprob_start_len),
+        logprob_options: Some(logprob_options),
+        multimodal_inputs,
+        multimodal_processor_options: processor_options,
+        use_audio_in_video,
+        stream: true,
         rid: Some(request_id.to_string()),
         lora_path,
+        lora_id: None,
         routing_key: request.mdc_sum.clone(),
         routed_dp_rank,
+        priority,
         trace_headers,
         session_id: None,
         disaggregated_params: resolve_disaggregated_params(
@@ -146,99 +247,241 @@ pub(crate) fn build_generate_request(
 }
 
 fn validate_request(request: &PreprocessedRequest) -> Result<(), DynamoError> {
-    if request.token_ids.is_empty() {
-        return Err(client::invalid_arg("token_ids must not be empty"));
-    }
-    if request.prompt_embeds.is_some() {
+    if request.token_ids.is_empty() && request.prompt_embeds.is_none() {
         return Err(client::invalid_arg(
-            "prompt_embeds are not supported by SGLang's native gRPC proto",
+            "token_ids must not be empty unless prompt_embeds is provided",
         ));
     }
-    if request.multi_modal_data.is_some() || request.mm_processor_kwargs.is_some() {
+    if request.sampling_options.best_of.unwrap_or(1) != request.sampling_options.n.unwrap_or(1) {
         return Err(client::invalid_arg(
-            "multimodal payloads are not supported by SGLang's native Generate RPC",
+            "best_of is unsupported unless it equals n; SGLang does not implement beam-search selection",
         ));
     }
-    if request.sampling_options.n.unwrap_or(1) != 1 {
-        return Err(client::invalid_arg(
-            "n must be 1 for the SGLang remote backend",
-        ));
-    }
-    if request.sampling_options.best_of.unwrap_or(1) != 1 {
-        return Err(client::invalid_arg(
-            "best_of is not represented by SGLang's native gRPC proto",
-        ));
+    if request.sampling_options.n == Some(0) {
+        return Err(client::invalid_arg("n must be greater than zero"));
     }
     if request.sampling_options.use_beam_search.unwrap_or(false) {
         return Err(client::invalid_arg(
-            "beam search is not represented by SGLang's native gRPC proto",
+            "beam search is not supported by SGLang",
         ));
     }
     if let Some(penalty) = request.sampling_options.length_penalty
         && (penalty - 1.0).abs() > f32::EPSILON
     {
         return Err(client::invalid_arg(
-            "length_penalty is not represented by SGLang's native gRPC proto",
-        ));
-    }
-    if request.sampling_options.seed.is_some() {
-        return Err(client::invalid_arg(
-            "seed is not represented by SGLang's native gRPC proto",
-        ));
-    }
-    if request.stop_conditions.max_thinking_tokens.is_some() {
-        return Err(client::invalid_arg(
-            "max_thinking_tokens is not represented by SGLang's native gRPC proto",
-        ));
-    }
-    if request
-        .sampling_options
-        .include_stop_str_in_output
-        .unwrap_or(false)
-    {
-        return Err(client::invalid_arg(
-            "include_stop_str_in_output is not represented by SGLang's native gRPC proto",
-        ));
-    }
-    if request
-        .stop_conditions
-        .stop_token_ids_visible
-        .as_ref()
-        .is_some_and(|tokens| !tokens.is_empty())
-    {
-        return Err(client::invalid_arg(
-            "visible stop-token semantics are not represented by SGLang's native gRPC proto",
-        ));
-    }
-    if let Some(guided) = request.sampling_options.guided_decoding.as_ref()
-        && (guided
-            .choice
-            .as_ref()
-            .is_some_and(|value| !value.is_empty())
-            || guided.grammar.is_some()
-            || guided
-                .backend
-                .as_ref()
-                .is_some_and(|value| !value.is_empty())
-            || guided.whitespace_pattern.is_some()
-            || guided.structural_tag.is_some())
-    {
-        return Err(client::invalid_arg(
-            "the native SGLang gRPC proto currently supports only JSON-schema and regex guided decoding",
-        ));
-    }
-    if request
-        .routing
-        .as_ref()
-        .and_then(|routing| routing.priority)
-        .unwrap_or(0)
-        != 0
-    {
-        return Err(client::invalid_arg(
-            "engine priority is not represented by SGLang's native gRPC proto",
+            "non-default length_penalty requires beam search, which SGLang does not support",
         ));
     }
     Ok(())
+}
+
+fn guided_decoding_to_proto(
+    guided: &dynamo_backend_common::GuidedDecodingOptions,
+) -> Result<pb::GuidedDecoding, DynamoError> {
+    use pb::guided_decoding::Constraint;
+    let constraints = [
+        guided
+            .json
+            .as_ref()
+            .map(|value| Constraint::JsonSchema(json_value_to_string(value))),
+        guided.regex.clone().map(Constraint::Regex),
+        guided.grammar.clone().map(Constraint::Ebnf),
+        guided.choice.as_ref().map(|values| {
+            Constraint::Choice(pb::ChoiceConstraint {
+                values: values.clone(),
+            })
+        }),
+        guided
+            .structural_tag
+            .as_ref()
+            .map(|value| Constraint::StructuralTag(json_value_to_string(value))),
+    ];
+    let mut present = constraints.into_iter().flatten();
+    let constraint = present.next();
+    if present.next().is_some() {
+        return Err(client::invalid_arg(
+            "guided decoding accepts exactly one of json, regex, grammar, choice, or structural_tag",
+        ));
+    }
+    Ok(pb::GuidedDecoding {
+        constraint,
+        backend: guided.backend.clone(),
+        whitespace_pattern: guided.whitespace_pattern.clone(),
+    })
+}
+
+fn multimodal_inputs(
+    request: &PreprocessedRequest,
+) -> Result<Vec<pb::MultimodalInput>, DynamoError> {
+    let Some(media) = request.multi_modal_data.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let hashes = request
+        .extra_args
+        .as_ref()
+        .and_then(|value| value.get("mm_hashes"))
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .map(|value| {
+                    value.as_str().map(str::to_string).ok_or_else(|| {
+                        client::invalid_arg("extra_args.mm_hashes entries must be strings")
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?;
+    let count: usize = media.values().map(Vec::len).sum();
+    if let Some(hashes) = hashes.as_ref()
+        && hashes.len() != count
+    {
+        return Err(client::invalid_arg(format!(
+            "multimodal routing hash count {} does not match media count {count}",
+            hashes.len()
+        )));
+    }
+    let mut hash_index = 0;
+    let mut mapped = Vec::with_capacity(count);
+    for key in ["image_url", "video_url", "audio_url"] {
+        let Some(items) = media.get(key) else {
+            continue;
+        };
+        let modality = match key {
+            "image_url" => pb::Modality::Image,
+            "video_url" => pb::Modality::Video,
+            "audio_url" => pb::Modality::Audio,
+            _ => unreachable!(),
+        };
+        for item in items {
+            let source = match item {
+                MultimodalData::Url(url) => {
+                    pb::multimodal_input::Source::Url(url.as_str().to_string())
+                }
+                MultimodalData::RawUrl(url) => pb::multimodal_input::Source::Url(url.clone()),
+                MultimodalData::Decoded(descriptor) => {
+                    let value = serde_json::to_value(descriptor).map_err(|err| {
+                        client::invalid_arg(format!("failed to serialize decoded media: {err}"))
+                    })?;
+                    let shape = value
+                        .get("shape")
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| client::invalid_arg("decoded media shape is missing"))?
+                        .iter()
+                        .map(|dim| {
+                            dim.as_i64().ok_or_else(|| {
+                                client::invalid_arg("decoded media shape must contain integers")
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let metadata = serde_json::to_vec(
+                        value
+                            .get("nixl_metadata")
+                            .ok_or_else(|| client::invalid_arg("NIXL metadata is missing"))?,
+                    )
+                    .map_err(|err| client::invalid_arg(err.to_string()))?;
+                    let descriptor = serde_json::to_vec(
+                        value
+                            .get("nixl_descriptor")
+                            .ok_or_else(|| client::invalid_arg("NIXL descriptor is missing"))?,
+                    )
+                    .map_err(|err| client::invalid_arg(err.to_string()))?;
+                    let length = value
+                        .get("nixl_descriptor")
+                        .and_then(|value| value.get("size"))
+                        .and_then(Value::as_u64);
+                    pb::multimodal_input::Source::DecodedTensor(pb::Tensor {
+                        dtype: pb::TensorDataType::Uint8.into(),
+                        shape,
+                        strides: Vec::new(),
+                        storage: Some(pb::tensor::Storage::External(pb::ExternalBuffer {
+                            transport: Some(pb::external_buffer::Transport::Nixl(pb::NixlBuffer {
+                                metadata,
+                                descriptor,
+                                agent_name: None,
+                                length,
+                            })),
+                        })),
+                    })
+                }
+            };
+            mapped.push(pb::MultimodalInput {
+                modality: modality.into(),
+                source: Some(source),
+                mime_type: None,
+                routing_hash: hashes
+                    .as_ref()
+                    .and_then(|hashes| hashes.get(hash_index).cloned()),
+            });
+            hash_index += 1;
+        }
+    }
+    if mapped.len() != count {
+        let unsupported = media
+            .keys()
+            .filter(|key| !matches!(key.as_str(), "image_url" | "video_url" | "audio_url"))
+            .cloned()
+            .collect::<Vec<_>>();
+        return Err(client::invalid_arg(format!(
+            "unsupported multimodal keys: {}",
+            unsupported.join(", ")
+        )));
+    }
+    Ok(mapped)
+}
+
+pub(crate) fn json_object_to_struct(value: &Value) -> Result<Struct, DynamoError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| client::invalid_arg("multimodal processor options must be an object"))?;
+    Ok(Struct {
+        fields: object
+            .iter()
+            .map(|(key, value)| (key.clone(), json_to_prost(value)))
+            .collect(),
+    })
+}
+
+fn json_to_prost(value: &Value) -> ProstValue {
+    let kind = match value {
+        Value::Null => Kind::NullValue(0),
+        Value::Bool(value) => Kind::BoolValue(*value),
+        Value::Number(value) => Kind::NumberValue(value.as_f64().unwrap_or_default()),
+        Value::String(value) => Kind::StringValue(value.clone()),
+        Value::Array(values) => Kind::ListValue(ListValue {
+            values: values.iter().map(json_to_prost).collect(),
+        }),
+        Value::Object(values) => Kind::StructValue(Struct {
+            fields: values
+                .iter()
+                .map(|(key, value)| (key.clone(), json_to_prost(value)))
+                .collect(),
+        }),
+    };
+    ProstValue { kind: Some(kind) }
+}
+
+pub(crate) fn prost_struct_to_json(value: Struct) -> Value {
+    Value::Object(
+        value
+            .fields
+            .into_iter()
+            .map(|(key, value)| (key, prost_to_json(value)))
+            .collect(),
+    )
+}
+
+fn prost_to_json(value: ProstValue) -> Value {
+    match value.kind {
+        None | Some(Kind::NullValue(_)) => Value::Null,
+        Some(Kind::BoolValue(value)) => Value::Bool(value),
+        Some(Kind::NumberValue(value)) => serde_json::json!(value),
+        Some(Kind::StringValue(value)) => Value::String(value),
+        Some(Kind::ListValue(value)) => {
+            Value::Array(value.values.into_iter().map(prost_to_json).collect())
+        }
+        Some(Kind::StructValue(value)) => prost_struct_to_json(value),
+    }
 }
 
 fn resolve_disaggregated_params(
@@ -255,6 +498,10 @@ fn resolve_disaggregated_params(
             &info.bootstrap_host,
             u64::from(info.bootstrap_port),
             info.bootstrap_room,
+            request
+                .routing
+                .as_ref()
+                .and_then(|routing| routing.prefill_dp_rank),
         )
         .map(Some);
     }
@@ -269,7 +516,7 @@ fn resolve_disaggregated_params(
             client::invalid_arg("prefill request has no bootstrap port from discovery")
         })?;
         let room = rand::random::<u64>() & (i64::MAX as u64);
-        return bootstrap_values_to_proto(host, u64::from(port), room).map(Some);
+        return bootstrap_values_to_proto(host, u64::from(port), room, None).map(Some);
     }
     Err(client::invalid_arg(
         "decode request has neither bootstrap_info nor prefill_result",
@@ -289,28 +536,47 @@ fn disaggregated_json_to_proto(value: &Value) -> Result<pb::DisaggregatedParams,
         .get("bootstrap_room")
         .and_then(Value::as_u64)
         .ok_or_else(|| client::invalid_arg("disaggregated_params.bootstrap_room is missing"))?;
-    bootstrap_values_to_proto(host, port, room)
+    let mut params = bootstrap_values_to_proto(
+        host,
+        port,
+        room,
+        value
+            .get("prefill_dp_rank")
+            .and_then(Value::as_u64)
+            .and_then(|rank| u32::try_from(rank).ok()),
+    )?;
+    params.bootstrap_pair_key = value
+        .get("bootstrap_pair_key")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    params.decode_tp_size = value
+        .get("decode_tp_size")
+        .and_then(Value::as_i64)
+        .and_then(|size| i32::try_from(size).ok());
+    Ok(params)
 }
 
 fn bootstrap_values_to_proto(
     host: &str,
     port: u64,
     room: u64,
+    prefill_dp_rank: Option<u32>,
 ) -> Result<pb::DisaggregatedParams, DynamoError> {
     if host.trim().is_empty() {
         return Err(client::invalid_arg("bootstrap_host must not be empty"));
     }
-    let bootstrap_port = i32::try_from(port)
-        .map_err(|_| client::invalid_arg(format!("bootstrap_port is out of range: {port}")))?;
-    let bootstrap_room = i64::try_from(room).map_err(|_| {
-        client::invalid_arg(format!(
-            "bootstrap_room must fit SGLang's signed int64 field: {room}"
-        ))
-    })?;
     Ok(pb::DisaggregatedParams {
         bootstrap_host: host.to_string(),
-        bootstrap_port,
-        bootstrap_room,
+        bootstrap_port: i32::try_from(port)
+            .map_err(|_| client::invalid_arg(format!("bootstrap_port is out of range: {port}")))?,
+        bootstrap_room: i64::try_from(room).map_err(|_| {
+            client::invalid_arg(format!(
+                "bootstrap_room must fit SGLang's signed int64 field: {room}"
+            ))
+        })?,
+        prefill_dp_rank: prefill_dp_rank.map(|rank| i32::try_from(rank).unwrap_or(i32::MAX)),
+        bootstrap_pair_key: None,
+        decode_tp_size: None,
     })
 }
 
@@ -319,6 +585,9 @@ pub(crate) fn disaggregated_params_to_json(params: &pb::DisaggregatedParams) -> 
         "bootstrap_host": params.bootstrap_host,
         "bootstrap_port": params.bootstrap_port,
         "bootstrap_room": params.bootstrap_room,
+        "prefill_dp_rank": params.prefill_dp_rank,
+        "bootstrap_pair_key": params.bootstrap_pair_key,
+        "decode_tp_size": params.decode_tp_size,
     })
 }
 
@@ -329,231 +598,327 @@ fn json_value_to_string(value: &Value) -> String {
     }
 }
 
-pub(crate) fn output_ids_to_u32(ids: &[i32]) -> Result<Vec<u32>, DynamoError> {
-    ids.iter()
+pub(crate) fn map_generate_response(
+    response: pb::GenerateResponse,
+    fallback_prompt_tokens: u32,
+    fallback_completion_tokens: u32,
+    return_tokens_as_ids: bool,
+) -> Result<LLMEngineOutput, DynamoError> {
+    let token_ids = response
+        .delta_output_ids
+        .iter()
         .map(|id| {
             u32::try_from(*id).map_err(|_| {
                 client::protocol_error(format!("SGLang returned a negative token id: {id}"))
             })
         })
+        .collect::<Result<Vec<_>, _>>()?;
+    let usage_message = response.usage.as_ref();
+    let prompt_tokens = usage_message
+        .and_then(|usage| u32::try_from(usage.prompt_tokens).ok())
+        .unwrap_or(fallback_prompt_tokens);
+    let completion_tokens = usage_message
+        .and_then(|usage| u32::try_from(usage.completion_tokens).ok())
+        .unwrap_or(fallback_completion_tokens);
+    let mut mapped = match response.terminal.as_ref() {
+        None => LLMEngineOutput::default(),
+        Some(pb::generate_response::Terminal::Finish(finish)) => {
+            use pb::FinishReason;
+            let reason = FinishReason::try_from(finish.reason).map_err(|_| {
+                client::protocol_error(format!("unknown SGLang finish reason {}", finish.reason))
+            })?;
+            match reason {
+                FinishReason::Stop => LLMEngineOutput::stop(),
+                FinishReason::Length => LLMEngineOutput::length(),
+                FinishReason::Abort | FinishReason::Cancelled => LLMEngineOutput::cancelled(),
+                FinishReason::Unspecified => {
+                    return Err(client::protocol_error(
+                        "SGLang terminal finish reason is unspecified",
+                    ));
+                }
+            }
+            .with_usage(usage(prompt_tokens, completion_tokens))
+        }
+        Some(pb::generate_response::Terminal::Error(error)) => {
+            LLMEngineOutput::error(error.message.clone())
+                .with_usage(usage(prompt_tokens, completion_tokens))
+        }
+    };
+    mapped.token_ids = token_ids;
+    mapped.text = response.delta_text;
+    mapped.index = Some(u32::try_from(response.choice_index).map_err(|_| {
+        client::protocol_error(format!(
+            "SGLang returned negative choice index {}",
+            response.choice_index
+        ))
+    })?);
+    if let Some(pb::generate_response::Terminal::Finish(finish)) = response.terminal.as_ref() {
+        mapped.stop_reason = finish.stop_reason.as_ref().and_then(|reason| {
+            reason.reason.as_ref().map(|reason| match reason {
+                pb::stop_reason::Reason::MatchedString(value) => StopReason::String(value.clone()),
+                pb::stop_reason::Reason::MatchedTokenId(value) => {
+                    StopReason::Int(i64::from(*value))
+                }
+            })
+        });
+    }
+    if let Some(logprobs) = response.logprobs.as_ref() {
+        let (selected, top) = map_output_logprobs(&logprobs.output, return_tokens_as_ids)?;
+        mapped.log_probs = (!selected.is_empty()).then_some(selected);
+        mapped.top_logprobs = (!top.is_empty()).then_some(top);
+    }
+    let mut engine_data = response
+        .engine_metadata
+        .map(prost_struct_to_json)
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    if let Some(routed) = response.routed_experts {
+        engine_data.insert(
+            "routed_experts".to_string(),
+            serde_json::json!({
+                "expert_ids": routed.expert_ids,
+                "shape": routed.shape,
+                "start_position": routed.start_position,
+            }),
+        );
+    }
+    if let Some(logprobs) = response.logprobs.as_ref()
+        && !logprobs.prompt.is_empty()
+    {
+        engine_data.insert(
+            "prompt_logprobs".to_string(),
+            prompt_logprobs_to_json(&logprobs.prompt),
+        );
+    }
+    mapped.engine_data = (!engine_data.is_empty()).then_some(Value::Object(engine_data));
+    mapped.disaggregated_params = response
+        .prefill_handoff
+        .as_ref()
+        .map(disaggregated_params_to_json);
+    if let (Some(usage), Some(completion_usage)) = (usage_message, mapped.completion_usage.as_mut())
+        && let Ok(cached_tokens) = u32::try_from(usage.cached_prompt_tokens)
+        && cached_tokens > 0
+    {
+        let mut details = dynamo_backend_common::PromptTokensDetails::default();
+        details.cached_tokens = Some(cached_tokens);
+        completion_usage.prompt_tokens_details = Some(details);
+    }
+    Ok(mapped)
+}
+
+fn map_output_logprobs(
+    values: &[pb::TokenLogprob],
+    return_tokens_as_ids: bool,
+) -> Result<(Vec<f64>, Vec<Vec<TopLogprob>>), DynamoError> {
+    let selected = values
+        .iter()
+        .map(|entry| f64::from(entry.logprob))
+        .collect();
+    let top = values
+        .iter()
+        .map(|entry| {
+            entry
+                .top_logprobs
+                .iter()
+                .enumerate()
+                .map(|(index, alternative)| {
+                    let token_id = u32::try_from(alternative.token_id).map_err(|_| {
+                        client::protocol_error("top-logprob token id does not fit u32")
+                    })?;
+                    Ok(TopLogprob {
+                        rank: alternative
+                            .rank
+                            .and_then(|rank| u32::try_from(rank).ok())
+                            .unwrap_or_else(|| u32::try_from(index + 1).unwrap_or(u32::MAX)),
+                        token_id,
+                        token: if return_tokens_as_ids {
+                            Some(format!("token_id:{token_id}"))
+                        } else {
+                            alternative.text.clone()
+                        },
+                        logprob: f64::from(alternative.logprob),
+                        bytes: None,
+                    })
+                })
+                .collect::<Result<Vec<_>, DynamoError>>()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((selected, top))
+}
+
+fn prompt_logprobs_to_json(values: &[pb::TokenLogprob]) -> Value {
+    let mut positions = Vec::with_capacity(values.len() + 1);
+    positions.push(Value::Null);
+    for selected in values {
+        let mut position = Map::new();
+        position.insert(
+            selected.token_id.to_string(),
+            serde_json::json!({
+                "logprob": selected.logprob,
+                "decoded_token": selected.text,
+            }),
+        );
+        for alternative in &selected.top_logprobs {
+            position
+                .entry(alternative.token_id.to_string())
+                .or_insert_with(|| {
+                    serde_json::json!({
+                        "logprob": alternative.logprob,
+                        "decoded_token": alternative.text,
+                    })
+                });
+        }
+        positions.push(Value::Object(position));
+    }
+    Value::Array(positions)
+}
+
+pub(crate) fn build_embed_request(
+    request: &Value,
+    request_id: &str,
+) -> Result<pb::EmbedRequest, DynamoError> {
+    let input = request
+        .get("input")
+        .ok_or_else(|| client::invalid_arg("embedding request is missing input"))?;
+    let inputs = match input {
+        Value::String(text) => vec![pb::EmbedInput {
+            input: Some(pb::embed_input::Input::Text(text.clone())),
+        }],
+        Value::Array(values) if values.iter().all(Value::is_string) => values
+            .iter()
+            .map(|value| pb::EmbedInput {
+                input: Some(pb::embed_input::Input::Text(
+                    value.as_str().unwrap_or_default().to_string(),
+                )),
+            })
+            .collect(),
+        Value::Array(values) if values.iter().all(Value::is_number) => vec![pb::EmbedInput {
+            input: Some(pb::embed_input::Input::InputIds(pb::TokenIds {
+                values: json_token_ids(values)?,
+            })),
+        }],
+        Value::Array(values) if values.iter().all(Value::is_array) => values
+            .iter()
+            .map(|value| {
+                Ok(pb::EmbedInput {
+                    input: Some(pb::embed_input::Input::InputIds(pb::TokenIds {
+                        values: json_token_ids(value.as_array().expect("guarded by is_array"))?,
+                    })),
+                })
+            })
+            .collect::<Result<Vec<_>, DynamoError>>()?,
+        _ => {
+            return Err(client::invalid_arg(
+                "embedding input must be text, token IDs, or a homogeneous batch",
+            ));
+        }
+    };
+    if inputs.is_empty() {
+        return Err(client::invalid_arg(
+            "embedding input batch must not be empty",
+        ));
+    }
+    let encoding = match request
+        .get("encoding_format")
+        .and_then(Value::as_str)
+        .unwrap_or("float")
+    {
+        "float" => pb::EmbeddingEncoding::Float,
+        "base64" => pb::EmbeddingEncoding::Base64,
+        other => {
+            return Err(client::invalid_arg(format!(
+                "unsupported embedding encoding_format `{other}`"
+            )));
+        }
+    };
+    let dimensions = request
+        .get("dimensions")
+        .map(|value| {
+            value
+                .as_i64()
+                .and_then(|value| i32::try_from(value).ok())
+                .filter(|value| *value > 0)
+                .ok_or_else(|| client::invalid_arg("dimensions must be a positive integer"))
+        })
+        .transpose()?;
+    let mut trace_headers = HashMap::new();
+    dynamo_runtime::logging::inject_trace_headers_into_map(&mut trace_headers);
+    Ok(pb::EmbedRequest {
+        inputs,
+        dimensions,
+        encoding: encoding.into(),
+        rid: Some(request_id.to_string()),
+        routing_key: None,
+        routed_dp_rank: None,
+        priority: 0,
+        trace_headers,
+    })
+}
+
+fn json_token_ids(values: &[Value]) -> Result<Vec<i32>, DynamoError> {
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_i64()
+                .and_then(|value| i32::try_from(value).ok())
+                .filter(|value| *value >= 0)
+                .ok_or_else(|| client::invalid_arg("token IDs must be non-negative i32 values"))
+        })
         .collect()
 }
 
-fn meta_value(meta: &HashMap<String, String>, key: &str) -> Option<Value> {
-    meta.get(key)
-        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-}
-
-pub(crate) fn meta_u32(meta: &HashMap<String, String>, key: &str) -> Option<u32> {
-    meta_value(meta, key)
-        .and_then(|value| value.as_u64())
-        .and_then(|value| u32::try_from(value).ok())
-}
-
-pub(crate) fn terminal_from_meta(
-    meta: &HashMap<String, String>,
-    prompt_tokens: u32,
-    generated: u32,
-) -> Result<LLMEngineOutput, DynamoError> {
-    let finish = meta_value(meta, "finish_reason")
-        .ok_or_else(|| client::protocol_error("SGLang terminal is missing finish_reason"))?;
-    let finish_type = finish
-        .get("type")
-        .and_then(Value::as_str)
-        .or_else(|| finish.as_str())
-        .ok_or_else(|| client::protocol_error("SGLang finish_reason is missing a type"))?;
-    let mut output = match finish_type {
-        "stop" => LLMEngineOutput::stop(),
-        "length" => LLMEngineOutput::length(),
-        "cancelled" => LLMEngineOutput::cancelled(),
-        "abort" | "error" => return Err(terminal_failure(finish_type, &finish)),
-        other => {
-            return Err(client::protocol_error(format!(
-                "SGLang returned unsupported finish_reason type `{other}`"
-            )));
-        }
-    }
-    .with_usage(usage(prompt_tokens, generated));
-    output.stop_reason = finish.get("matched").and_then(|matched| match matched {
-        Value::String(value) => Some(StopReason::String(value.clone())),
-        Value::Number(value) => value.as_i64().map(StopReason::Int),
-        _ => None,
-    });
-    Ok(output)
-}
-
-fn terminal_failure(finish_type: &str, finish: &Value) -> DynamoError {
-    let message = finish
-        .get("message")
-        .and_then(Value::as_str)
-        .unwrap_or("SGLang generation failed");
-    let status_code = finish.get("status_code").and_then(Value::as_i64);
-    let err_type = finish.get("err_type").and_then(Value::as_str);
-    let detail = format!(
-        "SGLang generation {finish_type}: {message} (status_code={}, err_type={})",
-        status_code
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "unknown".to_string()),
-        err_type.unwrap_or("unknown")
-    );
-    if matches!(status_code, Some(400..=499)) {
-        client::invalid_arg(detail)
-    } else {
-        client::protocol_error(detail)
-    }
-}
-
-pub(crate) fn engine_data_from_meta(
-    meta: &HashMap<String, String>,
-    include_prompt_logprobs: bool,
-) -> Result<Option<Value>, DynamoError> {
-    let mut data = Map::new();
-    if let Some(routed_experts) = meta_value(meta, "routed_experts") {
-        data.insert("routed_experts".to_string(), routed_experts);
-    }
-    if include_prompt_logprobs && let Some(prompt_logprobs) = prompt_logprobs_from_meta(meta)? {
-        data.insert("prompt_logprobs".to_string(), prompt_logprobs);
-    }
-    Ok((!data.is_empty()).then_some(Value::Object(data)))
-}
-
-fn prompt_logprobs_from_meta(meta: &HashMap<String, String>) -> Result<Option<Value>, DynamoError> {
-    let Some(Value::Array(input_logprobs)) = meta_value(meta, "input_token_logprobs") else {
-        return Ok(None);
-    };
-    if input_logprobs.is_empty() {
-        return Ok(None);
-    }
-    let input_top_logprobs = match meta_value(meta, "input_top_logprobs") {
-        Some(Value::Array(values)) => values,
-        _ => Vec::new(),
-    };
-
-    let mut payload = Vec::with_capacity(input_logprobs.len() + 1);
-    payload.push(Value::Null);
-    for (index, selected) in input_logprobs.iter().enumerate() {
-        let (token_id, entry) = prompt_logprob_entry(selected, "input_token_logprobs")?;
-        let mut position = Map::new();
-        position.insert(token_id, entry);
-        if let Some(Value::Array(alternatives)) = input_top_logprobs.get(index) {
-            for alternative in alternatives {
-                let (token_id, entry) = prompt_logprob_entry(alternative, "input_top_logprobs")?;
-                position.entry(token_id).or_insert(entry);
-            }
-        }
-        payload.push(Value::Object(position));
-    }
-    Ok(Some(Value::Array(payload)))
-}
-
-fn prompt_logprob_entry(value: &Value, label: &str) -> Result<(String, Value), DynamoError> {
-    let parts = value
-        .as_array()
-        .ok_or_else(|| client::protocol_error(format!("invalid {label} entry from SGLang")))?;
-    let logprob = parts
-        .first()
-        .and_then(Value::as_f64)
-        .ok_or_else(|| client::protocol_error(format!("missing logprob in {label}")))?;
-    let token_id = parts
-        .get(1)
-        .and_then(Value::as_i64)
-        .ok_or_else(|| client::protocol_error(format!("missing token id in {label}")))?;
-    let mut entry = Map::new();
-    entry.insert("logprob".to_string(), Value::from(logprob));
-    if let Some(decoded) = parts.get(2).and_then(Value::as_str) {
-        entry.insert(
-            "decoded_token".to_string(),
-            Value::String(decoded.to_string()),
-        );
-    }
-    Ok((token_id.to_string(), Value::Object(entry)))
-}
-
-pub(crate) type ExtractedLogprobs = (Option<Vec<f64>>, Option<Vec<Vec<TopLogprob>>>, usize);
-
-pub(crate) fn extract_logprobs(
-    meta: &HashMap<String, String>,
-    offset: usize,
-    return_tokens_as_ids: bool,
-) -> Result<ExtractedLogprobs, DynamoError> {
-    let Some(Value::Array(all_logprobs)) = meta_value(meta, "output_token_logprobs") else {
-        return Ok((None, None, offset));
-    };
-    if offset >= all_logprobs.len() {
-        return Ok((None, None, all_logprobs.len()));
-    }
-
-    let mut log_probs = Vec::with_capacity(all_logprobs.len() - offset);
-    for entry in &all_logprobs[offset..] {
-        let value = entry
-            .as_array()
-            .and_then(|parts| parts.first())
-            .and_then(Value::as_f64)
-            .ok_or_else(|| {
-                client::protocol_error("invalid output_token_logprobs entry from SGLang")
-            })?;
-        log_probs.push(value);
-    }
-
-    let top_logprobs = match meta_value(meta, "output_top_logprobs") {
-        Some(Value::Array(all_top)) => {
-            let mut positions = Vec::new();
-            for position in all_top.iter().skip(offset) {
-                let Some(entries) = position.as_array() else {
-                    positions.push(Vec::new());
-                    continue;
-                };
-                let mut mapped = Vec::with_capacity(entries.len());
-                for (index, entry) in entries.iter().enumerate() {
-                    let parts = entry.as_array().ok_or_else(|| {
-                        client::protocol_error("invalid output_top_logprobs entry from SGLang")
-                    })?;
-                    let logprob = parts.first().and_then(Value::as_f64).ok_or_else(|| {
-                        client::protocol_error("missing top-logprob value from SGLang")
-                    })?;
-                    let token_id = parts.get(1).and_then(Value::as_u64).ok_or_else(|| {
-                        client::protocol_error("missing top-logprob token id from SGLang")
-                    })?;
-                    let token_id = u32::try_from(token_id).map_err(|_| {
-                        client::protocol_error("top-logprob token id does not fit u32")
-                    })?;
-                    let token = if return_tokens_as_ids {
-                        Some(format!("token_id:{token_id}"))
-                    } else {
-                        parts.get(2).and_then(Value::as_str).map(str::to_string)
-                    };
-                    mapped.push(TopLogprob {
-                        rank: u32::try_from(index + 1).unwrap_or(u32::MAX),
-                        token_id,
-                        token,
-                        logprob,
-                        bytes: None,
-                    });
+pub(crate) fn map_embed_response(
+    response: pb::EmbedResponse,
+    model: &str,
+) -> Result<Value, DynamoError> {
+    let data = response
+        .embeddings
+        .into_iter()
+        .map(|embedding| {
+            use pb::embedding::Data;
+            let value = match embedding.data {
+                Some(Data::FloatValues(values)) => serde_json::json!(values.values),
+                Some(Data::PackedFloat32(bytes)) => {
+                    Value::String(base64::engine::general_purpose::STANDARD.encode(bytes))
                 }
-                positions.push(mapped);
-            }
-            Some(positions)
-        }
-        _ => None,
-    };
-
-    Ok((Some(log_probs), top_logprobs, all_logprobs.len()))
+                None => {
+                    return Err(client::protocol_error(
+                        "SGLang embedding response is missing data",
+                    ));
+                }
+            };
+            Ok(serde_json::json!({
+                "object": "embedding",
+                "index": embedding.index,
+                "embedding": value,
+            }))
+        })
+        .collect::<Result<Vec<_>, DynamoError>>()?;
+    let usage = response.usage.unwrap_or_default();
+    Ok(serde_json::json!({
+        "object": "list",
+        "data": data,
+        "model": model,
+        "usage": {
+            "prompt_tokens": usage.prompt_tokens,
+            "total_tokens": usage.total_tokens,
+        },
+    }))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use dynamo_backend_common::{
-        BootstrapInfo, DisaggregationMode, FinishReason, OutputOptions, PrefillResult,
-        PreprocessedRequest, SamplingOptions, StopConditions,
+        BootstrapInfo, DisaggregationMode, FinishReason, MultimodalData, OutputOptions,
+        PrefillResult, PreprocessedRequest, SamplingOptions, StopConditions,
     };
-    use serde_json::json;
 
     use super::{
-        build_generate_request, disaggregated_params_to_json, engine_data_from_meta,
-        extract_logprobs, terminal_from_meta,
+        build_embed_request, build_generate_request, disaggregated_params_to_json,
+        map_embed_response, map_generate_response,
     };
+    use crate::proto as pb;
 
     fn request() -> PreprocessedRequest {
         PreprocessedRequest::builder()
@@ -570,50 +935,94 @@ mod tests {
     }
 
     #[test]
-    fn request_maps_native_fields_and_full_width_room() {
+    fn request_maps_seed_priority_choices_guidance_and_visible_stops() {
         let mut request = request();
-        request.bootstrap_info = Some(BootstrapInfo {
-            bootstrap_host: "prefill".to_string(),
-            bootstrap_port: 5000,
-            bootstrap_room: i64::MAX as u64,
-            handoff_id: None,
-        });
+        request.sampling_options.seed = Some(42);
+        request.sampling_options.n = Some(2);
+        request.sampling_options.best_of = Some(2);
+        request.sampling_options.guided_decoding =
+            Some(dynamo_backend_common::GuidedDecodingOptions::new(
+                None,
+                None,
+                Some(vec!["a".into(), "b".into()]),
+                None,
+                Some("xgrammar".into()),
+                None,
+                None,
+            ));
+        request.stop_conditions.stop_token_ids_visible = Some(vec![9]);
+        request.routing.get_or_insert_default().priority = Some(7);
         let mapped =
-            build_generate_request(&request, "rid-1", DisaggregationMode::Decode, None, None)
+            build_generate_request(&request, "rid", DisaggregationMode::Aggregated, None, None)
                 .unwrap();
-        assert_eq!(mapped.input_ids, vec![1, 2, 3]);
-        assert_eq!(mapped.rid.as_deref(), Some("rid-1"));
-        assert_eq!(mapped.sampling_params.unwrap().max_new_tokens, Some(8));
-        assert_eq!(
-            mapped.disaggregated_params.unwrap().bootstrap_room,
-            i64::MAX
+        let sampling = mapped.sampling_params.unwrap();
+        assert_eq!(sampling.seed, Some(42));
+        assert_eq!(sampling.n, Some(2));
+        assert!(sampling.token_stops[0].include_in_output);
+        assert_eq!(mapped.priority, 7);
+        assert!(matches!(
+            sampling.guided_decoding.unwrap().constraint,
+            Some(pb::guided_decoding::Constraint::Choice(_))
+        ));
+    }
+
+    #[test]
+    fn request_rejects_conflicting_stop_visibility() {
+        let mut request = request();
+        request.stop_conditions.stop_token_ids_hidden = Some(vec![9]);
+        request.stop_conditions.stop_token_ids_visible = Some(vec![9]);
+        assert!(
+            build_generate_request(&request, "rid", DisaggregationMode::Aggregated, None, None)
+                .unwrap_err()
+                .to_string()
+                .contains("both visible and hidden")
         );
     }
 
     #[test]
-    fn prefill_clamps_generation_and_disables_decode_only_options() {
-        let mut request = request();
-        request.stop_conditions.min_tokens = Some(4);
-        request.output_options = OutputOptions {
-            logprobs: Some(2),
-            prompt_logprobs: Some(3),
-            ..Default::default()
-        };
-        let mapped = build_generate_request(
-            &request,
-            "rid-2",
-            DisaggregationMode::Prefill,
-            Some("prefill"),
-            Some(5001),
+    fn embedding_batch_preserves_dimensions_and_base64_encoding() {
+        let request = serde_json::json!({
+            "model": "Qwen/Qwen3-Embedding-0.6B",
+            "input": ["one", "two"],
+            "dimensions": 2,
+            "encoding_format": "base64",
+        });
+        let mapped = build_embed_request(&request, "embed-rid").unwrap();
+        assert_eq!(mapped.inputs.len(), 2);
+        assert_eq!(mapped.dimensions, Some(2));
+        assert_eq!(mapped.encoding, pb::EmbeddingEncoding::Base64 as i32);
+
+        let response = map_embed_response(
+            pb::EmbedResponse {
+                embeddings: vec![pb::Embedding {
+                    index: 0,
+                    data: Some(pb::embedding::Data::PackedFloat32(vec![0, 0, 128, 63])),
+                }],
+                usage: Some(pb::Usage {
+                    prompt_tokens: 2,
+                    total_tokens: 2,
+                    ..Default::default()
+                }),
+            },
+            "Qwen/Qwen3-Embedding-0.6B",
         )
         .unwrap();
-        let sampling = mapped.sampling_params.unwrap();
-        assert_eq!(sampling.max_new_tokens, Some(1));
-        assert_eq!(sampling.min_new_tokens, None);
-        assert_eq!(mapped.return_logprob, Some(false));
-        assert_eq!(mapped.top_logprobs_num, Some(0));
-        assert_eq!(mapped.logprob_start_len, Some(-1));
-        assert_eq!(mapped.disaggregated_params.unwrap().bootstrap_port, 5001);
+        assert_eq!(response["data"][0]["embedding"], "AACAPw==");
+        assert_eq!(response["usage"]["total_tokens"], 2);
+    }
+
+    #[test]
+    fn multimodal_hash_cardinality_is_enforced() {
+        let mut request = request();
+        request.multi_modal_data = Some(std::collections::HashMap::from([(
+            "image_url".to_string(),
+            vec![MultimodalData::RawUrl("https://example/image.png".into())],
+        )]));
+        request.extra_args = Some(serde_json::json!({"mm_hashes": []}));
+        assert!(
+            build_generate_request(&request, "rid", DisaggregationMode::Aggregated, None, None)
+                .is_err()
+        );
     }
 
     #[test]
@@ -627,7 +1036,6 @@ mod tests {
         )
         .unwrap();
         let handoff = prefill.disaggregated_params.unwrap();
-
         let mut decode_request = request();
         decode_request.prefill_result = Some(PrefillResult {
             disaggregated_params: disaggregated_params_to_json(&handoff),
@@ -641,107 +1049,63 @@ mod tests {
             None,
         )
         .unwrap();
-
         assert_eq!(decode.disaggregated_params, Some(handoff));
     }
 
     #[test]
-    fn logprobs_are_sliced_from_cumulative_metadata() {
-        let meta = HashMap::from([
-            (
-                "output_token_logprobs".to_string(),
-                json!([[-0.1, 10, "a"], [-0.2, 11, "b"]]).to_string(),
-            ),
-            (
-                "output_top_logprobs".to_string(),
-                json!([[[-0.1, 10, "a"]], [[-0.2, 11, "b"]]]).to_string(),
-            ),
-        ]);
-        let (logprobs, top, next) = extract_logprobs(&meta, 1, false).unwrap();
-        assert_eq!(logprobs.unwrap(), vec![-0.2]);
-        assert_eq!(top.unwrap()[0][0].token_id, 11);
-        assert_eq!(next, 2);
-    }
-
-    #[test]
-    fn terminal_maps_finish_reason_and_usage() {
-        let meta = HashMap::from([(
-            "finish_reason".to_string(),
-            json!({"type": "length"}).to_string(),
-        )]);
-        let terminal = terminal_from_meta(&meta, 4, 3).unwrap();
-        assert_eq!(terminal.finish_reason, Some(FinishReason::Length));
-        assert_eq!(terminal.completion_usage.unwrap().total_tokens, 7);
-    }
-
-    #[test]
-    fn abort_terminal_preserves_failure_metadata_as_error() {
-        let meta = HashMap::from([(
-            "finish_reason".to_string(),
-            json!({
-                "type": "abort",
-                "message": "prefill allocation failed",
-                "status_code": 503,
-                "err_type": "KVTransferError"
-            })
-            .to_string(),
-        )]);
-        let error = terminal_from_meta(&meta, 4, 0).unwrap_err().to_string();
-        assert!(error.contains("prefill allocation failed"));
-        assert!(error.contains("status_code=503"));
-        assert!(error.contains("KVTransferError"));
-    }
-
-    #[test]
-    fn malformed_terminal_is_rejected() {
-        assert!(terminal_from_meta(&HashMap::new(), 4, 0).is_err());
-        let meta = HashMap::from([(
-            "finish_reason".to_string(),
-            json!({"type": "mystery"}).to_string(),
-        )]);
-        assert!(terminal_from_meta(&meta, 4, 0).is_err());
-    }
-
-    #[test]
-    fn terminal_engine_data_contains_prompt_logprobs_and_routed_experts() {
-        let meta = HashMap::from([
-            (
-                "input_token_logprobs".to_string(),
-                json!([[-0.1, 10, "a"], [-0.2, 11, "b"]]).to_string(),
-            ),
-            (
-                "input_top_logprobs".to_string(),
-                json!([[[-0.3, 12, "c"]], []]).to_string(),
-            ),
-            ("routed_experts".to_string(), json!([1, 2]).to_string()),
-        ]);
-        let data = engine_data_from_meta(&meta, true).unwrap().unwrap();
-        let prompt = data["prompt_logprobs"].as_array().unwrap();
-        assert!(prompt[0].is_null());
-        assert_eq!(prompt[1]["10"]["logprob"], json!(-0.1));
-        assert_eq!(prompt[1]["12"]["decoded_token"], json!("c"));
-        assert_eq!(data["routed_experts"], json!([1, 2]));
-    }
-
-    #[test]
-    fn prompt_logprobs_are_terminal_only() {
-        let meta = HashMap::from([(
-            "input_token_logprobs".to_string(),
-            json!([[-0.1, 10, "a"]]).to_string(),
-        )]);
-        assert!(engine_data_from_meta(&meta, false).unwrap().is_none());
-    }
-
-    #[test]
-    fn decode_requires_rendezvous_params() {
-        assert!(
-            build_generate_request(&request(), "rid-3", DisaggregationMode::Decode, None, None,)
-                .is_err()
+    fn response_preserves_choice_usage_logprobs_and_handoff() {
+        let response = pb::GenerateResponse {
+            choice_index: 1,
+            delta_output_ids: vec![7],
+            logprobs: Some(pb::Logprobs {
+                output: vec![pb::TokenLogprob {
+                    logprob: -0.2,
+                    token_id: 7,
+                    text: Some("x".into()),
+                    top_logprobs: vec![],
+                }],
+                prompt: vec![],
+            }),
+            usage: Some(pb::Usage {
+                prompt_tokens: 4,
+                completion_tokens: 1,
+                total_tokens: 5,
+                cached_prompt_tokens: 2,
+            }),
+            prefill_handoff: Some(pb::DisaggregatedParams {
+                bootstrap_host: "prefill".into(),
+                bootstrap_port: 5001,
+                bootstrap_room: 9,
+                ..Default::default()
+            }),
+            terminal: Some(pb::generate_response::Terminal::Finish(
+                pb::GenerationFinish {
+                    reason: pb::FinishReason::Stop.into(),
+                    stop_reason: None,
+                },
+            )),
+            ..Default::default()
+        };
+        let mapped = map_generate_response(response, 0, 0, false).unwrap();
+        assert_eq!(mapped.index, Some(1));
+        assert_eq!(mapped.finish_reason, Some(FinishReason::Stop));
+        let log_probs = mapped.log_probs.unwrap();
+        assert_eq!(log_probs.len(), 1);
+        assert!((log_probs[0] + 0.2).abs() < 1e-6);
+        assert!(mapped.disaggregated_params.is_some());
+        assert_eq!(
+            mapped
+                .completion_usage
+                .unwrap()
+                .prompt_tokens_details
+                .unwrap()
+                .cached_tokens,
+            Some(2)
         );
     }
 
     #[test]
-    fn room_above_signed_int64_is_rejected() {
+    fn full_width_room_is_checked() {
         let mut request = request();
         request.bootstrap_info = Some(BootstrapInfo {
             bootstrap_host: "prefill".to_string(),
@@ -750,7 +1114,7 @@ mod tests {
             handoff_id: None,
         });
         assert!(
-            build_generate_request(&request, "rid-4", DisaggregationMode::Decode, None, None,)
+            build_generate_request(&request, "rid", DisaggregationMode::Decode, None, None)
                 .is_err()
         );
     }
