@@ -38,6 +38,9 @@ repos:
   - id: clang-format
     types_or: [c, c++, cuda, proto, textproto, java]
     args: ["-fallback-style=none", "-style=file", "-i"]
+    # This temporary vendored contract must remain byte-for-byte identical to
+    # the frozen SGLang source recorded in its adjacent README and hash file.
+    exclude: ^lib/sglang-remote/proto/sglang/runtime/v1/sglang\.proto$
 - repo: https://github.com/codespell-project/codespell
   rev: v2.2.4
   hooks:

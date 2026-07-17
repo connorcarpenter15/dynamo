@@ -57,6 +57,9 @@ CODEOWNERS @ai-dynamo/Devops
 /lib/llm/tests/test_reasoning_parser.rs @ai-dynamo/dynamo-parser-codeowners
 /lib/llm/tests/test_streaming_tool_parsers.rs @ai-dynamo/dynamo-parser-codeowners
 
+# Native SGLang gRPC backend
+/lib/sglang-remote/ @ai-dynamo/dynamo-backend-sglang-codeowners
+
 # Docs — the docs group owns documentation surfaces: the docs site (docs/, fern/)
 # and the Markdown inside examples/ and recipes/. Code teams above still own all
 # non-Markdown (code, deploy configs) in examples/ and recipes/; only the prose
