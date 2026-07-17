@@ -1100,6 +1100,59 @@ mod tests {
     }
 
     #[test]
+    fn decoded_multimodal_input_maps_to_nixl_external_tensor() {
+        let descriptor = serde_json::from_value(serde_json::json!({
+            "nixl_metadata": "b64:metadata",
+            "nixl_descriptor": {
+                "addr": 4096,
+                "size": 48,
+                "mem_type": "Dram",
+                "device_id": 0,
+            },
+            "shape": [4, 4, 3],
+            "dtype": "UINT8",
+            "metadata": null,
+        }))
+        .unwrap();
+        let mut request = request();
+        request.multi_modal_data = Some(std::collections::HashMap::from([(
+            "image_url".to_string(),
+            vec![MultimodalData::Decoded(descriptor)],
+        )]));
+        request.extra_args = Some(serde_json::json!({"mm_hashes": ["canonical-hash"]}));
+
+        let mapped =
+            build_generate_request(&request, "rid", DisaggregationMode::Aggregated, None, None)
+                .unwrap();
+        assert_eq!(mapped.multimodal_inputs.len(), 1);
+        let input = &mapped.multimodal_inputs[0];
+        assert_eq!(input.routing_hash.as_deref(), Some("canonical-hash"));
+        let Some(pb::multimodal_input::Source::DecodedTensor(tensor)) = input.source.as_ref()
+        else {
+            panic!("decoded media did not map to a tensor");
+        };
+        assert_eq!(tensor.dtype, pb::TensorDataType::Uint8 as i32);
+        assert_eq!(tensor.shape, vec![4, 4, 3]);
+        let Some(pb::tensor::Storage::External(buffer)) = tensor.storage.as_ref() else {
+            panic!("decoded media did not map to external storage");
+        };
+        let Some(pb::external_buffer::Transport::Nixl(nixl)) = buffer.transport.as_ref() else {
+            panic!("decoded media did not map to NIXL");
+        };
+        assert_eq!(nixl.length, Some(48));
+        assert_eq!(nixl.metadata, br#""b64:metadata""#);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&nixl.descriptor).unwrap(),
+            serde_json::json!({
+                "addr": 4096,
+                "size": 48,
+                "mem_type": "Dram",
+                "device_id": 0,
+            })
+        );
+    }
+
+    #[test]
     fn prefill_handoff_round_trips_to_decode_request() {
         let prefill = build_generate_request(
             &request(),
