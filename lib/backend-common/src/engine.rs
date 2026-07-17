@@ -32,7 +32,7 @@ pub use dynamo_llm::protocols::common::preprocessor::{
 pub use dynamo_llm::protocols::common::{
     FinishReason, GuidedDecodingOptions, OutputOptions, SamplingOptions, StopConditions,
 };
-pub use dynamo_protocols::types::{CompletionUsage, StopReason};
+pub use dynamo_protocols::types::{CompletionUsage, PromptTokensDetails, StopReason};
 pub use dynamo_runtime::engine::AsyncEngineContext;
 
 /// Per-request handle wrapping the runtime context. `Deref`s to
@@ -201,8 +201,9 @@ pub trait LLMEngine: Send + Sync + 'static {
     ///
     /// Stream item: `Result<LLMEngineOutput, DynamoError>`.
     ///   * `Ok(chunk)` carries normal output. Exactly one terminal `Ok`
-    ///     chunk (one with `finish_reason` set) must be the last item
-    ///     yielded, and no items may follow it.
+    ///     chunk (one with `finish_reason` set) per requested choice must be
+    ///     yielded. Choices may interleave, but no item may follow the terminal
+    ///     for the same choice. Single-choice engines use choice index 0.
     ///   * `Err(dynamo_err)` carries a typed mid-stream failure (e.g.
     ///     `BackendError::InvalidArgument`). It is itself terminal — the
     ///     framework forwards it as `Annotated::error` and stops polling

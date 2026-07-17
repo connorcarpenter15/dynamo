@@ -23,8 +23,7 @@ use crate::args::{Args, TransportConfig, normalize_endpoint};
 use crate::client::{self, Client, Discovery, Pool};
 use crate::proto as pb;
 use crate::protocol::{
-    build_generate_request, disaggregated_params_to_json, engine_data_from_meta, extract_logprobs,
-    meta_u32, output_ids_to_u32, terminal_from_meta,
+    build_generate_request, disaggregated_params_to_json, map_generate_response,
 };
 
 pub struct SglangSidecarEngine {
@@ -191,7 +190,7 @@ impl LLMEngine for SglangSidecarEngine {
             .map(Pool::stream_client)
             .ok_or_else(|| client::engine_shutdown("generate called before start"))?;
 
-        let prompt_tokens = request.token_ids.len() as u32;
+        let prompt_tokens = u32::try_from(request.token_ids.len()).unwrap_or(u32::MAX);
         let return_tokens_as_ids = request
             .output_options
             .return_tokens_as_token_ids
@@ -211,12 +210,22 @@ impl LLMEngine for SglangSidecarEngine {
         } else {
             None
         };
+        let expected_choices = if self.disaggregation_mode.is_prefill() {
+            1_u32
+        } else {
+            u32::from(request.sampling_options.n.unwrap_or(1))
+        };
         let cancel = self.cancel.clone();
         let is_prefill = self.disaggregation_mode.is_prefill();
 
         Ok(Box::pin(async_stream::stream! {
             if ctx.is_stopped() || cancel.is_cancelled() {
-                yield Ok(LLMEngineOutput::cancelled().with_usage(usage(prompt_tokens, 0)));
+                for index in 0..expected_choices {
+                    let mut output = LLMEngineOutput::cancelled()
+                        .with_usage(usage(prompt_tokens, 0));
+                    output.index = Some(index);
+                    yield Ok(output);
+                }
                 return;
             }
 
@@ -228,7 +237,12 @@ impl LLMEngine for SglangSidecarEngine {
                 response = grpc_client.generate(grpc_request) => Some(response),
             };
             let Some(opened) = opened else {
-                yield Ok(LLMEngineOutput::cancelled().with_usage(usage(prompt_tokens, 0)));
+                for index in 0..expected_choices {
+                    let mut output = LLMEngineOutput::cancelled()
+                        .with_usage(usage(prompt_tokens, 0));
+                    output.index = Some(index);
+                    yield Ok(output);
+                }
                 return;
             };
             let mut stream = match opened {
@@ -239,29 +253,45 @@ impl LLMEngine for SglangSidecarEngine {
                 }
             };
 
-            let mut generated = 0_u32;
-            let mut observed_prompt_tokens = prompt_tokens;
-            let mut logprob_offset = 0_usize;
+            let mut generated_by_choice = HashMap::<u32, u32>::new();
+            let mut terminal_choices = std::collections::HashSet::<u32>::new();
             loop {
                 tokio::select! {
                     biased;
                     _ = ctx.stopped() => {
-                        yield Ok(LLMEngineOutput::cancelled()
-                            .with_usage(usage(observed_prompt_tokens, generated)));
+                        for index in 0..expected_choices {
+                            if terminal_choices.insert(index) {
+                                let generated = generated_by_choice.get(&index).copied().unwrap_or(0);
+                                let mut output = LLMEngineOutput::cancelled()
+                                    .with_usage(usage(prompt_tokens, generated));
+                                output.index = Some(index);
+                                yield Ok(output);
+                            }
+                        }
                         break;
                     }
                     _ = cancel.cancelled() => {
-                        yield Ok(LLMEngineOutput::cancelled()
-                            .with_usage(usage(observed_prompt_tokens, generated)));
+                        for index in 0..expected_choices {
+                            if terminal_choices.insert(index) {
+                                let generated = generated_by_choice.get(&index).copied().unwrap_or(0);
+                                let mut output = LLMEngineOutput::cancelled()
+                                    .with_usage(usage(prompt_tokens, generated));
+                                output.index = Some(index);
+                                yield Ok(output);
+                            }
+                        }
                         break;
                     }
                     message = stream.message() => {
                         let response = match message {
                             Ok(Some(response)) => response,
                             Ok(None) => {
-                                yield Err(client::engine_shutdown(
-                                    "SGLang closed Generate before a finished response",
-                                ));
+                                if terminal_choices.len() != expected_choices as usize {
+                                    yield Err(client::engine_shutdown(format!(
+                                        "SGLang closed Generate after {}/{} terminal choices",
+                                        terminal_choices.len(), expected_choices
+                                    )));
+                                }
                                 break;
                             }
                             Err(status) => {
@@ -270,93 +300,53 @@ impl LLMEngine for SglangSidecarEngine {
                             }
                         };
 
-                        if let Some(value) = meta_u32(&response.meta_info, "prompt_tokens") {
-                            observed_prompt_tokens = value;
-                        }
-                        let token_ids = match output_ids_to_u32(&response.output_ids) {
-                            Ok(ids) => ids,
-                            Err(err) => {
-                                yield Err(err);
+                        let choice = match u32::try_from(response.choice_index) {
+                            Ok(choice) if choice < expected_choices => choice,
+                            _ => {
+                                yield Err(client::protocol_error(format!(
+                                    "SGLang returned choice index {} outside 0..{}",
+                                    response.choice_index, expected_choices
+                                )));
                                 break;
                             }
                         };
-                        let (log_probs, top_logprobs, next_offset) =
-                            match extract_logprobs(
-                                &response.meta_info,
-                                logprob_offset,
-                                return_tokens_as_ids,
-                            ) {
-                                Ok(values) => values,
-                                Err(err) => {
-                                    yield Err(err);
-                                    break;
-                                }
-                            };
-                        logprob_offset = next_offset;
-
-                        if is_prefill {
-                            if response.finished {
-                                let mut terminal = match terminal_from_meta(
-                                    &response.meta_info,
-                                    observed_prompt_tokens,
-                                    0,
-                                ) {
-                                    Ok(terminal) => terminal,
-                                    Err(error) => {
-                                        yield Err(error);
-                                        break;
-                                    }
-                                };
-                                terminal.disaggregated_params = prefill_handoff.clone();
-                                yield Ok(terminal);
-                                break;
-                            }
-                            continue;
-                        }
-
-                        generated = generated.saturating_add(token_ids.len() as u32);
-                        if response.finished {
-                            let mut terminal = match terminal_from_meta(
-                                &response.meta_info,
-                                observed_prompt_tokens,
-                                generated,
-                            ) {
-                                Ok(terminal) => terminal,
-                                Err(error) => {
-                                    yield Err(error);
-                                    break;
-                                }
-                            };
-                            let engine_data = match engine_data_from_meta(&response.meta_info, true) {
-                                Ok(engine_data) => engine_data,
-                                Err(error) => {
-                                    yield Err(error);
-                                    break;
-                                }
-                            };
-                            terminal.token_ids = token_ids;
-                            terminal.log_probs = log_probs;
-                            terminal.top_logprobs = top_logprobs;
-                            terminal.engine_data = engine_data;
-                            yield Ok(terminal);
+                        if terminal_choices.contains(&choice) {
+                            yield Err(client::protocol_error(format!(
+                                "SGLang returned data after terminal for choice {choice}"
+                            )));
                             break;
                         }
-
-                        if !token_ids.is_empty() {
-                            let engine_data = match engine_data_from_meta(&response.meta_info, false) {
-                                Ok(engine_data) => engine_data,
-                                Err(error) => {
-                                    yield Err(error);
-                                    break;
-                                }
-                            };
-                            yield Ok(LLMEngineOutput {
-                                token_ids,
-                                log_probs,
-                                top_logprobs,
-                                engine_data,
-                                ..Default::default()
-                            });
+                        let delta_len = u32::try_from(response.delta_output_ids.len())
+                            .unwrap_or(u32::MAX);
+                        let generated = generated_by_choice.entry(choice).or_default();
+                        *generated = generated.saturating_add(delta_len);
+                        let is_terminal = response.terminal.is_some();
+                        let mut mapped = match map_generate_response(
+                            response,
+                            prompt_tokens,
+                            *generated,
+                            return_tokens_as_ids,
+                        ) {
+                            Ok(mapped) => mapped,
+                            Err(error) => {
+                                yield Err(error);
+                                break;
+                            }
+                        };
+                        if is_prefill && !is_terminal {
+                            continue;
+                        }
+                        if is_prefill && is_terminal {
+                            mapped.disaggregated_params = prefill_handoff.clone();
+                        }
+                        if is_terminal {
+                            terminal_choices.insert(choice);
+                        }
+                        if !mapped.token_ids.is_empty() || is_terminal {
+                            yield Ok(mapped);
+                        }
+                        if terminal_choices.len() == expected_choices as usize {
+                            break;
                         }
                     }
                 }

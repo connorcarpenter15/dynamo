@@ -7,6 +7,7 @@
 //! Decode-mode disagg defers `engine.abort()` until the first chunk to
 //! avoid orphaning the prefill peer's NIXL KV transfer.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -203,6 +204,11 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
     ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
         let (request, handle) = input.into_parts();
         let ctx: Arc<dyn AsyncEngineContext> = handle.context();
+        let expected_terminals = if self.mode.is_prefill() {
+            1_usize
+        } else {
+            usize::from(request.sampling_options.n.unwrap_or(1))
+        };
 
         // Per-request worker-side span. Nests under `handle_payload` (set up
         // by the runtime's NATS ingress) so the trace tree has a contiguous
@@ -357,7 +363,8 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
         let guard = CancelMonitorGuard { drop_token };
 
         #[cfg(debug_assertions)]
-        let chunks = crate::validate::wrap(chunks, self.mode);
+        let chunks =
+            crate::validate::wrap(chunks, self.mode, expected_terminals, Some(ctx.clone()));
 
         let stream_ctx = ctx.clone();
         let stream_span = span.clone();
@@ -375,6 +382,7 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
             let mut chunk_count: usize = 0;
             let mut output_token_count: usize = 0;
             let mut signalled = false;
+            let mut terminal_choices = HashSet::<u32>::new();
             // ITL samples (ms) — millisecond gap between successive non-empty
             // token chunks. Aggregate; we only render percentiles at terminal
             // so the per-chunk overhead is one timestamp + one Vec push.
@@ -440,10 +448,14 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
                         {
                             chunk.worker_trace_link = Some(link.clone());
                         }
+                        let terminal_choice = is_terminal.then_some(chunk.index.unwrap_or(0));
                         yield Annotated::from_data(chunk);
                         if is_terminal {
-                            finalizer.mark_completed();
-                            break;
+                            terminal_choices.insert(terminal_choice.expect("terminal choice"));
+                            if terminal_choices.len() >= expected_terminals {
+                                finalizer.mark_completed();
+                                break;
+                            }
                         }
                     }
                     Err(dynamo_err) => {
