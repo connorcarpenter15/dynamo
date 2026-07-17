@@ -449,14 +449,15 @@ fn lora_name(body: &Value) -> Result<String, DynamoError> {
 
 fn success(name: &str, action: &str) -> Value {
     json!({
-        "status": "success",
+        "status": "ok",
+        "success": true,
         "message": format!("LoRA adapter `{name}` {action}"),
         "lora_name": name,
     })
 }
 
 fn error(message: impl Into<String>) -> Value {
-    json!({"status": "error", "message": message.into()})
+    json!({"status": "error", "success": false, "message": message.into()})
 }
 
 fn topology(
@@ -544,5 +545,22 @@ mod tests {
         assert_eq!(lora_name(&json!({"lora_name": "a"})).unwrap(), "a");
         assert_eq!(lora_name(&json!({"name": "b"})).unwrap(), "b");
         assert!(lora_name(&json!({})).is_err());
+    }
+
+    #[test]
+    fn management_results_use_the_standard_status_envelope() {
+        assert_eq!(
+            success("adapter", "loaded"),
+            json!({
+                "status": "ok",
+                "success": true,
+                "message": "LoRA adapter `adapter` loaded",
+                "lora_name": "adapter",
+            })
+        );
+        assert_eq!(
+            error("failed"),
+            json!({"status": "error", "success": false, "message": "failed"})
+        );
     }
 }
