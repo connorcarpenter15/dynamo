@@ -1,14 +1,9 @@
-// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: Apache-2.0
-
-// Temporary copy of the SGLang sidecar's native gRPC contract. See README.md
-// for provenance and the removal plan.
-
 syntax = "proto3";
 package sglang.runtime.v1;
 
-service SglangService
-{
+import "google/protobuf/struct.proto";
+
+service SglangService {
   // SGLang-native RPCs (typed proto)
   rpc TextGenerate(TextGenerateRequest) returns (stream TextGenerateResponse);
   rpc Generate(GenerateRequest) returns (stream GenerateResponse);
@@ -49,16 +44,14 @@ service SglangService
 // the room id; the decode leg fetches it from the same room. Both legs
 // receive the same `bootstrap_room` from the router so they rendezvous
 // on the KV transfer.
-message DisaggregatedParams
-{
+message DisaggregatedParams {
   string bootstrap_host = 1;
   int32 bootstrap_port = 2;
   int64 bootstrap_room = 3;
 }
 
 // Sampling parameters shared across text and tokenized RPCs.
-message SamplingParams
-{
+message SamplingParams {
   optional float temperature = 1;
   optional float top_p = 2;
   optional int32 top_k = 3;
@@ -72,14 +65,31 @@ message SamplingParams
   repeated int32 stop_token_ids = 11;
   optional bool ignore_eos = 12;
   optional int32 n = 13;
-  optional string json_schema = 14;
-  optional string regex = 15;
+  reserved 14, 15;
+  reserved "json_schema", "regex";
+  optional int64 seed = 16;
+  optional GuidedDecoding guided_decoding = 17;
+  optional bool require_reasoning = 18;
+  optional uint32 max_thinking_tokens = 19;
+}
+
+message GuidedDecoding {
+  oneof constraint {
+    string json_schema = 1;
+    string regex = 2;
+    string ebnf = 3;
+    ChoiceConstraint choice = 4;
+    string structural_tag = 5;
+  }
+}
+
+message ChoiceConstraint {
+  repeated string values = 1;
 }
 
 // ---- Text-based generate (text in, text out) ----
 
-message TextGenerateRequest
-{
+message TextGenerateRequest {
   string text = 1;
   optional SamplingParams sampling_params = 2;
   optional bool stream = 3;
@@ -94,19 +104,27 @@ message TextGenerateRequest
   map<string, string> trace_headers = 12;
   optional string session_id = 13;
   optional DisaggregatedParams disaggregated_params = 14;
+  optional int32 priority = 15;
 }
 
-message TextGenerateResponse
-{
-  string text = 1;
-  map<string, string> meta_info = 2;
-  bool finished = 3;
+message TextGenerateResponse {
+  string delta_text = 1;
+  reserved 2, 3;
+  reserved "meta_info", "finished";
+  int32 choice_index = 4;
+  optional Logprobs logprobs = 5;
+  optional Usage usage = 6;
+  optional RoutedExpertMetadata routed_experts = 7;
+  google.protobuf.Struct engine_metadata = 8;
+  oneof terminal {
+    GenerationFinish finish = 9;
+    GenerationError error = 10;
+  }
 }
 
 // ---- Tokenized generate (input_ids in, token_ids out) ----
 
-message GenerateRequest
-{
+message GenerateRequest {
   repeated int32 input_ids = 1;
   optional SamplingParams sampling_params = 2;
   optional bool stream = 3;
@@ -120,43 +138,114 @@ message GenerateRequest
   map<string, string> trace_headers = 11;
   optional string session_id = 12;
   optional DisaggregatedParams disaggregated_params = 13;
+  optional int32 priority = 14;
 }
 
-message GenerateResponse
-{
-  repeated int32 output_ids = 1;
-  map<string, string> meta_info = 2;
-  bool finished = 3;
+message GenerateResponse {
+  repeated int32 delta_output_ids = 1;
+  reserved 2, 3;
+  reserved "meta_info", "finished";
+  int32 choice_index = 4;
+  optional Logprobs logprobs = 5;
+  optional Usage usage = 6;
+  optional RoutedExpertMetadata routed_experts = 7;
+  google.protobuf.Struct engine_metadata = 8;
+  oneof terminal {
+    GenerationFinish finish = 9;
+    GenerationError error = 10;
+  }
+}
+
+message LogprobAlternative {
+  float logprob = 1;
+  int32 token_id = 2;
+  optional string text = 3;
+  optional int32 rank = 4;
+}
+
+message TokenLogprob {
+  float logprob = 1;
+  int32 token_id = 2;
+  optional string text = 3;
+  repeated LogprobAlternative top_logprobs = 4;
+}
+
+message Logprobs {
+  repeated TokenLogprob output = 1;
+  repeated TokenLogprob prompt = 2;
+}
+
+message Usage {
+  uint64 prompt_tokens = 1;
+  uint64 completion_tokens = 2;
+  uint64 total_tokens = 3;
+  uint64 cached_prompt_tokens = 4;
+}
+
+message RoutedExpertMetadata {
+  bytes packed_expert_ids = 1;
+  repeated int64 shape = 2;
+  int32 start_position = 3;
+}
+
+enum FinishReason {
+  FINISH_REASON_UNSPECIFIED = 0;
+  FINISH_REASON_STOP = 1;
+  FINISH_REASON_LENGTH = 2;
+  FINISH_REASON_CANCELLED = 3;
+}
+
+message StopReason {
+  oneof reason {
+    string matched_string = 1;
+    int32 matched_token_id = 2;
+  }
+}
+
+message GenerationFinish {
+  FinishReason reason = 1;
+  optional StopReason stop_reason = 2;
+}
+
+enum GenerationErrorCode {
+  GENERATION_ERROR_CODE_UNSPECIFIED = 0;
+  GENERATION_ERROR_CODE_INVALID_ARGUMENT = 1;
+  GENERATION_ERROR_CODE_CANCELLED = 2;
+  GENERATION_ERROR_CODE_UNAVAILABLE = 3;
+  GENERATION_ERROR_CODE_INTERNAL = 4;
+  GENERATION_ERROR_CODE_DEADLINE_EXCEEDED = 5;
+}
+
+message GenerationError {
+  GenerationErrorCode code = 1;
+  string message = 2;
+  bool retryable = 3;
 }
 
 // ---- Text-based embed (text in, embedding out) ----
 
-message TextEmbedRequest
-{
+message TextEmbedRequest {
   string text = 1;
   optional string rid = 2;
   optional string routing_key = 3;
   map<string, string> trace_headers = 4;
 }
 
-message TextEmbedResponse
-{
+message TextEmbedResponse {
   repeated float embedding = 1;
   map<string, string> meta_info = 2;
 }
 
 // ---- Tokenized embed (input_ids in, embedding out) ----
 
-message EmbedRequest
-{
+message EmbedRequest {
   repeated int32 input_ids = 1;
   optional string rid = 2;
   optional string routing_key = 3;
   map<string, string> trace_headers = 4;
 }
 
-message EmbedResponse
-{
+message EmbedResponse {
   repeated float embedding = 1;
   map<string, string> meta_info = 2;
 }
@@ -165,8 +254,7 @@ message EmbedResponse
 
 message HealthCheckRequest {}
 
-message HealthCheckResponse
-{
+message HealthCheckResponse {
   bool healthy = 1;
 }
 
@@ -174,8 +262,7 @@ message HealthCheckResponse
 
 message GetModelInfoRequest {}
 
-message GetModelInfoResponse
-{
+message GetModelInfoResponse {
   string model_path = 1;
   string json_info = 2;
 }
@@ -184,28 +271,24 @@ message GetModelInfoResponse
 
 message GetServerInfoRequest {}
 
-message GetServerInfoResponse
-{
+message GetServerInfoResponse {
   string json_info = 1;
 }
 
 // ---- Abort ----
 
-message AbortRequest
-{
+message AbortRequest {
   string rid = 1;
   bool abort_all = 2;
 }
 
-message AbortResponse
-{
+message AbortResponse {
   bool success = 1;
 }
 
 // ---- Classify (same internal path as embed, uses EmbeddingReqInput) ----
 
-message ClassifyRequest
-{
+message ClassifyRequest {
   string text = 1;
   repeated int32 input_ids = 2;
   optional string rid = 3;
@@ -213,35 +296,30 @@ message ClassifyRequest
   map<string, string> trace_headers = 5;
 }
 
-message ClassifyResponse
-{
+message ClassifyResponse {
   repeated float embedding = 1;
   map<string, string> meta_info = 2;
 }
 
 // ---- Tokenize / Detokenize (local ops, no inference) ----
 
-message TokenizeRequest
-{
+message TokenizeRequest {
   string text = 1;
   optional bool add_special_tokens = 2;
 }
 
-message TokenizeResponse
-{
+message TokenizeResponse {
   repeated int32 tokens = 1;
   int32 count = 2;
   int32 max_model_len = 3;
   string input_text = 4;
 }
 
-message DetokenizeRequest
-{
+message DetokenizeRequest {
   repeated int32 tokens = 1;
 }
 
-message DetokenizeResponse
-{
+message DetokenizeResponse {
   string text = 1;
 }
 
@@ -249,13 +327,11 @@ message DetokenizeResponse
 
 message ListModelsRequest {}
 
-message ListModelsResponse
-{
+message ListModelsResponse {
   repeated ModelCard models = 1;
 }
 
-message ModelCard
-{
+message ModelCard {
   string id = 1;
   string root = 2;
   optional string parent = 3;
@@ -264,13 +340,11 @@ message ModelCard
 
 // ---- Get load ----
 
-message GetLoadRequest
-{
+message GetLoadRequest {
   optional int32 dp_rank = 1;
 }
 
-message GetLoadResponse
-{
+message GetLoadResponse {
   string json_info = 1;
 }
 
@@ -278,80 +352,68 @@ message GetLoadResponse
 
 message FlushCacheRequest {}
 
-message FlushCacheResponse
-{
+message FlushCacheResponse {
   bool success = 1;
   string message = 2;
 }
 
 // ---- Pause / Continue generation ----
 
-message PauseGenerationRequest
-{
+message PauseGenerationRequest {
   string mode = 1;
 }
 
-message PauseGenerationResponse
-{
+message PauseGenerationResponse {
   string message = 1;
 }
 
 message ContinueGenerationRequest {}
 
-message ContinueGenerationResponse
-{
+message ContinueGenerationResponse {
   string message = 1;
 }
 
 // ---- OpenAI-compatible pass-through messages ----
 
-message OpenAIRequest
-{
+message OpenAIRequest {
   bytes json_body = 1;
   map<string, string> trace_headers = 2;
 }
 
-message OpenAIStreamChunk
-{
+message OpenAIStreamChunk {
   bytes json_chunk = 1;
   bool finished = 2;
 }
 
-message OpenAIResponse
-{
+message OpenAIResponse {
   bytes json_body = 1;
   int32 status_code = 2;
 }
 
 // ---- Admin: Profile ----
 
-message StartProfileRequest
-{
+message StartProfileRequest {
   optional string output_dir = 1;
 }
 
-message StartProfileResponse
-{
+message StartProfileResponse {
   string message = 1;
 }
 
 message StopProfileRequest {}
 
-message StopProfileResponse
-{
+message StopProfileResponse {
   string message = 1;
 }
 
 // ---- Admin: Weight update ----
 
-message UpdateWeightsRequest
-{
+message UpdateWeightsRequest {
   string model_path = 1;
   optional string load_format = 2;
 }
 
-message UpdateWeightsResponse
-{
+message UpdateWeightsResponse {
   bool success = 1;
   string message = 2;
 }
