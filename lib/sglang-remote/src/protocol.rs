@@ -476,13 +476,26 @@ fn prost_to_json(value: ProstValue) -> Value {
     match value.kind {
         None | Some(Kind::NullValue(_)) => Value::Null,
         Some(Kind::BoolValue(value)) => Value::Bool(value),
-        Some(Kind::NumberValue(value)) => serde_json::json!(value),
+        Some(Kind::NumberValue(value)) => prost_number_to_json(value),
         Some(Kind::StringValue(value)) => Value::String(value),
         Some(Kind::ListValue(value)) => {
             Value::Array(value.values.into_iter().map(prost_to_json).collect())
         }
         Some(Kind::StructValue(value)) => prost_struct_to_json(value),
     }
+}
+
+fn prost_number_to_json(value: f64) -> Value {
+    // google.protobuf.Struct represents every JSON number as an f64. Recover
+    // integer-valued numbers within IEEE-754's exact range so OpenAI-shaped
+    // media responses still deserialize into fields such as `created: u32`.
+    const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+    if value.is_finite() && value.fract() == 0.0 && value.abs() <= MAX_SAFE_INTEGER {
+        return Value::Number((value as i64).into());
+    }
+    serde_json::Number::from_f64(value)
+        .map(Value::Number)
+        .unwrap_or(Value::Null)
 }
 
 fn resolve_disaggregated_params(
@@ -940,7 +953,7 @@ mod tests {
 
     use super::{
         build_embed_request, build_generate_request, disaggregated_params_to_json,
-        map_embed_response, map_generate_response,
+        json_object_to_struct, map_embed_response, map_generate_response, prost_struct_to_json,
     };
     use crate::proto as pb;
 
@@ -987,6 +1000,24 @@ mod tests {
             sampling.guided_decoding.unwrap().constraint,
             Some(pb::guided_decoding::Constraint::Choice(_))
         ));
+    }
+
+    #[test]
+    fn protobuf_struct_recovers_integer_valued_json_numbers() {
+        let original = serde_json::json!({
+            "created": 1_784_253_717,
+            "num_inference_steps": 2,
+            "guidance_scale": 7.5,
+            "nested": [3, 1.25],
+        });
+        let round_trip =
+            prost_struct_to_json(json_object_to_struct(&original).expect("JSON object"));
+
+        assert_eq!(round_trip["created"].as_u64(), Some(1_784_253_717));
+        assert_eq!(round_trip["num_inference_steps"].as_u64(), Some(2));
+        assert_eq!(round_trip["guidance_scale"].as_f64(), Some(7.5));
+        assert_eq!(round_trip["nested"][0].as_u64(), Some(3));
+        assert_eq!(round_trip["nested"][1].as_f64(), Some(1.25));
     }
 
     #[test]
