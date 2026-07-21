@@ -813,7 +813,6 @@ mod tests {
             usage: Some(pb::Usage {
                 prompt_tokens: 4,
                 completion_tokens: 1,
-                total_tokens: 5,
                 cached_prompt_tokens: 2,
             }),
             routed_experts: Some(pb::RoutedExpertMetadata {
