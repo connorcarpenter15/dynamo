@@ -35,3 +35,4 @@ uuid = { workspace = true }
 [dev-dependencies]
 dynamo-backend-common = { workspace = true, features = ["testing"] }
 tokio-stream = { workspace = true, features = ["net"] }
+pprof = { version = "0.14", features = ["flamegraph"] }
