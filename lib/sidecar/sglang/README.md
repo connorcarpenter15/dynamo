@@ -37,9 +37,9 @@ same unified worker lifecycle as the standalone executable.
 The sidecar uses SGLang's typed generation response fields directly. It
 supports independently interleaved choices, typed usage (including cached
 prompt tokens), output and prompt logprobs, stop reasons, per-choice errors,
-routed-expert data, and engine extensions. Requests forward deterministic
-seeds, engine priority, reasoning/thinking controls, and one guided-decoding
-constraint: JSON schema, regex, EBNF grammar, choices, or structural tags.
+and engine extensions. Requests forward deterministic seeds, engine priority,
+reasoning/thinking controls, and one guided-decoding constraint: JSON schema,
+regex, EBNF grammar, choices, or structural tags.
 
 The source proto is temporarily vendored under `proto/`; its README records
 the exact SGLang fork commit and SHA-256. This remains a focused text-generation

@@ -23,7 +23,7 @@ use crate::args::{Args, TransportConfig, normalize_endpoint};
 use crate::client::{self, Client, Discovery, Pool};
 use crate::proto as pb;
 use crate::protocol::{
-    build_generate_request, disaggregated_params_to_json, map_generate_response,
+    build_generate_request, disaggregated_params_to_json, map_typed_generate_response,
 };
 
 pub struct SglangSidecarEngine {
@@ -234,7 +234,7 @@ impl LLMEngine for SglangSidecarEngine {
                 biased;
                 _ = ctx.stopped() => None,
                 _ = cancel.cancelled() => None,
-                response = grpc_client.generate(grpc_request) => Some(response),
+                response = grpc_client.typed_generate(grpc_request) => Some(response),
             };
             let Some(opened) = opened else {
                 for index in 0..expected_choices {
@@ -248,12 +248,13 @@ impl LLMEngine for SglangSidecarEngine {
             let mut stream = match opened {
                 Ok(response) => response.into_inner(),
                 Err(status) => {
-                    yield Err(client::status_to_dynamo("Generate", status));
+                    yield Err(client::typed_generate_status_to_dynamo(status));
                     return;
                 }
             };
 
             let mut generated_by_choice = HashMap::<u32, u32>::new();
+            let mut prompt_logprobs_by_choice = HashMap::<u32, Value>::new();
             let mut terminal_choices = std::collections::HashSet::<u32>::new();
             loop {
                 tokio::select! {
@@ -265,6 +266,12 @@ impl LLMEngine for SglangSidecarEngine {
                                 let mut output = LLMEngineOutput::cancelled()
                                     .with_usage(usage(prompt_tokens, generated));
                                 output.index = Some(index);
+                                defer_prompt_logprobs_until_terminal(
+                                    &mut output,
+                                    index,
+                                    true,
+                                    &mut prompt_logprobs_by_choice,
+                                );
                                 yield Ok(output);
                             }
                         }
@@ -277,6 +284,12 @@ impl LLMEngine for SglangSidecarEngine {
                                 let mut output = LLMEngineOutput::cancelled()
                                     .with_usage(usage(prompt_tokens, generated));
                                 output.index = Some(index);
+                                defer_prompt_logprobs_until_terminal(
+                                    &mut output,
+                                    index,
+                                    true,
+                                    &mut prompt_logprobs_by_choice,
+                                );
                                 yield Ok(output);
                             }
                         }
@@ -288,14 +301,14 @@ impl LLMEngine for SglangSidecarEngine {
                             Ok(None) => {
                                 if terminal_choices.len() != expected_choices as usize {
                                     yield Err(client::engine_shutdown(format!(
-                                        "SGLang closed Generate after {}/{} terminal choices",
+                                        "SGLang closed TypedGenerate after {}/{} terminal choices",
                                         terminal_choices.len(), expected_choices
                                     )));
                                 }
                                 break;
                             }
                             Err(status) => {
-                                yield Err(client::status_to_dynamo("Generate", status));
+                                yield Err(client::typed_generate_status_to_dynamo(status));
                                 break;
                             }
                         };
@@ -321,8 +334,9 @@ impl LLMEngine for SglangSidecarEngine {
                         let generated = generated_by_choice.entry(choice).or_default();
                         *generated = generated.saturating_add(delta_len);
                         let is_terminal = response.terminal.is_some();
-                        let mut mapped = match map_generate_response(
+                        let mut mapped = match map_typed_generate_response(
                             response,
+                            ctx.id(),
                             prompt_tokens,
                             *generated,
                             return_tokens_as_ids,
@@ -333,6 +347,12 @@ impl LLMEngine for SglangSidecarEngine {
                                 break;
                             }
                         };
+                        defer_prompt_logprobs_until_terminal(
+                            &mut mapped,
+                            choice,
+                            is_terminal,
+                            &mut prompt_logprobs_by_choice,
+                        );
                         if is_prefill && !is_terminal {
                             continue;
                         }
@@ -377,6 +397,38 @@ impl LLMEngine for SglangSidecarEngine {
         self.cancel.cancel();
         tracing::info!("sglang sidecar shutdown complete");
         Ok(())
+    }
+}
+
+fn defer_prompt_logprobs_until_terminal(
+    output: &mut LLMEngineOutput,
+    choice: u32,
+    is_terminal: bool,
+    deferred: &mut HashMap<u32, Value>,
+) {
+    let prompt_logprobs = output
+        .engine_data
+        .as_mut()
+        .and_then(Value::as_object_mut)
+        .and_then(|data| data.remove("prompt_logprobs"));
+    if let Some(prompt_logprobs) = prompt_logprobs {
+        deferred.entry(choice).or_insert(prompt_logprobs);
+    }
+    if output
+        .engine_data
+        .as_ref()
+        .and_then(Value::as_object)
+        .is_some_and(serde_json::Map::is_empty)
+    {
+        output.engine_data = None;
+    }
+    if is_terminal && let Some(prompt_logprobs) = deferred.remove(&choice) {
+        let data = output
+            .engine_data
+            .get_or_insert_with(|| Value::Object(serde_json::Map::new()))
+            .as_object_mut()
+            .expect("engine_data initialized as an object");
+        data.insert("prompt_logprobs".to_string(), prompt_logprobs);
     }
 }
 
@@ -598,7 +650,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        DisaggregationMode, Discovery, build_engine_config, resolve_bootstrap_host_with_local,
+        DisaggregationMode, Discovery, build_engine_config, defer_prompt_logprobs_until_terminal,
+        resolve_bootstrap_host_with_local,
     };
 
     fn discovery(server_info: serde_json::Value) -> Discovery {
@@ -610,6 +663,25 @@ mod tests {
             model_info: json!({}),
             server_info,
         }
+    }
+
+    #[test]
+    fn prompt_logprobs_are_deferred_to_a_matching_cancellation_terminal() {
+        let mut deferred = std::collections::HashMap::new();
+        let mut initial = dynamo_backend_common::LLMEngineOutput {
+            engine_data: Some(json!({"prompt_logprobs": [{"1": {"logprob": -0.1}}]})),
+            ..Default::default()
+        };
+        defer_prompt_logprobs_until_terminal(&mut initial, 1, false, &mut deferred);
+        assert!(initial.engine_data.is_none());
+
+        let mut terminal = dynamo_backend_common::LLMEngineOutput::cancelled();
+        defer_prompt_logprobs_until_terminal(&mut terminal, 1, true, &mut deferred);
+        assert_eq!(
+            terminal.engine_data.unwrap()["prompt_logprobs"],
+            json!([{"1": {"logprob": -0.1}}])
+        );
+        assert!(deferred.is_empty());
     }
 
     #[test]
