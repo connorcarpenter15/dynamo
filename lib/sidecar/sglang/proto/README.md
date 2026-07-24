@@ -12,6 +12,6 @@ wheel as a build dependency, and compile the packaged proto instead.
 
 The focused typed-generation contract was copied from Connor's SGLang fork at
 schema commit
-[`1d0f82451b9a74aab79596b41c38dbbad17cff0d`](https://github.com/connorcarpenter15/sglang/commit/1d0f82451b9a74aab79596b41c38dbbad17cff0d).
+[`c19ce1d21ebd5a7f6afa35c5be2d1c344ce741f7`](https://github.com/connorcarpenter15/sglang/commit/c19ce1d21ebd5a7f6afa35c5be2d1c344ce741f7).
 The source and vendored file SHA-256 is
 `3fd236326112e46b1ec7b3f3ee62933ba4757e96499d11620c404f6c6d134abe`.
