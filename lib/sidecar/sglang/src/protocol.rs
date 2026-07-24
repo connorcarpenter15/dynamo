@@ -387,8 +387,8 @@ fn prost_number_to_json(value: f64) -> Value {
         .unwrap_or(Value::Null)
 }
 
-pub(crate) fn map_typed_generate_response(
-    response: pb::TypedGenerateResponse,
+pub(crate) fn map_generate_response(
+    response: pb::GenerateResponse,
     expected_request_id: &str,
     fallback_prompt_tokens: u32,
     fallback_completion_tokens: u32,
@@ -396,12 +396,12 @@ pub(crate) fn map_typed_generate_response(
 ) -> Result<LLMEngineOutput, DynamoError> {
     if response.request_id.trim().is_empty() {
         return Err(client::protocol_error(
-            "SGLang TypedGenerate returned an empty request_id",
+            "SGLang server is incompatible with this sidecar: Generate returned no typed request_id",
         ));
     }
     if response.request_id != expected_request_id {
         return Err(client::protocol_error(format!(
-            "SGLang TypedGenerate returned request_id `{}` for request `{expected_request_id}`",
+            "SGLang Generate returned request_id `{}` for request `{expected_request_id}`",
             response.request_id
         )));
     }
@@ -423,7 +423,7 @@ pub(crate) fn map_typed_generate_response(
         .unwrap_or(fallback_completion_tokens);
     let mut mapped = match response.terminal.as_ref() {
         None => LLMEngineOutput::default(),
-        Some(pb::typed_generate_response::Terminal::Finish(finish)) => {
+        Some(pb::generate_response::Terminal::Finish(finish)) => {
             let reason = pb::FinishReason::try_from(finish.reason).map_err(|_| {
                 client::protocol_error(format!("unknown SGLang finish reason {}", finish.reason))
             })?;
@@ -439,7 +439,7 @@ pub(crate) fn map_typed_generate_response(
             }
             .with_usage(usage(prompt_tokens, completion_tokens))
         }
-        Some(pb::typed_generate_response::Terminal::Error(error)) => {
+        Some(pb::generate_response::Terminal::Error(error)) => {
             LLMEngineOutput::error(error.message.clone())
                 .with_usage(usage(prompt_tokens, completion_tokens))
         }
@@ -451,8 +451,7 @@ pub(crate) fn map_typed_generate_response(
             response.choice_index
         ))
     })?);
-    if let Some(pb::typed_generate_response::Terminal::Finish(finish)) = response.terminal.as_ref()
-    {
+    if let Some(pb::generate_response::Terminal::Finish(finish)) = response.terminal.as_ref() {
         mapped.stop_reason = finish.stop_reason.as_ref().and_then(|reason| {
             reason.reason.as_ref().map(|reason| match reason {
                 pb::stop_reason::Reason::MatchedString(value) => StopReason::String(value.clone()),
@@ -504,7 +503,7 @@ pub(crate) fn map_typed_generate_response(
             prompt_logprobs_to_json(&logprobs.prompt),
         );
     }
-    if let Some(pb::typed_generate_response::Terminal::Error(error)) = response.terminal.as_ref() {
+    if let Some(pb::generate_response::Terminal::Error(error)) = response.terminal.as_ref() {
         engine_data.insert(
             "generation_error".to_string(),
             serde_json::json!({
@@ -607,9 +606,7 @@ mod tests {
     };
     use serde_json::json;
 
-    use super::{
-        build_generate_request, disaggregated_params_to_json, map_typed_generate_response,
-    };
+    use super::{build_generate_request, disaggregated_params_to_json, map_generate_response};
 
     fn request() -> PreprocessedRequest {
         PreprocessedRequest::builder()
@@ -795,8 +792,8 @@ mod tests {
     }
 
     #[test]
-    fn typed_response_maps_choice_usage_logprobs_and_stop() {
-        let response = pb::TypedGenerateResponse {
+    fn generate_response_maps_choice_usage_logprobs_and_stop() {
+        let response = pb::GenerateResponse {
             request_id: "rid-response".to_string(),
             delta_output_ids: vec![7],
             choice_index: 1,
@@ -834,7 +831,7 @@ mod tests {
                 .into_iter()
                 .collect(),
             }),
-            terminal: Some(pb::typed_generate_response::Terminal::Finish(
+            terminal: Some(pb::generate_response::Terminal::Finish(
                 pb::GenerationFinish {
                     reason: pb::FinishReason::Stop as i32,
                     stop_reason: Some(pb::StopReason {
@@ -842,8 +839,9 @@ mod tests {
                     }),
                 },
             )),
+            ..Default::default()
         };
-        let mapped = map_typed_generate_response(response, "rid-response", 0, 0, false).unwrap();
+        let mapped = map_generate_response(response, "rid-response", 0, 0, false).unwrap();
         assert_eq!(mapped.index, Some(1));
         assert_eq!(mapped.finish_reason, Some(FinishReason::Stop));
         assert_eq!(
@@ -868,10 +866,10 @@ mod tests {
 
     #[test]
     fn typed_error_is_a_choice_terminal_with_stable_metadata() {
-        let response = pb::TypedGenerateResponse {
+        let response = pb::GenerateResponse {
             request_id: "rid-error".to_string(),
             choice_index: 0,
-            terminal: Some(pb::typed_generate_response::Terminal::Error(
+            terminal: Some(pb::generate_response::Terminal::Error(
                 pb::GenerationError {
                     code: pb::GenerationErrorCode::Unavailable as i32,
                     message: "worker unavailable".to_string(),
@@ -880,7 +878,7 @@ mod tests {
             )),
             ..Default::default()
         };
-        let mapped = map_typed_generate_response(response, "rid-error", 4, 0, false).unwrap();
+        let mapped = map_generate_response(response, "rid-error", 4, 0, false).unwrap();
         assert!(matches!(mapped.finish_reason, Some(FinishReason::Error(_))));
         assert_eq!(
             mapped.engine_data.unwrap()["generation_error"]["retryable"],
@@ -890,7 +888,7 @@ mod tests {
 
     #[test]
     fn response_rejects_misaligned_output_logprobs() {
-        let response = pb::TypedGenerateResponse {
+        let response = pb::GenerateResponse {
             request_id: "rid-logprobs".to_string(),
             choice_index: 0,
             delta_output_ids: vec![7],
@@ -905,23 +903,26 @@ mod tests {
             }),
             ..Default::default()
         };
-        let error = map_typed_generate_response(response, "rid-logprobs", 0, 0, false)
+        let error = map_generate_response(response, "rid-logprobs", 0, 0, false)
             .unwrap_err()
             .to_string();
         assert!(error.contains("does not align"));
     }
 
     #[test]
-    fn typed_response_requires_the_exact_request_id() {
+    fn generate_response_requires_the_exact_request_id() {
         for request_id in ["", "different-request"] {
-            let response = pb::TypedGenerateResponse {
+            let response = pb::GenerateResponse {
                 request_id: request_id.to_string(),
                 ..Default::default()
             };
-            let error = map_typed_generate_response(response, "expected-request", 0, 0, false)
+            let error = map_generate_response(response, "expected-request", 0, 0, false)
                 .unwrap_err()
                 .to_string();
             assert!(error.contains("request_id"));
+            if request_id.is_empty() {
+                assert!(error.contains("incompatible"));
+            }
         }
     }
 

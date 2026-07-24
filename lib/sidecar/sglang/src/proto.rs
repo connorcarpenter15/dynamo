@@ -19,7 +19,7 @@ mod tests {
         let source = include_bytes!("../proto/sglang.proto");
         assert_eq!(
             format!("{:x}", Sha256::digest(source)),
-            "3fd236326112e46b1ec7b3f3ee62933ba4757e96499d11620c404f6c6d134abe"
+            "73dbab9686eccd5442044eb89b172fca230d12487e4dc85d5668e5bef21c9002"
         );
     }
 }

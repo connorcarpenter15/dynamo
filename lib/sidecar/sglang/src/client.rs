@@ -305,15 +305,6 @@ pub fn status_to_dynamo(rpc: &str, status: tonic::Status) -> DynamoError {
     )
 }
 
-pub fn typed_generate_status_to_dynamo(status: tonic::Status) -> DynamoError {
-    if status.code() == tonic::Code::Unimplemented {
-        return protocol_error(
-            "SGLang server is incompatible with this sidecar: the TypedGenerate RPC is not implemented",
-        );
-    }
-    status_to_dynamo("TypedGenerate", status)
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -324,10 +315,7 @@ mod tests {
     use tokio::time::{Instant, timeout};
     use tonic::transport::Endpoint;
 
-    use super::{
-        client_from_channel, connect, discover, json_u32, json_u64, parse_discovery,
-        typed_generate_status_to_dynamo,
-    };
+    use super::{client_from_channel, connect, discover, json_u32, json_u64, parse_discovery};
     use crate::args::TransportConfig;
     use crate::proto as pb;
 
@@ -398,13 +386,5 @@ mod tests {
             error.error_type(),
             ErrorType::Backend(BackendError::InvalidArgument)
         );
-    }
-
-    #[test]
-    fn typed_generate_unimplemented_reports_an_incompatible_server() {
-        let error = typed_generate_status_to_dynamo(tonic::Status::unimplemented("unknown method"));
-
-        assert!(error.to_string().contains("incompatible"));
-        assert!(error.to_string().contains("TypedGenerate"));
     }
 }

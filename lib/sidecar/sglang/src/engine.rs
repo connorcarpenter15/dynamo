@@ -23,7 +23,7 @@ use crate::args::{Args, TransportConfig, normalize_endpoint};
 use crate::client::{self, Client, Discovery, Pool};
 use crate::proto as pb;
 use crate::protocol::{
-    build_generate_request, disaggregated_params_to_json, map_typed_generate_response,
+    build_generate_request, disaggregated_params_to_json, map_generate_response,
 };
 
 pub struct SglangSidecarEngine {
@@ -234,7 +234,7 @@ impl LLMEngine for SglangSidecarEngine {
                 biased;
                 _ = ctx.stopped() => None,
                 _ = cancel.cancelled() => None,
-                response = grpc_client.typed_generate(grpc_request) => Some(response),
+                response = grpc_client.generate(grpc_request) => Some(response),
             };
             let Some(opened) = opened else {
                 for index in 0..expected_choices {
@@ -248,7 +248,7 @@ impl LLMEngine for SglangSidecarEngine {
             let mut stream = match opened {
                 Ok(response) => response.into_inner(),
                 Err(status) => {
-                    yield Err(client::typed_generate_status_to_dynamo(status));
+                    yield Err(client::status_to_dynamo("Generate", status));
                     return;
                 }
             };
@@ -301,14 +301,14 @@ impl LLMEngine for SglangSidecarEngine {
                             Ok(None) => {
                                 if terminal_choices.len() != expected_choices as usize {
                                     yield Err(client::engine_shutdown(format!(
-                                        "SGLang closed TypedGenerate after {}/{} terminal choices",
+                                        "SGLang closed Generate after {}/{} terminal choices",
                                         terminal_choices.len(), expected_choices
                                     )));
                                 }
                                 break;
                             }
                             Err(status) => {
-                                yield Err(client::typed_generate_status_to_dynamo(status));
+                                yield Err(client::status_to_dynamo("Generate", status));
                                 break;
                             }
                         };
@@ -334,7 +334,7 @@ impl LLMEngine for SglangSidecarEngine {
                         let generated = generated_by_choice.entry(choice).or_default();
                         *generated = generated.saturating_add(delta_len);
                         let is_terminal = response.terminal.is_some();
-                        let mut mapped = match map_typed_generate_response(
+                        let mut mapped = match map_generate_response(
                             response,
                             ctx.id(),
                             prompt_tokens,
