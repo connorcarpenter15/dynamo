@@ -13,7 +13,7 @@ description = "Dynamo SGLang sidecar for an out-of-process engine exposed throug
 
 [package.metadata.cargo-machete]
 # Referenced by the protobuf client generated into OUT_DIR at build time.
-ignored = ["prost"]
+ignored = ["prost", "prost-types"]
 
 [[bin]]
 name = "dynamo-sglang-sidecar"
@@ -40,6 +40,7 @@ url = { workspace = true }
 # bundles prost codegen via `compile_protos` (the 0.14 split to
 # tonic-prost-build does not apply here).
 prost = { version = "0.13.5" }
+prost-types = { version = "0.13.5" }
 tonic = { version = "0.13.1" }
 
 [build-dependencies]
@@ -47,3 +48,4 @@ tonic-build = { version = "0.13.1" }
 
 [dev-dependencies]
 dynamo-backend-common = { workspace = true, features = ["testing"] }
+sha2 = "0.10"

@@ -2541,6 +2541,7 @@ dependencies = [
  "dynamo-runtime",
  "futures",
  "prost 0.13.5",
+ "prost-types 0.13.5",
  "rand 0.9.4",
  "serde_json",
  "tokio",
