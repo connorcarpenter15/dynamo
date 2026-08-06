@@ -19,24 +19,39 @@ use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Notify, oneshot};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status};
+use tonic_health::ServingStatus as HealthServingStatus;
 
-use crate::client::VllmClient;
+use crate::client::{CONTROL_SERVICE, INFERENCE_SERVICE, VllmClient};
 use crate::convert::{ResponseState, build_generate_request};
 use crate::engine::VllmSidecarEngine;
 use crate::json::{json_to_struct, struct_to_json};
-use crate::model::ConfiguredModel;
+use crate::model::DiscoveredModel;
 use crate::proto as pb;
 
 #[derive(Clone, Default)]
-struct FakeGenerate {
+struct FakeVllm {
     requests: Arc<Mutex<Vec<pb::GenerateRequest>>>,
     peers: Arc<Mutex<Vec<SocketAddr>>>,
+    model_info_override: Arc<Mutex<Option<pb::ModelInfo>>>,
     reject: Arc<AtomicBool>,
     hang: Arc<AtomicBool>,
     hang_before_headers: Arc<AtomicBool>,
     headers_pending: Arc<AtomicBool>,
     release_headers: Arc<Notify>,
     server_stream_dropped: Arc<AtomicBool>,
+    control_calls: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+    paused: Arc<AtomicBool>,
+    sleeping: Arc<AtomicBool>,
+    weight_version: Arc<Mutex<String>>,
+}
+
+impl FakeVllm {
+    async fn record_control(&self, name: &str, body: serde_json::Value) {
+        self.control_calls
+            .lock()
+            .await
+            .push((name.to_string(), body));
+    }
 }
 
 struct DropSignal(Arc<AtomicBool>);
@@ -48,7 +63,7 @@ impl Drop for DropSignal {
 }
 
 #[tonic::async_trait]
-impl pb::generate_server::Generate for FakeGenerate {
+impl pb::inference_server::Inference for FakeVllm {
     type GenerateStreamStream =
         Pin<Box<dyn Stream<Item = Result<pb::GenerateResponse, Status>> + Send>>;
 
@@ -161,6 +176,221 @@ impl pb::generate_server::Generate for FakeGenerate {
     }
 }
 
+#[tonic::async_trait]
+impl pb::control_server::Control for FakeVllm {
+    async fn get_server_info(
+        &self,
+        _request: Request<pb::GetServerInfoRequest>,
+    ) -> Result<Response<pb::ServerInfo>, Status> {
+        Ok(Response::new(server_info()))
+    }
+
+    async fn get_model_info(
+        &self,
+        _request: Request<pb::GetModelInfoRequest>,
+    ) -> Result<Response<pb::ModelInfo>, Status> {
+        let model = self
+            .model_info_override
+            .lock()
+            .await
+            .clone()
+            .unwrap_or_else(model_info);
+        Ok(Response::new(model))
+    }
+
+    async fn abort(
+        &self,
+        _request: Request<pb::AbortRequest>,
+    ) -> Result<Response<pb::AbortResponse>, Status> {
+        Ok(Response::new(pb::AbortResponse {}))
+    }
+
+    async fn get_kv_event_sources(
+        &self,
+        _request: Request<pb::GetKvEventSourcesRequest>,
+    ) -> Result<Response<pb::GetKvEventSourcesResponse>, Status> {
+        Ok(Response::new(pb::GetKvEventSourcesResponse {
+            sources: Vec::new(),
+        }))
+    }
+
+    async fn pause_generation(
+        &self,
+        request: Request<pb::PauseGenerationRequest>,
+    ) -> Result<Response<pb::PauseGenerationResponse>, Status> {
+        let request = request.into_inner();
+        self.paused.store(true, Ordering::SeqCst);
+        self.record_control(
+            "pause_generation",
+            json!({"mode": request.mode, "clear_cache": request.clear_cache}),
+        )
+        .await;
+        Ok(Response::new(pb::PauseGenerationResponse {}))
+    }
+
+    async fn resume_generation(
+        &self,
+        _request: Request<pb::ResumeGenerationRequest>,
+    ) -> Result<Response<pb::ResumeGenerationResponse>, Status> {
+        self.paused.store(false, Ordering::SeqCst);
+        self.record_control("resume_generation", json!({})).await;
+        Ok(Response::new(pb::ResumeGenerationResponse {}))
+    }
+
+    async fn is_paused(
+        &self,
+        _request: Request<pb::IsPausedRequest>,
+    ) -> Result<Response<pb::IsPausedResponse>, Status> {
+        Ok(Response::new(pb::IsPausedResponse {
+            paused: self.paused.load(Ordering::SeqCst),
+        }))
+    }
+
+    async fn sleep(
+        &self,
+        request: Request<pb::SleepRequest>,
+    ) -> Result<Response<pb::SleepResponse>, Status> {
+        let request = request.into_inner();
+        self.sleeping.store(true, Ordering::SeqCst);
+        self.record_control(
+            "sleep",
+            json!({"level": request.level, "mode": request.mode}),
+        )
+        .await;
+        Ok(Response::new(pb::SleepResponse {}))
+    }
+
+    async fn wake_up(
+        &self,
+        request: Request<pb::WakeUpRequest>,
+    ) -> Result<Response<pb::WakeUpResponse>, Status> {
+        self.sleeping.store(false, Ordering::SeqCst);
+        self.record_control("wake_up", json!({"tags": request.into_inner().tags}))
+            .await;
+        Ok(Response::new(pb::WakeUpResponse {}))
+    }
+
+    async fn is_sleeping(
+        &self,
+        _request: Request<pb::IsSleepingRequest>,
+    ) -> Result<Response<pb::IsSleepingResponse>, Status> {
+        Ok(Response::new(pb::IsSleepingResponse {
+            sleeping: self.sleeping.load(Ordering::SeqCst),
+        }))
+    }
+
+    async fn init_weight_transfer_engine(
+        &self,
+        request: Request<pb::InitWeightTransferEngineRequest>,
+    ) -> Result<Response<pb::InitWeightTransferEngineResponse>, Status> {
+        let body = serde_json::from_slice(&request.into_inner().init_info_json)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        self.record_control("init_weight_transfer_engine", body)
+            .await;
+        Ok(Response::new(pb::InitWeightTransferEngineResponse {}))
+    }
+
+    async fn start_weight_update(
+        &self,
+        _request: Request<pb::StartWeightUpdateRequest>,
+    ) -> Result<Response<pb::StartWeightUpdateResponse>, Status> {
+        self.record_control("start_weight_update", json!({})).await;
+        Ok(Response::new(pb::StartWeightUpdateResponse {}))
+    }
+
+    async fn start_draft_weight_update(
+        &self,
+        _request: Request<pb::StartDraftWeightUpdateRequest>,
+    ) -> Result<Response<pb::StartDraftWeightUpdateResponse>, Status> {
+        self.record_control("start_draft_weight_update", json!({}))
+            .await;
+        Ok(Response::new(pb::StartDraftWeightUpdateResponse {}))
+    }
+
+    async fn update_weights(
+        &self,
+        request: Request<pb::UpdateWeightsRequest>,
+    ) -> Result<Response<pb::UpdateWeightsResponse>, Status> {
+        let body = serde_json::from_slice(&request.into_inner().update_info_json)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        self.record_control("update_weights", body).await;
+        Ok(Response::new(pb::UpdateWeightsResponse {}))
+    }
+
+    async fn finish_weight_update(
+        &self,
+        request: Request<pb::FinishWeightUpdateRequest>,
+    ) -> Result<Response<pb::FinishWeightUpdateResponse>, Status> {
+        let version = request.into_inner().weight_version;
+        if let Some(version) = &version {
+            self.weight_version.lock().await.clone_from(version);
+        }
+        self.record_control("finish_weight_update", json!({"weight_version": version}))
+            .await;
+        Ok(Response::new(pb::FinishWeightUpdateResponse {}))
+    }
+
+    async fn update_weight_version(
+        &self,
+        request: Request<pb::UpdateWeightVersionRequest>,
+    ) -> Result<Response<pb::UpdateWeightVersionResponse>, Status> {
+        let version = request.into_inner().weight_version;
+        self.weight_version.lock().await.clone_from(&version);
+        self.record_control("update_weight_version", json!({"new_version": version}))
+            .await;
+        Ok(Response::new(pb::UpdateWeightVersionResponse {}))
+    }
+
+    async fn get_weight_version(
+        &self,
+        _request: Request<pb::GetWeightVersionRequest>,
+    ) -> Result<Response<pb::GetWeightVersionResponse>, Status> {
+        Ok(Response::new(pb::GetWeightVersionResponse {
+            weight_version: self.weight_version.lock().await.clone(),
+        }))
+    }
+}
+
+fn model_info() -> pb::ModelInfo {
+    pb::ModelInfo {
+        model_id: "model-source".to_string(),
+        served_model_name: "served-model".to_string(),
+        served_model_aliases: vec!["model-alias".to_string()],
+        supports_text_input: true,
+        supports_token_ids_input: true,
+        supports_multimodal: false,
+        reasoning_parser: "deepseek_r1".to_string(),
+        tool_call_parser: "hermes".to_string(),
+    }
+}
+
+fn server_info() -> pb::ServerInfo {
+    pb::ServerInfo {
+        engine_version: "test-vllm".to_string(),
+        api_version: "vllm".to_string(),
+        instance_id: "test-instance".to_string(),
+        parallelism: Some(pb::ParallelismInfo {
+            tensor_parallel_size: 2,
+            pipeline_parallel_size: 1,
+            data_parallel_size: 4,
+            data_parallel_rank: 2,
+            decode_context_parallel_size: 1,
+        }),
+        max_model_len: 8192,
+        kv_block_size: 16,
+        total_kv_blocks: 4096,
+        max_running_requests: 128,
+        max_batched_tokens: 2048,
+        supports_explicit_data_parallel_rank: false,
+        rl_capabilities: Some(pb::RlCapabilities {
+            weight_transfer_enabled: true,
+            weight_transfer_backend: "nccl".to_string(),
+            sleep_mode_enabled: true,
+            draft_weight_updates_enabled: true,
+        }),
+    }
+}
+
 fn sequence_response(
     terminal: bool,
     logprobs: bool,
@@ -189,6 +419,7 @@ fn sequence_response(
                 finish_reason: pb::finish_info::FinishReason::Stop as i32,
                 stop_reason: Some(pb::finish_info::StopReason::StopTokenId(2)),
                 kv_transfer_params,
+                ec_transfer_params: None,
             }),
         }),
     }
@@ -313,23 +544,33 @@ fn oversized_logprob_counts_are_rejected() {
 
 struct FakeServer {
     endpoint: String,
-    service: FakeGenerate,
+    service: FakeVllm,
     shutdown: Option<oneshot::Sender<()>>,
 }
 
 impl FakeServer {
-    async fn start(service: FakeGenerate) -> Self {
+    async fn start(service: FakeVllm) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let address = listener.local_addr().expect("address");
         let (shutdown, shutdown_rx) = oneshot::channel();
-        let server_service = service.clone();
+        let inference_service = service.clone();
+        let control_service = service.clone();
+        let (health, health_service) = tonic_health::server::health_reporter();
+        health
+            .set_service_status(CONTROL_SERVICE, HealthServingStatus::Serving)
+            .await;
+        health
+            .set_service_status(INFERENCE_SERVICE, HealthServingStatus::Serving)
+            .await;
         tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(
-                    pb::generate_server::GenerateServer::new(server_service)
+                    pb::inference_server::InferenceServer::new(inference_service)
                         .max_encoding_message_size(64 * 1024 * 1024)
                         .max_decoding_message_size(64 * 1024 * 1024),
                 )
+                .add_service(pb::control_server::ControlServer::new(control_service))
+                .add_service(health_service)
                 .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
                     let _ = shutdown_rx.await;
                 })
@@ -397,17 +638,37 @@ fn request() -> PreprocessedRequest {
 }
 
 fn engine(endpoint: &str, mode: DisaggregationMode, connections: usize) -> VllmSidecarEngine {
+    let transport = GrpcTransportConfig {
+        connections: NonZeroUsize::new(connections).expect("non-zero connection count"),
+        ..Default::default()
+    };
     VllmSidecarEngine::new(
         GrpcEndpoint::parse(endpoint, "--vllm-endpoint").expect("valid test endpoint"),
-        ConfiguredModel {
-            source: "model-source".to_string(),
-        },
+        DiscoveredModel::from_proto(model_info(), server_info()).expect("valid discovery"),
         mode,
-        GrpcTransportConfig {
-            connections: NonZeroUsize::new(connections).expect("non-zero connection count"),
-            ..Default::default()
-        },
+        transport,
     )
+}
+
+async fn engine_from_args(
+    endpoint: &str,
+) -> (VllmSidecarEngine, dynamo_backend_common::WorkerConfig) {
+    let argv = vec![
+        "dynamo-vllm-sidecar".to_string(),
+        "--vllm-endpoint".to_string(),
+        endpoint.to_string(),
+        "--grpc-connections".to_string(),
+        "2".to_string(),
+        "--grpc-startup-deadline-secs".to_string(),
+        "5".to_string(),
+        "--grpc-connect-attempt-timeout-secs".to_string(),
+        "1".to_string(),
+        "--enable-rl".to_string(),
+    ];
+    tokio::task::spawn_blocking(move || VllmSidecarEngine::from_args(Some(argv)))
+        .await
+        .expect("bootstrap task")
+        .expect("bootstrap discovery")
 }
 
 async fn collect(
@@ -426,11 +687,24 @@ async fn collect(
 
 #[tokio::test]
 async fn aggregated_generation_converts_request_stream_and_usage() {
-    let server = FakeServer::start(FakeGenerate::default()).await;
-    let engine = engine(&server.endpoint, DisaggregationMode::Aggregated, 2);
+    let server = FakeServer::start(FakeVllm::default()).await;
+    let (engine, worker) = engine_from_args(&server.endpoint).await;
+    assert_eq!(worker.model_name, "model-source");
+    assert_eq!(worker.served_model_name.as_deref(), Some("served-model"));
+    assert!(worker.enable_rl);
+    assert!(worker.reasoning_parser.is_none());
+    assert!(worker.tool_call_parser.is_none());
     let config = engine.start(0).await.expect("start");
     assert_eq!(config.model, "model-source");
-    assert_eq!(config.served_model_name, None);
+    assert_eq!(config.served_model_name.as_deref(), Some("served-model"));
+    let registration = config.llm.expect("LLM registration");
+    assert_eq!(registration.context_length, Some(8192));
+    assert_eq!(registration.kv_cache_block_size, Some(16));
+    assert_eq!(registration.total_kv_blocks, Some(4096));
+    assert_eq!(registration.max_num_seqs, Some(128));
+    assert_eq!(registration.max_num_batched_tokens, Some(2048));
+    assert_eq!(registration.data_parallel_size, None);
+    assert_eq!(registration.data_parallel_start_rank, None);
 
     let outputs = collect(&engine, request()).await;
     assert_eq!(outputs.len(), 1);
@@ -446,7 +720,7 @@ async fn aggregated_generation_converts_request_stream_and_usage() {
 
     let requests = server.service.requests.lock().await;
     let sent = requests.first().expect("recorded request");
-    assert!(sent.model.is_empty());
+    assert_eq!(sent.model, "served-model");
     assert_eq!(sent.priority, 0);
     let sampling = sent.sampling.as_ref().unwrap();
     assert_eq!(
@@ -482,8 +756,95 @@ async fn aggregated_generation_converts_request_stream_and_usage() {
 }
 
 #[tokio::test]
+async fn rl_engine_routes_preserve_lifecycle_payloads_and_version() {
+    let server = FakeServer::start(FakeVllm::default()).await;
+    let engine = engine(&server.endpoint, DisaggregationMode::Aggregated, 1);
+    engine.start(0).await.expect("start");
+
+    assert!(
+        engine
+            .supported_controls()
+            .await
+            .unwrap()
+            .contains(&"pause_generation".to_string())
+    );
+    assert!(
+        engine
+            .supported_updates()
+            .await
+            .unwrap()
+            .contains(&"update_weights".to_string())
+    );
+    assert_eq!(
+        engine
+            .engine_control(
+                "pause_generation".to_string(),
+                json!({"mode": "keep", "clear_cache": false}),
+            )
+            .await
+            .unwrap(),
+        json!({"status": "paused"})
+    );
+    engine
+        .engine_update(
+            "init_weight_transfer_engine".to_string(),
+            json!({"init_info": {"master_addr": "trainer", "master_port": 1234}}),
+        )
+        .await
+        .unwrap();
+    engine
+        .engine_update("start_weight_update".to_string(), json!({}))
+        .await
+        .unwrap();
+    engine
+        .engine_update(
+            "update_weights".to_string(),
+            json!({"update_info": {"names": ["layer.weight"], "shape": [4, 8]}}),
+        )
+        .await
+        .unwrap();
+    engine
+        .engine_update(
+            "finish_weight_update".to_string(),
+            json!({"weight_version": "step-42"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        engine
+            .engine_control("get_weight_version".to_string(), json!({}))
+            .await
+            .unwrap(),
+        json!({"weight_version": "step-42"})
+    );
+
+    assert_eq!(
+        *server.service.control_calls.lock().await,
+        vec![
+            (
+                "pause_generation".to_string(),
+                json!({"mode": pb::PauseMode::Keep as i32, "clear_cache": false}),
+            ),
+            (
+                "init_weight_transfer_engine".to_string(),
+                json!({"master_addr": "trainer", "master_port": 1234}),
+            ),
+            ("start_weight_update".to_string(), json!({})),
+            (
+                "update_weights".to_string(),
+                json!({"names": ["layer.weight"], "shape": [4, 8]}),
+            ),
+            (
+                "finish_weight_update".to_string(),
+                json!({"weight_version": "step-42"}),
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn grpc_request_errors_are_propagated() {
-    let service = FakeGenerate::default();
+    let service = FakeVllm::default();
     service.reject.store(true, Ordering::SeqCst);
     let server = FakeServer::start(service).await;
     let engine = engine(&server.endpoint, DisaggregationMode::Aggregated, 1);
@@ -499,7 +860,7 @@ async fn grpc_request_errors_are_propagated() {
 
 #[tokio::test]
 async fn prefill_decode_handoff_is_opaque_and_repeatable() {
-    let server = FakeServer::start(FakeGenerate::default()).await;
+    let server = FakeServer::start(FakeVllm::default()).await;
     let prefill = engine(&server.endpoint, DisaggregationMode::Prefill, 1);
     let decode = engine(&server.endpoint, DisaggregationMode::Decode, 1);
     prefill.start(0).await.expect("start prefill");
@@ -534,40 +895,43 @@ async fn prefill_decode_handoff_is_opaque_and_repeatable() {
     }
 }
 
-#[test]
-fn component_honors_config_for_aggregated_but_fixes_disagg_roles() {
-    let component = |extra: &[&str]| {
+#[tokio::test]
+async fn component_honors_config_for_aggregated_but_fixes_disagg_roles() {
+    let server = FakeServer::start(FakeVllm::default()).await;
+    for (extra, expected) in [
+        (Vec::<&str>::new(), "custom"),
+        (vec!["--disaggregation-mode", "prefill"], "prefill"),
+        (vec!["--disaggregation-mode", "decode"], "backend"),
+    ] {
         let mut argv = vec![
-            "dynamo-vllm-sidecar",
-            "--vllm-endpoint",
-            "127.0.0.1:50051",
-            "--model-path",
-            "test-model",
-            "--component",
-            "custom",
+            "dynamo-vllm-sidecar".to_string(),
+            "--vllm-endpoint".to_string(),
+            server.endpoint.clone(),
+            "--component".to_string(),
+            "custom".to_string(),
         ];
-        argv.extend_from_slice(extra);
-        VllmSidecarEngine::from_args(Some(argv.iter().map(|s| s.to_string()).collect()))
-            .expect("from_args")
-            .1
-            .component
-    };
-    // Aggregated keeps the operator-configured component.
-    assert_eq!(component(&[]), "custom");
-    // Disaggregated roles override to fixed names so the frontend can route.
-    assert_eq!(component(&["--disaggregation-mode", "prefill"]), "prefill");
-    assert_eq!(component(&["--disaggregation-mode", "decode"]), "backend");
+        argv.extend(extra.into_iter().map(str::to_string));
+        let component =
+            tokio::task::spawn_blocking(move || VllmSidecarEngine::from_args(Some(argv)))
+                .await
+                .expect("bootstrap task")
+                .expect("from_args")
+                .1
+                .component;
+        assert_eq!(component, expected);
+    }
 }
 
 #[tokio::test]
 async fn pool_uses_each_configured_connection() {
-    let server = FakeServer::start(FakeGenerate::default()).await;
+    let server = FakeServer::start(FakeVllm::default()).await;
     let transport = GrpcTransportConfig {
         connections: NonZeroUsize::new(2).unwrap(),
         ..Default::default()
     };
     let endpoint = GrpcEndpoint::parse(&server.endpoint, "--vllm-endpoint").unwrap();
-    let client = VllmClient::connect(&endpoint, transport)
+    let deadline = crate::client::startup_deadline(transport.startup_deadline).unwrap();
+    let client = VllmClient::connect(&endpoint, transport, deadline)
         .await
         .expect("connect pool");
     assert_eq!(client.connection_count(), 2);
@@ -597,7 +961,7 @@ async fn pool_uses_each_configured_connection() {
 
 #[tokio::test]
 async fn cancellation_drops_the_remote_stream() {
-    let service = FakeGenerate::default();
+    let service = FakeVllm::default();
     service.hang.store(true, Ordering::SeqCst);
     let server = FakeServer::start(service).await;
     let engine = engine(&server.endpoint, DisaggregationMode::Aggregated, 1);
@@ -626,7 +990,7 @@ async fn cancellation_drops_the_remote_stream() {
 
 #[tokio::test]
 async fn cancellation_interrupts_pending_response_headers() {
-    let service = FakeGenerate::default();
+    let service = FakeVllm::default();
     service.hang_before_headers.store(true, Ordering::SeqCst);
     let server = FakeServer::start(service).await;
     let engine = engine(&server.endpoint, DisaggregationMode::Aggregated, 1);
@@ -657,7 +1021,7 @@ async fn cancellation_interrupts_pending_response_headers() {
 
 #[tokio::test]
 async fn unsupported_features_fail_before_rpc_submission() {
-    let server = FakeServer::start(FakeGenerate::default()).await;
+    let server = FakeServer::start(FakeVllm::default()).await;
     let engine = engine(&server.endpoint, DisaggregationMode::Aggregated, 1);
     engine.start(0).await.expect("start");
 
