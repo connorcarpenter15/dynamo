@@ -26,12 +26,18 @@ It is a standalone Rust executable.
 - Sampling, stop conditions, structured output, logprobs, cache options, and priority
 - Opaque `kv_transfer_params` handoff
 - Data-parallel rank routing and KV-event source discovery
+- Image URL and data-URI inputs, including media UUIDs
 
-The protocol does not support multimodal input, LoRA, encode workers, beam search, or `n > 1`.
+The protocol does not support LoRA, encode workers, beam search, `n > 1`,
+preprocessed multimodal features, audio/video media, or Dynamo tool-call and
+reasoning parsers. Parser defaults returned by Control are intentionally not
+advertised to the Dynamo frontend because the current inference protocol does
+not preserve all parser-related request semantics.
 
 ## Run
 
-Start a vLLM build with the split Inference and Control services and explicit data-parallel-rank capability used by the vendored protocol:
+Start a vLLM build with the split Inference and Control services and explicit
+data-parallel-rank capability used by the vendored protocol:
 
 ```bash
 vllm-rs serve Qwen/Qwen3-0.6B --host 127.0.0.1 --grpc-port 50051
@@ -51,7 +57,7 @@ dynamo-vllm-sidecar \
 Use `VLLM_GRPC_ENDPOINT` instead of `--vllm-endpoint` when the endpoint is
 provided through the environment.
 
-The sidecar discovers `model_id`, the served name, context length, KV capacity, scheduler limits, data-parallel topology, and KV-event sources through `vllm.Control`. `model_id` must be readable locally or fetchable by Dynamo for tokenization and chat templates. Parser defaults are not advertised because the current inference protocol cannot preserve all parser-related request semantics.
+The sidecar discovers `model_id`, the served name, context length, KV capacity, scheduler limits, data-parallel topology, and KV-event sources through `vllm.Control`. `model_id` must be readable locally or fetchable by Dynamo for tokenization and chat templates.
 
 Control reports the global data-parallel size, the rank hosted by the connected frontend, and whether explicit rank routing is supported. Dynamo forwards the selected rank on each generation request and uses discovered KV-event sources for KV-aware routing. Startup fails for data-parallel deployments when the server does not advertise explicit rank routing.
 
