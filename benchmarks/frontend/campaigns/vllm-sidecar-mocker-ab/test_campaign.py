@@ -13,6 +13,26 @@ import run_campaign as campaign
 
 
 class CampaignDryRunTest(unittest.TestCase):
+    def test_frontend_tokens_are_correlated_to_profiling_request_ids(self) -> None:
+        """Regression: tokenizer-added tokens must not replace server token totals."""
+        with tempfile.TemporaryDirectory() as temporary:
+            frontend_log = Path(temporary) / "frontend.log"
+            frontend_log.write_text(
+                "\x1b[3mx_request_id\x1b[0m=\x1b[0m\"warmup\" "
+                "request completed input_tokens=99 output_tokens=99\n"
+                "request completed x_request_id=\"profile\" "
+                "input_tokens=32 output_tokens=16\n",
+                encoding="utf-8",
+            )
+            metrics = campaign.parse_frontend_token_metrics(
+                frontend_log, {"profile"}
+            )
+        self.assertEqual(metrics["request_count"], 1)
+        self.assertEqual(metrics["total_input_tokens"], 32)
+        self.assertEqual(metrics["total_output_tokens"], 16)
+        self.assertEqual(metrics["output_length_min"], 16)
+        self.assertEqual(metrics["output_length_max"], 16)
+
     def test_topologies_share_workload_affinity_and_crossover_contract(self) -> None:
         """Regression: topology drift could invalidate the A/B result; dry-run commands expose it."""
         manifest = campaign.load_manifest()

@@ -884,7 +884,9 @@ def percentile(values: list[float], fraction: float) -> float:
     return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
 
 
-def pooled_record_metrics(paths: list[Path]) -> dict[str, list[float]]:
+def pooled_record_metrics(
+    paths: list[Path],
+) -> tuple[dict[str, list[float]], set[str]]:
     metric_names = (
         "time_to_first_token",
         "inter_token_latency",
@@ -893,6 +895,7 @@ def pooled_record_metrics(paths: list[Path]) -> dict[str, list[float]]:
         "input_sequence_length",
     )
     pooled = {name: [] for name in metric_names}
+    request_ids: set[str] = set()
     for path in paths:
         for line_number, line in enumerate(
             path.read_text(encoding="utf-8", errors="strict").splitlines(), start=1
@@ -907,6 +910,10 @@ def pooled_record_metrics(paths: list[Path]) -> dict[str, list[float]]:
                 continue
             if record.get("error") is not None:
                 continue
+            request_id = record.get("metadata", {}).get("x_request_id")
+            if not request_id:
+                raise CampaignError(f"profiling record lacks x_request_id in {path}")
+            request_ids.add(str(request_id))
             metrics = record.get("metrics", {})
             for name in metric_names:
                 value = metrics.get(name)
@@ -918,7 +925,56 @@ def pooled_record_metrics(paths: list[Path]) -> dict[str, list[float]]:
                         f"unexpected {name} unit in {path}: {value.get('unit')}"
                     )
                 pooled[name].append(float(value["value"]))
-    return pooled
+    return pooled, request_ids
+
+
+def parse_frontend_token_metrics(
+    frontend_log: Path, request_ids: set[str]
+) -> dict[str, float]:
+    ansi_escape = re.compile(r"\x1b\[[0-9;]*m")
+    request_id_pattern = re.compile(r'x_request_id="?([^"\s]+)"?')
+    token_pattern = re.compile(r"\binput_tokens=(\d+)\s+output_tokens=(\d+)\b")
+    matched: set[str] = set()
+    input_tokens: list[int] = []
+    output_tokens: list[int] = []
+    for line in frontend_log.read_text(
+        encoding="utf-8", errors="replace"
+    ).splitlines():
+        if "request completed" not in line:
+            continue
+        clean = ansi_escape.sub("", line)
+        request_id_match = request_id_pattern.search(clean)
+        if not request_id_match or request_id_match.group(1) not in request_ids:
+            continue
+        request_id = request_id_match.group(1)
+        if request_id in matched:
+            raise CampaignError(
+                f"duplicate frontend completion for {request_id} in {frontend_log}"
+            )
+        token_match = token_pattern.search(clean)
+        if not token_match:
+            raise CampaignError(
+                f"frontend completion lacks token totals for "
+                f"{request_id} in {frontend_log}"
+            )
+        matched.add(request_id)
+        input_tokens.append(int(token_match.group(1)))
+        output_tokens.append(int(token_match.group(2)))
+    missing = request_ids - matched
+    if missing:
+        raise CampaignError(
+            f"frontend token totals missing for {len(missing)} profiling requests "
+            f"in {frontend_log}"
+        )
+    return {
+        "request_count": float(len(matched)),
+        "total_input_tokens": float(sum(input_tokens)),
+        "total_output_tokens": float(sum(output_tokens)),
+        "input_length_min": float(min(input_tokens, default=0)),
+        "input_length_max": float(max(input_tokens, default=0)),
+        "output_length_min": float(min(output_tokens, default=0)),
+        "output_length_max": float(max(output_tokens, default=0)),
+    }
 
 
 def parse_process_metrics(system_dir: Path) -> dict[str, Any]:
@@ -989,24 +1045,34 @@ def parse_leg_metrics(output_dir: Path) -> dict[str, Any]:
             f"{len(record_paths)} != {len(profiles)}"
         )
     shards = [json.loads(path.read_text(encoding="utf-8")) for path in profiles]
-    records = pooled_record_metrics(record_paths)
+    records, request_ids = pooled_record_metrics(record_paths)
+    server_tokens = parse_frontend_token_metrics(
+        output_dir / "logs/frontend.log", request_ids
+    )
     completed = sum(metric_average(shard, "request_count") for shard in shards)
     failures = sum(metric_average(shard, "error_request_count") for shard in shards)
     if failures == 0:
         failures = sum(error_count(shard.get("error_summary", [])) for shard in shards)
     durations = [metric_average(shard, "benchmark_duration") for shard in shards]
     wall_seconds = max(durations, default=0.0)
-    total_input_tokens = sum(metric_average(shard, "total_isl") for shard in shards)
-    total_output_tokens = sum(
+    if completed != server_tokens["request_count"]:
+        raise CampaignError(
+            f"AIPerf completed {completed:g} requests but frontend token totals "
+            f"matched {server_tokens['request_count']:g}"
+        )
+    aiperf_total_input_tokens = sum(
+        metric_average(shard, "total_isl") for shard in shards
+    )
+    aiperf_total_output_tokens = sum(
         metric_average(shard, "total_output_tokens") for shard in shards
     )
-    total_output_sequence_tokens = sum(
+    aiperf_total_output_sequence_tokens = sum(
         metric_average(shard, "total_osl") for shard in shards
     )
     metric = {
         "shards": len(shards),
         "request_throughput_rps": completed / wall_seconds if wall_seconds else 0.0,
-        "output_throughput_tps": total_output_sequence_tokens / wall_seconds
+        "output_throughput_tps": server_tokens["total_output_tokens"] / wall_seconds
         if wall_seconds
         else 0.0,
         "completed_requests": completed,
@@ -1014,9 +1080,11 @@ def parse_leg_metrics(output_dir: Path) -> dict[str, Any]:
         "failed_request_fraction": failures / (completed + failures)
         if completed + failures
         else 0.0,
-        "total_input_tokens": total_input_tokens,
-        "total_output_tokens": total_output_tokens,
-        "total_output_sequence_tokens": total_output_sequence_tokens,
+        "total_input_tokens": server_tokens["total_input_tokens"],
+        "total_output_tokens": server_tokens["total_output_tokens"],
+        "aiperf_total_input_tokens": aiperf_total_input_tokens,
+        "aiperf_total_output_tokens": aiperf_total_output_tokens,
+        "aiperf_total_output_sequence_tokens": aiperf_total_output_sequence_tokens,
         "wall_seconds": wall_seconds,
         "ttft_p50_ms": percentile(records["time_to_first_token"], 0.50),
         "ttft_p99_ms": percentile(records["time_to_first_token"], 0.99),
@@ -1024,10 +1092,22 @@ def parse_leg_metrics(output_dir: Path) -> dict[str, Any]:
         "itl_p99_ms": percentile(records["inter_token_latency"], 0.99),
         "e2e_p50_ms": percentile(records["request_latency"], 0.50),
         "e2e_p99_ms": percentile(records["request_latency"], 0.99),
-        "input_length_min": min(records["input_sequence_length"], default=0.0),
-        "input_length_max": max(records["input_sequence_length"], default=0.0),
-        "output_length_min": min(records["output_sequence_length"], default=0.0),
-        "output_length_max": max(records["output_sequence_length"], default=0.0),
+        "input_length_min": server_tokens["input_length_min"],
+        "input_length_max": server_tokens["input_length_max"],
+        "output_length_min": server_tokens["output_length_min"],
+        "output_length_max": server_tokens["output_length_max"],
+        "aiperf_input_length_min": min(
+            records["input_sequence_length"], default=0.0
+        ),
+        "aiperf_input_length_max": max(
+            records["input_sequence_length"], default=0.0
+        ),
+        "aiperf_output_length_min": min(
+            records["output_sequence_length"], default=0.0
+        ),
+        "aiperf_output_length_max": max(
+            records["output_sequence_length"], default=0.0
+        ),
         "aiperf_versions": sorted(
             {str(shard.get("aiperf_version", "unknown")) for shard in shards}
         ),
@@ -1568,8 +1648,14 @@ def analyze_campaign(output_root: Path) -> None:
             "failed_request_fraction": metrics.get("failed_request_fraction", 0.0),
             "total_input_tokens": metrics.get("total_input_tokens", 0.0),
             "total_output_tokens": metrics.get("total_output_tokens", 0.0),
-            "total_output_sequence_tokens": metrics.get(
-                "total_output_sequence_tokens", 0.0
+            "aiperf_total_input_tokens": metrics.get(
+                "aiperf_total_input_tokens", 0.0
+            ),
+            "aiperf_total_output_tokens": metrics.get(
+                "aiperf_total_output_tokens", 0.0
+            ),
+            "aiperf_total_output_sequence_tokens": metrics.get(
+                "aiperf_total_output_sequence_tokens", 0.0
             ),
             "backend_cpu_seconds": process_metrics.get("cpu_seconds", 0.0),
             "backend_max_rss_kib_sum": process_metrics.get("max_rss_kib_sum", 0),
