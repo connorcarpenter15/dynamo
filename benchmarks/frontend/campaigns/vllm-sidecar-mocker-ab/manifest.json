@@ -23,7 +23,7 @@
     }
   },
   "fixture": {
-    "model": "lib/llm/tests/data/sample-models/mock-llama-3.1-8b-instruct",
+    "model": "lib/llm/tests/data/sample-models/TinyLlama_v1.1",
     "served_model_name": {
       "policy": "resolved-model-path"
     },

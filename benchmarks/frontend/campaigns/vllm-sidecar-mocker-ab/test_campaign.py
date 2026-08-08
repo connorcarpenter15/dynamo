@@ -47,6 +47,11 @@ class CampaignDryRunTest(unittest.TestCase):
         self.assertFalse(mocker_config["enable_prefix_caching"])
         self.assertEqual(mocker_config["max_num_seqs"], 8192)
         self.assertGreaterEqual(mocker_config["num_gpu_blocks"], 4_194_304)
+        model_path = campaign.REPO_ROOT / manifest["fixture"]["model"]
+        tokenizer = json.loads(
+            (model_path / "tokenizer.json").read_text(encoding="utf-8")
+        )
+        self.assertGreater(len(tokenizer["model"]["vocab"]), 0)
 
         with tempfile.TemporaryDirectory() as temporary:
             output_root = Path(temporary)
