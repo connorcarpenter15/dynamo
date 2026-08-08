@@ -111,6 +111,10 @@ fn request(max_tokens: u32) -> PreprocessedRequest {
             prompt_logprobs: Some(1),
             ..Default::default()
         })
+        // Frontend preprocessing always supplies the model-card checksum. The
+        // production sidecar forwards it through vLLM's cache_salt field even
+        // when prefix caching is disabled.
+        .mdc_sum(Some("model-card-checksum".to_string()))
         .build()
         .unwrap()
 }

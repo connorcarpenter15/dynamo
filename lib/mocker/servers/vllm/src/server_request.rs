@@ -109,12 +109,6 @@ impl PreparedRequest {
                 )
                 .into());
             }
-            if !kv.cache_salt.is_empty() {
-                return Err(Status::invalid_argument(
-                    "cache_salt is not supported by the Mocker server",
-                )
-                .into());
-            }
         }
         let transfer_role = KvTransferRole::classify(
             request

@@ -83,6 +83,10 @@ impl VllmMockerService {
             engine_args.worker_type == WorkerType::Aggregated,
             "Mocker worker_type must be aggregated; use the server mode for the emulated wire role"
         );
+        anyhow::ensure!(
+            !engine_args.enable_prefix_caching,
+            "Mocker vLLM gRPC server does not support prefix caching"
+        );
         let max_concurrent_requests = config.max_concurrent_requests;
         Ok(Self {
             config: Arc::new(config),

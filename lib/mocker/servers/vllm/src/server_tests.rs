@@ -190,6 +190,18 @@ fn service_rejects_non_vllm_or_multi_rank_engines() {
             .contains("worker_type")
     );
 
+    let prefix_caching = MockEngineArgs::builder()
+        .enable_prefix_caching(true)
+        .build()
+        .unwrap();
+    assert!(
+        VllmMockerService::new(MockerServerConfig::default(), prefix_caching)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("prefix caching")
+    );
+
     let disabled = MockerServerConfig {
         max_concurrent_requests: 0,
         ..Default::default()
