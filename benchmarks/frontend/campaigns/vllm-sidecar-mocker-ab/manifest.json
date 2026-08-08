@@ -4,7 +4,7 @@
   "description": "CPU-only direct Dynamo Mocker versus native-vLLM sidecar/gRPC request-plane campaign",
   "source": {
     "repository": "ai-dynamo/dynamo",
-    "required_ancestor": "12356a1d03d344260adafed3eb14f8f12f6aa77c",
+    "required_ancestor": "12356a1d03d352e00129717d97a90afbb3b39106",
     "require_clean_worktree": true
   },
   "protocol": {
