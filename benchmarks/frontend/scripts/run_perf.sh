@@ -307,6 +307,37 @@ INFRA_CPU_PREFIX=()
 [[ -n "$LOADGEN_CPUSET" ]] && LOADGEN_CPU_PREFIX=(taskset --cpu-list "$LOADGEN_CPUSET")
 [[ -n "$INFRA_CPUSET" ]] && INFRA_CPU_PREFIX=(taskset --cpu-list "$INFRA_CPUSET")
 
+cpuset_cpu_count() {
+    local cpuset="$1"
+    local segment first last
+    local count=0
+    local segments=()
+
+    IFS=',' read -r -a segments <<< "$cpuset"
+    for segment in "${segments[@]}"; do
+        if [[ "$segment" == *-* ]]; then
+            first="${segment%-*}"
+            last="${segment#*-}"
+            count=$((count + last - first + 1))
+        else
+            count=$((count + 1))
+        fi
+    done
+    echo "$count"
+}
+
+# AIPerf uses one process per record processor. Keep its total process count
+# within both its normal 32-process cap and the load-generator CPU allocation.
+# Oversubscribing record processors can deadlock AIPerf's final record drain
+# under timeout-heavy saturation.
+AIPERF_RECORD_PROCESSOR_BUDGET=32
+if [[ -n "$LOADGEN_CPUSET" ]]; then
+    _LOADGEN_CPU_COUNT=$(cpuset_cpu_count "$LOADGEN_CPUSET")
+    if (( _LOADGEN_CPU_COUNT < AIPERF_RECORD_PROCESSOR_BUDGET )); then
+        AIPERF_RECORD_PROCESSOR_BUDGET="$_LOADGEN_CPU_COUNT"
+    fi
+fi
+
 # Default model-name to model if not set
 [[ -z "$MODEL_NAME" ]] && MODEL_NAME="$MODEL"
 
@@ -1103,7 +1134,7 @@ for _AIPERF_MODEL in "${_AIPERF_MODELS[@]}"; do
             _SHARD_ARTIFACT_DIR="$AIPERF_ARTIFACT_DIR"
         fi
         mkdir -p "$_SHARD_ARTIFACT_DIR"
-        _SHARD_RECORD_PROCESSORS=$((32 / AIPERF_SHARDS))
+        _SHARD_RECORD_PROCESSORS=$((AIPERF_RECORD_PROCESSOR_BUDGET / AIPERF_SHARDS))
         [[ "$_SHARD_RECORD_PROCESSORS" -lt 1 ]] && _SHARD_RECORD_PROCESSORS=1
         _SHARD_LABEL="${_AIPERF_MODEL//\//_}_shard_${_shard}"
         "${LOADGEN_CPU_PREFIX[@]}" "${AIPERF_ENV[@]}" aiperf profile --artifact-dir "$_SHARD_ARTIFACT_DIR" \
