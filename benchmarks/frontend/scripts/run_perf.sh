@@ -308,36 +308,10 @@ INFRA_CPU_PREFIX=()
 [[ -n "$LOADGEN_CPUSET" ]] && LOADGEN_CPU_PREFIX=(taskset --cpu-list "$LOADGEN_CPUSET")
 [[ -n "$INFRA_CPUSET" ]] && INFRA_CPU_PREFIX=(taskset --cpu-list "$INFRA_CPUSET")
 
-cpuset_cpu_count() {
-    local cpuset="$1"
-    local segment first last
-    local count=0
-    local segments=()
-
-    IFS=',' read -r -a segments <<< "$cpuset"
-    for segment in "${segments[@]}"; do
-        if [[ "$segment" == *-* ]]; then
-            first="${segment%-*}"
-            last="${segment#*-}"
-            count=$((count + last - first + 1))
-        else
-            count=$((count + 1))
-        fi
-    done
-    echo "$count"
-}
-
-# AIPerf uses one process per record processor. Keep its total process count
-# within both its normal 32-process cap and the load-generator CPU allocation.
-# Oversubscribing record processors can deadlock AIPerf's final record drain
-# under timeout-heavy saturation.
-AIPERF_RECORD_PROCESSOR_BUDGET=32
-if [[ -n "$LOADGEN_CPUSET" ]]; then
-    _LOADGEN_CPU_COUNT=$(cpuset_cpu_count "$LOADGEN_CPUSET")
-    if (( _LOADGEN_CPU_COUNT < AIPERF_RECORD_PROCESSOR_BUDGET )); then
-        AIPERF_RECORD_PROCESSOR_BUDGET="$_LOADGEN_CPU_COUNT"
-    fi
-fi
+# AIPerf 0.10.0 can strand the final record when multiple record processors
+# drain a timeout-heavy phase. A single processor preserves the complete export;
+# request workers still use the full load-generator CPU set.
+AIPERF_RECORD_PROCESSOR_BUDGET=1
 
 # Default model-name to model if not set
 [[ -z "$MODEL_NAME" ]] && MODEL_NAME="$MODEL"
