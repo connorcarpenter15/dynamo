@@ -1015,6 +1015,13 @@ echo "  aiperf targets: ${_AIPERF_MODELS[*]} (mode=$AIPERF_TARGETS, endpoint=$AI
 AIPERF_PIDS=()
 AIPERF_LABELS=()
 AIPERF_FAILED=false
+if [[ -d "$MODEL" ]]; then
+    # AIPerf 0.10.0's offline loader treats absolute local paths as Hub repo IDs.
+    # Keep the local fixture local while allowing its service processes to load it.
+    AIPERF_ENV=(env -u HF_HUB_OFFLINE -u TRANSFORMERS_OFFLINE)
+else
+    AIPERF_ENV=(env HF_HUB_OFFLINE=1)
+fi
 for _AIPERF_MODEL in "${_AIPERF_MODELS[@]}"; do
     if [[ ${#_AIPERF_MODELS[@]} -gt 1 ]]; then
         AIPERF_ARTIFACT_DIR="$OUTPUT_DIR/aiperf/${_AIPERF_MODEL}"
@@ -1049,7 +1056,7 @@ for _AIPERF_MODEL in "${_AIPERF_MODELS[@]}"; do
         _SHARD_RECORD_PROCESSORS=$((32 / AIPERF_SHARDS))
         [[ "$_SHARD_RECORD_PROCESSORS" -lt 1 ]] && _SHARD_RECORD_PROCESSORS=1
         _SHARD_LABEL="${_AIPERF_MODEL//\//_}_shard_${_shard}"
-        "${LOADGEN_CPU_PREFIX[@]}" env HF_HUB_OFFLINE=1 aiperf profile --artifact-dir "$_SHARD_ARTIFACT_DIR" \
+        "${LOADGEN_CPU_PREFIX[@]}" "${AIPERF_ENV[@]}" aiperf profile --artifact-dir "$_SHARD_ARTIFACT_DIR" \
             --model "$_AIPERF_MODEL" \
             "${_AIPERF_TOK_ARGS[@]}" \
             --endpoint-type "$ENDPOINT_TYPE" \
