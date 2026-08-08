@@ -126,6 +126,9 @@ class CampaignDryRunTest(unittest.TestCase):
                 "--require-aiperf-version",
                 "--random-seed",
                 "--exact-input-token-id",
+                "--warmup-grace-period",
+                "--benchmark-grace-period",
+                "--aiperf-dataset-entries",
             ]:
                 self.assertEqual(
                     campaign.flag_value(direct, flag),
@@ -135,6 +138,15 @@ class CampaignDryRunTest(unittest.TestCase):
             self.assertEqual(
                 campaign.flag_value(direct, "--exact-input-token-id"),
                 str(manifest["fixture"]["exact_input_token_id"]),
+            )
+            self.assertEqual(
+                campaign.flag_value(direct, "--warmup-grace-period"), "0"
+            )
+            self.assertEqual(
+                campaign.flag_value(direct, "--benchmark-grace-period"), "0"
+            )
+            self.assertEqual(
+                campaign.flag_value(direct, "--aiperf-dataset-entries"), "1"
             )
             self.assertNotEqual(
                 campaign.flag_value(direct, "--namespace"),

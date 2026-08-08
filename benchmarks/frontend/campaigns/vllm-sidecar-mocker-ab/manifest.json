@@ -33,6 +33,7 @@
   "tools": {
     "aiperf_version": "0.10.0",
     "aiperf_export_level": "records",
+    "num_dataset_entries": 1,
     "random_seed": 100,
     "request_rate": "unlimited"
   },
@@ -60,6 +61,8 @@
   "timing": {
     "warmup_seconds": 15,
     "measurement_seconds": 60,
+    "warmup_grace_seconds": 0,
+    "measurement_grace_seconds": 0,
     "cooldown_seconds": 5
   },
   "loadgen_preflight": {

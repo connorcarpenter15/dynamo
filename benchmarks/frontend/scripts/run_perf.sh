@@ -61,9 +61,11 @@ TOKENIZER_BACKEND="${TOKENIZER_BACKEND:-}"
 NUM_MODELS="${NUM_MODELS:-1}"                 # Number of model instances (each gets NUM_WORKERS workers)
 AIPERF_TARGETS="${AIPERF_TARGETS:-first}"     # "first" = model-1 only, "all" = one aiperf run per model
 BENCHMARK_DURATION="${BENCHMARK_DURATION:-}"  # aiperf --benchmark-duration (seconds)
+BENCHMARK_GRACE_PERIOD="${BENCHMARK_GRACE_PERIOD:-}"
 REQUEST_RATE="${REQUEST_RATE:-}"              # aiperf --request-rate (requests/sec)
 WARMUP_DURATION="${WARMUP_DURATION:-}"        # aiperf --warmup-duration (seconds)
 WARMUP_COUNT="${WARMUP_COUNT:-}"              # aiperf --warmup-request-count
+WARMUP_GRACE_PERIOD="${WARMUP_GRACE_PERIOD:-}"
 BACKEND_MODE="${BACKEND_MODE:-direct-vllm-mocker}"
 GRPC_CONNECTIONS="${GRPC_CONNECTIONS:-8}"
 GRPC_PORT="${GRPC_PORT:-50051}"
@@ -72,6 +74,7 @@ ENDPOINT_TYPE="${ENDPOINT_TYPE:-chat}"
 DYNAMO_NAMESPACE="${DYNAMO_NAMESPACE:-dynamo}"
 AIPERF_SHARDS="${AIPERF_SHARDS:-1}"
 AIPERF_EXPORT_LEVEL="${AIPERF_EXPORT_LEVEL:-summary}"
+AIPERF_DATASET_ENTRIES="${AIPERF_DATASET_ENTRIES:-12800}"
 REQUIRED_AIPERF_VERSION="${REQUIRED_AIPERF_VERSION:-}"
 RANDOM_SEED="${RANDOM_SEED:-100}"
 EXACT_INPUT_TOKEN_ID="${EXACT_INPUT_TOKEN_ID:-}"
@@ -120,9 +123,11 @@ while [[ $# -gt 0 ]]; do
         --num-models)           NUM_MODELS="$2"; shift 2 ;;
         --aiperf-targets)       AIPERF_TARGETS="$2"; shift 2 ;;
         --benchmark-duration)   BENCHMARK_DURATION="$2"; shift 2 ;;
+        --benchmark-grace-period) BENCHMARK_GRACE_PERIOD="$2"; shift 2 ;;
         --request-rate)         REQUEST_RATE="$2"; shift 2 ;;
         --warmup-duration)      WARMUP_DURATION="$2"; shift 2 ;;
         --warmup-count)         WARMUP_COUNT="$2"; shift 2 ;;
+        --warmup-grace-period)  WARMUP_GRACE_PERIOD="$2"; shift 2 ;;
         --backend-mode)         BACKEND_MODE="$2"; shift 2 ;;
         --grpc-connections)     GRPC_CONNECTIONS="$2"; shift 2 ;;
         --grpc-port)            GRPC_PORT="$2"; shift 2 ;;
@@ -131,6 +136,7 @@ while [[ $# -gt 0 ]]; do
         --namespace)            DYNAMO_NAMESPACE="$2"; shift 2 ;;
         --aiperf-shards)        AIPERF_SHARDS="$2"; shift 2 ;;
         --aiperf-export-level)  AIPERF_EXPORT_LEVEL="$2"; shift 2 ;;
+        --aiperf-dataset-entries) AIPERF_DATASET_ENTRIES="$2"; shift 2 ;;
         --require-aiperf-version) REQUIRED_AIPERF_VERSION="$2"; shift 2 ;;
         --random-seed)          RANDOM_SEED="$2"; shift 2 ;;
         --exact-input-token-id) EXACT_INPUT_TOKEN_ID="$2"; shift 2 ;;
@@ -172,9 +178,12 @@ Service Options:
   --aiperf-targets MODE     "first" (default): aiperf targets model-1 only.
                             "all": run aiperf sequentially for each model.
   --benchmark-duration N    aiperf run duration in seconds (default: use --num-requests)
+  --benchmark-grace-period N
+                            Seconds to drain after the measurement boundary
   --request-rate N          Target requests per second (aiperf --request-rate)
   --warmup-duration N       aiperf warmup phase duration in seconds
   --warmup-count N          aiperf warmup request count (default: concurrency)
+  --warmup-grace-period N   Seconds to drain after the warmup boundary
   --backend-mode MODE       direct-vllm-mocker|vllm-sidecar-mocker
   --grpc-connections N      Sidecar gRPC connection pool size (default: 8)
   --grpc-port PORT          Native vLLM gRPC port (default: 50051)
@@ -183,6 +192,8 @@ Service Options:
   --namespace NAME          Unique Dynamo namespace (default: dynamo)
   --aiperf-shards N         Equal parallel AIPerf shards (default: 1)
   --aiperf-export-level N   AIPerf summary|records|raw export level
+  --aiperf-dataset-entries N
+                            Synthetic dataset entries to materialize (default: 12800)
   --require-aiperf-version V
                             Require an exact AIPerf version
   --random-seed N           AIPerf synthetic workload seed (default: 100)
@@ -236,10 +247,17 @@ case "$AIPERF_EXPORT_LEVEL" in
     summary|records|raw) ;;
     *) echo "ERROR: unsupported --aiperf-export-level '$AIPERF_EXPORT_LEVEL'"; exit 1 ;;
 esac
-for _positive_name in GRPC_CONNECTIONS GRPC_PORT AIPERF_SHARDS; do
+for _positive_name in GRPC_CONNECTIONS GRPC_PORT AIPERF_SHARDS AIPERF_DATASET_ENTRIES; do
     _positive_value="${!_positive_name}"
     if [[ ! "$_positive_value" =~ ^[1-9][0-9]*$ ]]; then
         echo "ERROR: $_positive_name must be a positive integer, got '$_positive_value'"
+        exit 1
+    fi
+done
+for _grace_name in BENCHMARK_GRACE_PERIOD WARMUP_GRACE_PERIOD; do
+    _grace_value="${!_grace_name}"
+    if [[ -n "$_grace_value" && ! "$_grace_value" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        echo "ERROR: $_grace_name must be a non-negative duration, got '$_grace_value'"
         exit 1
     fi
 done
@@ -979,6 +997,7 @@ _LOAD_ARGS=()
 _EFFECTIVE_REQUESTS="null"
 if [[ -n "$BENCHMARK_DURATION" ]]; then
     _LOAD_ARGS+=(--benchmark-duration "$BENCHMARK_DURATION")
+    [[ -n "$BENCHMARK_GRACE_PERIOD" ]] && _LOAD_ARGS+=(--benchmark-grace-period "$BENCHMARK_GRACE_PERIOD")
 fi
 if [[ -n "$REQUEST_RATE" ]]; then
     _LOAD_ARGS+=(--request-rate "$REQUEST_RATE")
@@ -1007,6 +1026,7 @@ elif [[ -n "$WARMUP_COUNT" ]]; then
 else
     _WARMUP_ARGS+=(--warmup-request-count "$((CONCURRENCY / AIPERF_SHARDS))")
 fi
+[[ -n "$WARMUP_GRACE_PERIOD" ]] && _WARMUP_ARGS+=(--warmup-grace-period "$WARMUP_GRACE_PERIOD")
 
 if [[ "$ENDPOINT_TYPE" == "completions" ]]; then
     AIPERF_ENDPOINT="/v1/completions"
@@ -1096,7 +1116,7 @@ for _AIPERF_MODEL in "${_AIPERF_MODELS[@]}"; do
             --concurrency "$_SHARD_CONCURRENCY" \
             "${_SHARD_LOAD_ARGS[@]}" \
             "${_WARMUP_ARGS[@]}" \
-            --num-dataset-entries 12800 \
+            --num-dataset-entries "$AIPERF_DATASET_ENTRIES" \
             --random-seed "$RANDOM_SEED" \
             --record-processors "$_SHARD_RECORD_PROCESSORS" \
             --export-level "$AIPERF_EXPORT_LEVEL" \
@@ -1313,6 +1333,7 @@ cat > "$OUTPUT_DIR/config.json" <<EOF
   "concurrency": $CONCURRENCY,
   "num_requests": ${_EFFECTIVE_REQUESTS:-null},
   "benchmark_duration": ${BENCHMARK_DURATION:-null},
+  "benchmark_grace_period": ${BENCHMARK_GRACE_PERIOD:-null},
   "request_rate": ${REQUEST_RATE:-null},
   "isl": $ISL,
   "osl": $OSL,
@@ -1320,6 +1341,8 @@ cat > "$OUTPUT_DIR/config.json" <<EOF
   "aiperf_version": $_AIPERF_VERSION_JSON,
   "random_seed": $RANDOM_SEED,
   "exact_input_token_id": ${EXACT_INPUT_TOKEN_ID:-null},
+  "warmup_grace_period": ${WARMUP_GRACE_PERIOD:-null},
+  "aiperf_dataset_entries": $AIPERF_DATASET_ENTRIES,
   "aiperf_shards": $AIPERF_SHARDS,
   "aiperf_export_level": "$AIPERF_EXPORT_LEVEL",
   "aiperf_failed": $AIPERF_FAILED,

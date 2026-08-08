@@ -593,8 +593,14 @@ def build_run_perf_command(
             [
                 "--benchmark-duration",
                 str(timing["measurement_seconds"]),
+                "--benchmark-grace-period",
+                str(timing["measurement_grace_seconds"]),
                 "--warmup-duration",
                 str(timing["warmup_seconds"]),
+                "--warmup-grace-period",
+                str(timing["warmup_grace_seconds"]),
+                "--aiperf-dataset-entries",
+                str(manifest["tools"]["num_dataset_entries"]),
                 "--capture-duration",
                 str(
                     timing["measurement_seconds"]
