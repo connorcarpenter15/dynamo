@@ -62,6 +62,7 @@ NUM_MODELS="${NUM_MODELS:-1}"                 # Number of model instances (each 
 AIPERF_TARGETS="${AIPERF_TARGETS:-first}"     # "first" = model-1 only, "all" = one aiperf run per model
 BENCHMARK_DURATION="${BENCHMARK_DURATION:-}"  # aiperf --benchmark-duration (seconds)
 BENCHMARK_GRACE_PERIOD="${BENCHMARK_GRACE_PERIOD:-}"
+REQUEST_TIMEOUT_SECONDS="${REQUEST_TIMEOUT_SECONDS:-}"
 REQUEST_RATE="${REQUEST_RATE:-}"              # aiperf --request-rate (requests/sec)
 WARMUP_DURATION="${WARMUP_DURATION:-}"        # aiperf --warmup-duration (seconds)
 WARMUP_COUNT="${WARMUP_COUNT:-}"              # aiperf --warmup-request-count
@@ -124,6 +125,7 @@ while [[ $# -gt 0 ]]; do
         --aiperf-targets)       AIPERF_TARGETS="$2"; shift 2 ;;
         --benchmark-duration)   BENCHMARK_DURATION="$2"; shift 2 ;;
         --benchmark-grace-period) BENCHMARK_GRACE_PERIOD="$2"; shift 2 ;;
+        --request-timeout-seconds) REQUEST_TIMEOUT_SECONDS="$2"; shift 2 ;;
         --request-rate)         REQUEST_RATE="$2"; shift 2 ;;
         --warmup-duration)      WARMUP_DURATION="$2"; shift 2 ;;
         --warmup-count)         WARMUP_COUNT="$2"; shift 2 ;;
@@ -180,6 +182,8 @@ Service Options:
   --benchmark-duration N    aiperf run duration in seconds (default: use --num-requests)
   --benchmark-grace-period N
                             Seconds to drain after the measurement boundary
+  --request-timeout-seconds N
+                            Per-request HTTP timeout recorded as a failure
   --request-rate N          Target requests per second (aiperf --request-rate)
   --warmup-duration N       aiperf warmup phase duration in seconds
   --warmup-count N          aiperf warmup request count (default: concurrency)
@@ -254,7 +258,7 @@ for _positive_name in GRPC_CONNECTIONS GRPC_PORT AIPERF_SHARDS AIPERF_DATASET_EN
         exit 1
     fi
 done
-for _grace_name in BENCHMARK_GRACE_PERIOD WARMUP_GRACE_PERIOD; do
+for _grace_name in BENCHMARK_GRACE_PERIOD REQUEST_TIMEOUT_SECONDS WARMUP_GRACE_PERIOD; do
     _grace_value="${!_grace_name}"
     if [[ -n "$_grace_value" && ! "$_grace_value" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
         echo "ERROR: $_grace_name must be a non-negative duration, got '$_grace_value'"
@@ -1055,6 +1059,8 @@ echo "  aiperf targets: ${_AIPERF_MODELS[*]} (mode=$AIPERF_TARGETS, endpoint=$AI
 AIPERF_PIDS=()
 AIPERF_LABELS=()
 AIPERF_FAILED=false
+_REQUEST_TIMEOUT_ARGS=()
+[[ -n "$REQUEST_TIMEOUT_SECONDS" ]] && _REQUEST_TIMEOUT_ARGS=(--request-timeout-seconds "$REQUEST_TIMEOUT_SECONDS")
 if [[ -d "$MODEL" ]]; then
     # AIPerf 0.10.0's offline loader treats absolute local paths as Hub repo IDs.
     # Keep the local fixture local while allowing its service processes to load it.
@@ -1103,6 +1109,7 @@ for _AIPERF_MODEL in "${_AIPERF_MODELS[@]}"; do
             --endpoint "$AIPERF_ENDPOINT" \
             --streaming \
             --url "http://127.0.0.1:$FRONTEND_PORT" \
+            "${_REQUEST_TIMEOUT_ARGS[@]}" \
             --synthetic-input-tokens-mean "$ISL" \
             --synthetic-input-tokens-stddev 0 \
             --output-tokens-mean "$OSL" \
@@ -1334,6 +1341,7 @@ cat > "$OUTPUT_DIR/config.json" <<EOF
   "num_requests": ${_EFFECTIVE_REQUESTS:-null},
   "benchmark_duration": ${BENCHMARK_DURATION:-null},
   "benchmark_grace_period": ${BENCHMARK_GRACE_PERIOD:-null},
+  "request_timeout_seconds": ${REQUEST_TIMEOUT_SECONDS:-null},
   "request_rate": ${REQUEST_RATE:-null},
   "isl": $ISL,
   "osl": $OSL,

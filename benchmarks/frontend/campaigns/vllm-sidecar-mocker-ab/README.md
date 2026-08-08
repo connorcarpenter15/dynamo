@@ -53,7 +53,7 @@ The native sidecar currently publishes its resolved `--model-path` as the served
 
 For completion requests, the campaign overrides AIPerf's approximate synthetic text with exactly `isl` copies of the manifest-locked token ID. This keeps server-visible input lengths exact without changing the shared model or tokenizer identity.
 
-Timed phases use zero warmup and measurement grace. Outstanding requests are cancelled at the locked 15-second and 60-second boundaries and remain visible as saturation failures. Because the explicit prompt replaces every generated prompt, AIPerf materializes one reusable synthetic dataset entry per leg.
+Timed phases use a 15-second request timeout and a bounded 15-second grace after the warmup and measurement boundaries. Saturated requests therefore become recorded failures and drain before the next phase. Because the explicit prompt replaces every generated prompt, AIPerf materializes one reusable synthetic dataset entry per leg.
 
 The output root contains the manifest and SHA-256, source/environment/binary hashes, the resolved schedule, per-leg raw artifacts, individual runs, matched-pair CSV/JSON, point-level paired medians, connection-pool diagnostics, SVG comparison charts, flagged points, and `results/report.md`. Four-shard latency percentiles are pooled from AIPerf's records exports; throughput uses aggregate token/request totals divided by the maximum shard wall time.
 

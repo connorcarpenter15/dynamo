@@ -128,6 +128,7 @@ class CampaignDryRunTest(unittest.TestCase):
                 "--exact-input-token-id",
                 "--warmup-grace-period",
                 "--benchmark-grace-period",
+                "--request-timeout-seconds",
                 "--aiperf-dataset-entries",
             ]:
                 self.assertEqual(
@@ -140,10 +141,13 @@ class CampaignDryRunTest(unittest.TestCase):
                 str(manifest["fixture"]["exact_input_token_id"]),
             )
             self.assertEqual(
-                campaign.flag_value(direct, "--warmup-grace-period"), "0"
+                campaign.flag_value(direct, "--warmup-grace-period"), "15"
             )
             self.assertEqual(
-                campaign.flag_value(direct, "--benchmark-grace-period"), "0"
+                campaign.flag_value(direct, "--benchmark-grace-period"), "15"
+            )
+            self.assertEqual(
+                campaign.flag_value(direct, "--request-timeout-seconds"), "15"
             )
             self.assertEqual(
                 campaign.flag_value(direct, "--aiperf-dataset-entries"), "1"

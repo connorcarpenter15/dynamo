@@ -595,6 +595,8 @@ def build_run_perf_command(
                 str(timing["measurement_seconds"]),
                 "--benchmark-grace-period",
                 str(timing["measurement_grace_seconds"]),
+                "--request-timeout-seconds",
+                str(manifest["tools"]["request_timeout_seconds"]),
                 "--warmup-duration",
                 str(timing["warmup_seconds"]),
                 "--warmup-grace-period",
