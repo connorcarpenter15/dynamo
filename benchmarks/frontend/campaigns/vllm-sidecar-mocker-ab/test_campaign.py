@@ -108,6 +108,16 @@ class CampaignDryRunTest(unittest.TestCase):
             (model_path / "tokenizer_config.json").read_text(encoding="utf-8")
         )
         self.assertTrue(tokenizer_config["chat_template"])
+        model_config = json.loads(
+            (model_path / "config.json").read_text(encoding="utf-8")
+        )
+        required_context = max(manifest["main_matrix"]["input_tokens"]) + max(
+            manifest["main_matrix"]["output_tokens"]
+        )
+        self.assertGreaterEqual(
+            model_config["max_position_embeddings"], required_context
+        )
+        self.assertGreaterEqual(tokenizer_config["model_max_length"], required_context)
 
         with tempfile.TemporaryDirectory() as temporary:
             output_root = Path(temporary)

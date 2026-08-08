@@ -2,6 +2,6 @@
   "bos_token_id": 1,
   "eos_token_id": 2,
   "pad_token_id": 0,
-  "max_length": 2048,
+  "max_length": 16384,
   "transformers_version": "4.31.0.dev0"
 }
