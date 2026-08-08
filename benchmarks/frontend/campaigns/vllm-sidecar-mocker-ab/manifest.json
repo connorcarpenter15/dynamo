@@ -1,0 +1,111 @@
+{
+  "schema_version": 1,
+  "campaign": "vllm-sidecar-mocker-ab",
+  "description": "CPU-only direct Dynamo Mocker versus native-vLLM sidecar/gRPC request-plane campaign",
+  "source": {
+    "repository": "ai-dynamo/dynamo",
+    "required_ancestor": "f9863c6e420a4fc7af9d9458f0216957e3f757bf",
+    "require_clean_worktree": true
+  },
+  "protocol": {
+    "service": "vllm.Generate",
+    "version": "0.25.1",
+    "schema": "lib/sidecar/vllm/proto/vllm_grpc.proto"
+  },
+  "arms": {
+    "direct-mocker": {
+      "backend_mode": "direct-vllm-mocker",
+      "topology": "AIPerf -> Dynamo frontend -> TCP request plane -> python -m dynamo.mocker --engine-type vllm"
+    },
+    "sidecar": {
+      "backend_mode": "vllm-sidecar-mocker",
+      "topology": "AIPerf -> Dynamo frontend -> TCP request plane -> dynamo-vllm-sidecar -> native vLLM Generate gRPC -> dynamo-vllm-mocker-server"
+    }
+  },
+  "fixture": {
+    "model": "lib/llm/tests/data/sample-models/mock-llama-3.1-8b-instruct",
+    "served_model_name": {
+      "policy": "resolved-model-path"
+    },
+    "mocker_config": "benchmarks/frontend/campaigns/vllm-sidecar-mocker-ab/mocker-config.json"
+  },
+  "tools": {
+    "aiperf_version": "0.10.0",
+    "aiperf_export_level": "records",
+    "random_seed": 100,
+    "request_rate": "unlimited"
+  },
+  "transport": {
+    "request_plane": "tcp",
+    "event_plane": "nats",
+    "endpoint_type": "completions",
+    "streaming": true,
+    "grpc_host": "127.0.0.1",
+    "grpc_port": 50051,
+    "production_grpc_connections": 8
+  },
+  "hardware": {
+    "minimum_physical_cores": 48,
+    "maximum_preflight_busy_fraction": 0.05,
+    "busy_sample_seconds": 5,
+    "one_hardware_thread_per_core": true,
+    "roles": {
+      "frontend_cores": 8,
+      "backend_cores": 16,
+      "loadgen_cores": 16,
+      "minimum_infra_cores": 8
+    }
+  },
+  "timing": {
+    "warmup_seconds": 15,
+    "measurement_seconds": 60,
+    "cooldown_seconds": 5
+  },
+  "loadgen_preflight": {
+    "arm": "direct-mocker",
+    "input_tokens": 32,
+    "output_tokens": 16,
+    "concurrency": 4096,
+    "candidate_shards": [1, 4],
+    "improvement_threshold": 0.05,
+    "four_shard_minimum_concurrency": 1024
+  },
+  "main_matrix": {
+    "input_tokens": [32, 8192],
+    "output_tokens": [16, 1024],
+    "concurrency": [1, 16, 64, 256, 1024, 2048, 4096],
+    "shuffle_seed": 20260807,
+    "crossover": ["direct-mocker", "sidecar", "sidecar", "direct-mocker"]
+  },
+  "connection_diagnostic": {
+    "connections": [1, 2, 4, 8, 16],
+    "orders": ["ascending", "descending"],
+    "anchors": [
+      {"input_tokens": 32, "output_tokens": 1024, "concurrency": 1024},
+      {"input_tokens": 8192, "output_tokens": 1024, "concurrency": 4096}
+    ],
+    "reuse_main_connections": 8
+  },
+  "profiles": {
+    "input_tokens": 32,
+    "output_tokens": 1024,
+    "concurrency": 1024,
+    "direct_mocker_runs": 1,
+    "sidecar_connections": [1, 8, 16],
+    "profile_target": "backend"
+  },
+  "smoke": {
+    "input_tokens": 32,
+    "output_tokens": 16,
+    "concurrency": 1,
+    "request_count": 1,
+    "expected_output_tokens": 16
+  },
+  "flags": {
+    "throughput_loss_fraction": 0.10,
+    "p99_ttft_increase_fraction": 0.25,
+    "failed_request_fraction": 0.001,
+    "pool_throughput_improvement_fraction": 0.05,
+    "pool_failure_reduction_percentage_points": 0.1
+  }
+}

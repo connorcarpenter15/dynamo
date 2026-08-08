@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Focused dry-run regression coverage for the locked campaign topology."""
+
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+import run_campaign as campaign
+
+
+class CampaignDryRunTest(unittest.TestCase):
+    def test_topologies_share_workload_affinity_and_crossover_contract(self) -> None:
+        """Regression: topology drift could invalidate the A/B result; dry-run commands expose it."""
+        manifest = campaign.load_manifest()
+        layout = campaign.CpuLayout(
+            frontend="0-7",
+            backend="8-23",
+            loadgen="24-39",
+            infra="40-47",
+            physical_cores=48,
+        )
+        legs = campaign.build_resolved_plan(manifest, selected_shards=4)
+        main = [leg for leg in legs if leg["phase"] == "main"]
+        self.assertEqual(len(main), 112)
+        grouped: dict[str, list[dict]] = {}
+        for leg in main:
+            grouped.setdefault(leg["metadata"]["point_key"], []).append(leg)
+        expected_crossover = manifest["main_matrix"]["crossover"]
+        self.assertEqual(len(grouped), 28)
+        self.assertTrue(
+            all(
+                [leg["arm"] for leg in point] == expected_crossover
+                for point in grouped.values()
+            )
+        )
+        mocker_config_path = campaign.REPO_ROOT / manifest["fixture"]["mocker_config"]
+        mocker_config = json.loads(mocker_config_path.read_text(encoding="utf-8"))
+        self.assertEqual(mocker_config["engine_type"], "vllm")
+        self.assertEqual(mocker_config["speedup_ratio"], 0.0)
+        self.assertEqual(mocker_config["dp_size"], 1)
+        self.assertEqual(mocker_config["worker_type"], "aggregated")
+        self.assertEqual(mocker_config["block_size"], 64)
+        self.assertFalse(mocker_config["enable_prefix_caching"])
+        self.assertEqual(mocker_config["max_num_seqs"], 8192)
+        self.assertGreaterEqual(mocker_config["num_gpu_blocks"], 4_194_304)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output_root = Path(temporary)
+            binaries = {
+                "vllm_sidecar": "/build/dynamo-vllm-sidecar",
+                "vllm_mocker_server": "/build/dynamo-vllm-mocker-server",
+            }
+            point = next(iter(grouped.values()))
+            direct_leg = next(leg for leg in point if leg["arm"] == "direct-mocker")
+            sidecar_leg = next(leg for leg in point if leg["arm"] == "sidecar")
+            direct = campaign.build_run_perf_command(
+                direct_leg, manifest, layout, output_root, "dryrun", binaries
+            )
+            sidecar = campaign.build_run_perf_command(
+                sidecar_leg, manifest, layout, output_root, "dryrun", binaries
+            )
+            self.assertEqual(
+                campaign.flag_value(direct, "--backend-mode"), "direct-vllm-mocker"
+            )
+            self.assertEqual(
+                campaign.flag_value(sidecar, "--backend-mode"), "vllm-sidecar-mocker"
+            )
+            self.assertNotIn("--vllm-sidecar-bin", direct)
+            self.assertIn("--vllm-sidecar-bin", sidecar)
+            self.assertNotIn("--request-rate", direct)
+            self.assertNotIn("--request-rate", sidecar)
+            self.assertEqual(
+                campaign.flag_value(direct, "--model"),
+                campaign.flag_value(direct, "--model-name"),
+            )
+            for flag in [
+                "--model",
+                "--model-name",
+                "--workers",
+                "--data-parallel-size",
+                "--request-plane",
+                "--event-plane",
+                "--mocker-config",
+                "--endpoint-type",
+                "--frontend-cpuset",
+                "--backend-cpuset",
+                "--loadgen-cpuset",
+                "--infra-cpuset",
+                "--concurrency",
+                "--isl",
+                "--osl",
+                "--aiperf-shards",
+                "--require-aiperf-version",
+                "--random-seed",
+            ]:
+                self.assertEqual(
+                    campaign.flag_value(direct, flag),
+                    campaign.flag_value(sidecar, flag),
+                    flag,
+                )
+            self.assertNotEqual(
+                campaign.flag_value(direct, "--namespace"),
+                campaign.flag_value(sidecar, "--namespace"),
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

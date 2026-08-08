@@ -1,0 +1,13 @@
+{
+  "engine_type": "vllm",
+  "num_gpu_blocks": 4194304,
+  "block_size": 64,
+  "max_num_seqs": 8192,
+  "max_num_batched_tokens": 67108864,
+  "enable_prefix_caching": false,
+  "enable_chunked_prefill": true,
+  "speedup_ratio": 0.0,
+  "decode_speedup_ratio": 1.0,
+  "dp_size": 1,
+  "worker_type": "aggregated"
+}

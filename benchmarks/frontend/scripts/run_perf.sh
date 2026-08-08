@@ -64,6 +64,24 @@ BENCHMARK_DURATION="${BENCHMARK_DURATION:-}"  # aiperf --benchmark-duration (sec
 REQUEST_RATE="${REQUEST_RATE:-}"              # aiperf --request-rate (requests/sec)
 WARMUP_DURATION="${WARMUP_DURATION:-}"        # aiperf --warmup-duration (seconds)
 WARMUP_COUNT="${WARMUP_COUNT:-}"              # aiperf --warmup-request-count
+BACKEND_MODE="${BACKEND_MODE:-direct-vllm-mocker}"
+GRPC_CONNECTIONS="${GRPC_CONNECTIONS:-8}"
+GRPC_PORT="${GRPC_PORT:-50051}"
+MOCKER_CONFIG="${MOCKER_CONFIG:-}"
+ENDPOINT_TYPE="${ENDPOINT_TYPE:-chat}"
+DYNAMO_NAMESPACE="${DYNAMO_NAMESPACE:-dynamo}"
+AIPERF_SHARDS="${AIPERF_SHARDS:-1}"
+AIPERF_EXPORT_LEVEL="${AIPERF_EXPORT_LEVEL:-summary}"
+REQUIRED_AIPERF_VERSION="${REQUIRED_AIPERF_VERSION:-}"
+RANDOM_SEED="${RANDOM_SEED:-100}"
+FRONTEND_CPUSET="${FRONTEND_CPUSET:-}"
+BACKEND_CPUSET="${BACKEND_CPUSET:-}"
+LOADGEN_CPUSET="${LOADGEN_CPUSET:-}"
+INFRA_CPUSET="${INFRA_CPUSET:-}"
+VLLM_MOCKER_SERVER_BIN="${VLLM_MOCKER_SERVER_BIN:-}"
+VLLM_SIDECAR_BIN="${VLLM_SIDECAR_BIN:-}"
+PROFILE_TARGET="${PROFILE_TARGET:-frontend}"
+REQUIRE_MANAGED_INFRA=false
 
 # Opt-out flags
 SKIP_BPF=false
@@ -104,6 +122,24 @@ while [[ $# -gt 0 ]]; do
         --request-rate)         REQUEST_RATE="$2"; shift 2 ;;
         --warmup-duration)      WARMUP_DURATION="$2"; shift 2 ;;
         --warmup-count)         WARMUP_COUNT="$2"; shift 2 ;;
+        --backend-mode)         BACKEND_MODE="$2"; shift 2 ;;
+        --grpc-connections)     GRPC_CONNECTIONS="$2"; shift 2 ;;
+        --grpc-port)            GRPC_PORT="$2"; shift 2 ;;
+        --mocker-config)        MOCKER_CONFIG="$2"; shift 2 ;;
+        --endpoint-type)        ENDPOINT_TYPE="$2"; shift 2 ;;
+        --namespace)            DYNAMO_NAMESPACE="$2"; shift 2 ;;
+        --aiperf-shards)        AIPERF_SHARDS="$2"; shift 2 ;;
+        --aiperf-export-level)  AIPERF_EXPORT_LEVEL="$2"; shift 2 ;;
+        --require-aiperf-version) REQUIRED_AIPERF_VERSION="$2"; shift 2 ;;
+        --random-seed)          RANDOM_SEED="$2"; shift 2 ;;
+        --frontend-cpuset)      FRONTEND_CPUSET="$2"; shift 2 ;;
+        --backend-cpuset)       BACKEND_CPUSET="$2"; shift 2 ;;
+        --loadgen-cpuset)       LOADGEN_CPUSET="$2"; shift 2 ;;
+        --infra-cpuset)         INFRA_CPUSET="$2"; shift 2 ;;
+        --vllm-mocker-server-bin) VLLM_MOCKER_SERVER_BIN="$2"; shift 2 ;;
+        --vllm-sidecar-bin)     VLLM_SIDECAR_BIN="$2"; shift 2 ;;
+        --profile-target)       PROFILE_TARGET="$2"; shift 2 ;;
+        --require-managed-infra) REQUIRE_MANAGED_INFRA=true; shift ;;
         --skip-bpf)             SKIP_BPF=true; shift ;;
         --skip-nsys)            SKIP_NSYS=true; shift ;;
         --skip-flamegraph)      SKIP_FLAMEGRAPH=true; shift ;;
@@ -137,6 +173,26 @@ Service Options:
   --request-rate N          Target requests per second (aiperf --request-rate)
   --warmup-duration N       aiperf warmup phase duration in seconds
   --warmup-count N          aiperf warmup request count (default: concurrency)
+  --backend-mode MODE       direct-vllm-mocker|vllm-sidecar-mocker
+  --grpc-connections N      Sidecar gRPC connection pool size (default: 8)
+  --grpc-port PORT          Native vLLM gRPC port (default: 50051)
+  --mocker-config PATH      Shared Mocker engine JSON used by either topology
+  --endpoint-type TYPE      chat|completions (default: chat)
+  --namespace NAME          Unique Dynamo namespace (default: dynamo)
+  --aiperf-shards N         Equal parallel AIPerf shards (default: 1)
+  --aiperf-export-level N   AIPerf summary|records|raw export level
+  --require-aiperf-version V
+                            Require an exact AIPerf version
+  --random-seed N           AIPerf synthetic workload seed (default: 100)
+  --frontend-cpuset LIST    taskset CPU list for the frontend
+  --backend-cpuset LIST     Shared taskset CPU list for either backend topology
+  --loadgen-cpuset LIST     taskset CPU list for AIPerf
+  --infra-cpuset LIST       taskset CPU list for etcd, NATS, and collectors
+  --vllm-mocker-server-bin PATH
+                            Built dynamo-vllm-mocker-server executable
+  --vllm-sidecar-bin PATH   Built dynamo-vllm-sidecar executable
+  --profile-target TARGET   frontend|backend|all process set for profiling
+  --require-managed-infra   Reject pre-existing etcd or NATS processes
 
 Load Options:
   --concurrency N           aiperf concurrency (default: 64)
@@ -160,6 +216,59 @@ USAGE
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
+
+case "$BACKEND_MODE" in
+    direct-vllm-mocker|vllm-sidecar-mocker) ;;
+    *) echo "ERROR: unsupported --backend-mode '$BACKEND_MODE'"; exit 1 ;;
+esac
+case "$ENDPOINT_TYPE" in
+    chat|completions) ;;
+    *) echo "ERROR: unsupported --endpoint-type '$ENDPOINT_TYPE'"; exit 1 ;;
+esac
+case "$PROFILE_TARGET" in
+    frontend|backend|all) ;;
+    *) echo "ERROR: unsupported --profile-target '$PROFILE_TARGET'"; exit 1 ;;
+esac
+case "$AIPERF_EXPORT_LEVEL" in
+    summary|records|raw) ;;
+    *) echo "ERROR: unsupported --aiperf-export-level '$AIPERF_EXPORT_LEVEL'"; exit 1 ;;
+esac
+for _positive_name in GRPC_CONNECTIONS GRPC_PORT AIPERF_SHARDS; do
+    _positive_value="${!_positive_name}"
+    if [[ ! "$_positive_value" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: $_positive_name must be a positive integer, got '$_positive_value'"
+        exit 1
+    fi
+done
+if [[ ! "$RANDOM_SEED" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: RANDOM_SEED must be a non-negative integer, got '$RANDOM_SEED'"
+    exit 1
+fi
+if [[ -n "$MOCKER_CONFIG" && ! -f "$MOCKER_CONFIG" ]]; then
+    echo "ERROR: --mocker-config '$MOCKER_CONFIG' does not exist"
+    exit 1
+fi
+if [[ "$BACKEND_MODE" == "vllm-sidecar-mocker" && ( "$NUM_MODELS" -ne 1 || "$NUM_WORKERS" -ne 1 || "$DATA_PARALLEL_SIZE" -ne 1 ) ]]; then
+    echo "ERROR: vllm-sidecar-mocker requires one model, one worker, and DP1"
+    exit 1
+fi
+if (( CONCURRENCY % AIPERF_SHARDS != 0 )); then
+    echo "ERROR: concurrency ($CONCURRENCY) must be divisible by aiperf shards ($AIPERF_SHARDS)"
+    exit 1
+fi
+if [[ -n "$FRONTEND_CPUSET$BACKEND_CPUSET$LOADGEN_CPUSET$INFRA_CPUSET" ]] && ! command -v taskset &>/dev/null; then
+    echo "ERROR: taskset is required when a CPU set is configured"
+    exit 1
+fi
+
+FRONTEND_CPU_PREFIX=()
+BACKEND_CPU_PREFIX=()
+LOADGEN_CPU_PREFIX=()
+INFRA_CPU_PREFIX=()
+[[ -n "$FRONTEND_CPUSET" ]] && FRONTEND_CPU_PREFIX=(taskset --cpu-list "$FRONTEND_CPUSET")
+[[ -n "$BACKEND_CPUSET" ]] && BACKEND_CPU_PREFIX=(taskset --cpu-list "$BACKEND_CPUSET")
+[[ -n "$LOADGEN_CPUSET" ]] && LOADGEN_CPU_PREFIX=(taskset --cpu-list "$LOADGEN_CPUSET")
+[[ -n "$INFRA_CPUSET" ]] && INFRA_CPU_PREFIX=(taskset --cpu-list "$INFRA_CPUSET")
 
 # Default model-name to model if not set
 [[ -z "$MODEL_NAME" ]] && MODEL_NAME="$MODEL"
@@ -221,7 +330,6 @@ echo "--- Pre-flight checks ---"
 HAS_NSYS=false
 HAS_PERF=false
 HAS_BPF=false
-HAS_FLAMEGRAPH_RENDERER=false
 
 if command -v "$NSYS_CMD" &>/dev/null && [[ "$SKIP_NSYS" == false ]]; then
     HAS_NSYS=true
@@ -255,7 +363,6 @@ else
 fi
 
 if command -v flamegraph.pl &>/dev/null || command -v inferno-flamegraph &>/dev/null; then
-    HAS_FLAMEGRAPH_RENDERER=true
     echo "  flamegraph: available"
 else
     echo "  flamegraph: SKIP (install inferno: cargo install inferno)"
@@ -271,12 +378,20 @@ if ! command -v aiperf &>/dev/null && ! python3 -c "import aiperf" 2>/dev/null; 
     echo "ERROR: aiperf not found. Install: pip install git+https://github.com/ai-dynamo/aiperf.git"
     exit 1
 fi
-echo "  aiperf:     available"
+_AIPERF_VERSION_OUTPUT=$(aiperf --version 2>&1 || true)
+if [[ -n "$REQUIRED_AIPERF_VERSION" ]] && ! grep -Eq "(^|[^0-9])${REQUIRED_AIPERF_VERSION//./\\.}([^0-9]|$)" <<<"$_AIPERF_VERSION_OUTPUT"; then
+    echo "ERROR: required AIPerf $REQUIRED_AIPERF_VERSION, got '${_AIPERF_VERSION_OUTPUT:-unknown}'"
+    exit 1
+fi
+echo "  aiperf:     ${_AIPERF_VERSION_OUTPUT:-available}"
 echo ""
 
 # ─── Tracked PIDs for cleanup ───────────────────────────────────────────────
 ALL_PIDS=()      # everything we need to kill on exit
 CAPTURE_PIDS=()  # capture processes we wait for
+OBSERVED_PIDS=() # frontend and backend processes sampled under /proc
+OBSERVED_LABELS=()
+BACKEND_PIDS=()
 ETCD_PID=""      # etcd PID if we started it
 ETCD_DATA_DIR=""
 NATS_PID=""      # nats-server PID if we started it
@@ -325,19 +440,43 @@ cleanup() {
             break
         fi
     done
+    _cleanup_remaining=0
+    for pid in "${ALL_PIDS[@]}" "${CAPTURE_PIDS[@]}"; do
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            _cleanup_remaining=$((_cleanup_remaining + 1))
+        fi
+    done
+    if [[ -n "${OUTPUT_DIR:-}" && -d "$OUTPUT_DIR/system" ]]; then
+        jq -n --argjson remaining "$_cleanup_remaining" \
+            '{remaining_processes: $remaining, clean: ($remaining == 0)}' \
+            > "$OUTPUT_DIR/system/cleanup.json"
+    fi
     echo "Cleanup complete."
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # ─── Step 0: Ensure etcd + NATS are running ──────────────────────────────────
 echo "--- Checking infrastructure (etcd + NATS) ---"
+
+if [[ "$REQUIRE_MANAGED_INFRA" == true ]]; then
+    if curl -sf http://localhost:2379/health >/dev/null 2>&1; then
+        echo "ERROR: --require-managed-infra forbids a pre-existing etcd on port 2379"
+        exit 1
+    fi
+    if nc -z localhost 4222 2>/dev/null; then
+        echo "ERROR: --require-managed-infra forbids a pre-existing NATS server on port 4222"
+        exit 1
+    fi
+fi
 
 # etcd
 if ! curl -sf http://localhost:2379/health >/dev/null 2>&1; then
     if command -v etcd &>/dev/null; then
         echo "  etcd not running — starting it..."
         ETCD_DATA_DIR=$(mktemp -d)
-        etcd --data-dir="$ETCD_DATA_DIR" \
+        "${INFRA_CPU_PREFIX[@]}" etcd --data-dir="$ETCD_DATA_DIR" \
              --listen-client-urls=http://localhost:2379 \
              --advertise-client-urls=http://localhost:2379 \
              --listen-peer-urls=http://localhost:2380 \
@@ -366,7 +505,7 @@ fi
 if ! nc -z localhost 4222 2>/dev/null; then
     if command -v nats-server &>/dev/null; then
         echo "  nats-server not running — starting it..."
-        nats-server > /dev/null 2>&1 &
+        "${INFRA_CPU_PREFIX[@]}" nats-server > /dev/null 2>&1 &
         NATS_PID=$!
         for i in $(seq 1 30); do
             if nc -z localhost 4222 2>/dev/null; then
@@ -386,37 +525,111 @@ else
 fi
 echo ""
 
-# ─── Step 1: Start mocker workers ───────────────────────────────────────────
-TOTAL_WORKERS=$(( ${#MODEL_NAMES[@]} * NUM_WORKERS ))
-echo "--- Starting $TOTAL_WORKERS mocker worker(s) (${#MODEL_NAMES[@]} model(s) x $NUM_WORKERS worker(s)) ---"
+# ─── Step 1: Start the selected backend topology ────────────────────────────
+echo "--- Starting backend: $BACKEND_MODE ---"
 BASE_SYSTEM_PORT=8081
 WORKER_IDX=0
-for MN in "${MODEL_NAMES[@]}"; do
-    for i in $(seq 1 "$NUM_WORKERS"); do
-        WORKER_IDX=$((WORKER_IDX + 1))
-        WORKER_PORT=$((BASE_SYSTEM_PORT + WORKER_IDX - 1))
-        MOCKER_ARGS=(
-            --model-path "$MODEL"
-            --model-name "$MN"
-            --speedup-ratio "$SPEEDUP_RATIO"
-            --request-plane "$REQUEST_PLANE"
-        )
-        if [[ "$DATA_PARALLEL_SIZE" -gt 1 ]]; then
-            MOCKER_ARGS+=(--data-parallel-size "$DATA_PARALLEL_SIZE")
-        fi
-        if [[ -n "$PLANNER_PROFILE" ]]; then
-            MOCKER_ARGS+=(--planner-profile-data "$PLANNER_PROFILE")
-        fi
+if [[ "$BACKEND_MODE" == "direct-vllm-mocker" ]]; then
+    TOTAL_WORKERS=$(( ${#MODEL_NAMES[@]} * NUM_WORKERS ))
+    echo "  topology: frontend -> TCP request plane -> $TOTAL_WORKERS dynamo.mocker worker(s)"
+    for MN in "${MODEL_NAMES[@]}"; do
+        for i in $(seq 1 "$NUM_WORKERS"); do
+            WORKER_IDX=$((WORKER_IDX + 1))
+            WORKER_PORT=$((BASE_SYSTEM_PORT + WORKER_IDX - 1))
+            MOCKER_ARGS=(
+                --model-path "$MODEL"
+                --model-name "$MN"
+                --engine-type vllm
+                --request-plane "$REQUEST_PLANE"
+            )
+            if [[ -n "$MOCKER_CONFIG" ]]; then
+                MOCKER_ARGS+=(--extra-engine-args "$MOCKER_CONFIG")
+            else
+                MOCKER_ARGS+=(--speedup-ratio "$SPEEDUP_RATIO")
+            fi
+            if [[ "$DATA_PARALLEL_SIZE" -gt 1 ]]; then
+                MOCKER_ARGS+=(--data-parallel-size "$DATA_PARALLEL_SIZE")
+            fi
+            if [[ -n "$PLANNER_PROFILE" ]]; then
+                MOCKER_ARGS+=(--planner-profile-data "$PLANNER_PROFILE")
+            fi
 
-        MN_SAFE="${MN//\//_}"
-        HF_HUB_OFFLINE=1 DYN_SYSTEM_PORT=$WORKER_PORT DYN_EVENT_PLANE="$EVENT_PLANE" python -m dynamo.mocker "${MOCKER_ARGS[@]}" \
-            > "$OUTPUT_DIR/logs/mocker_${MN_SAFE}_${i}.log" 2>&1 &
-        ALL_PIDS+=($!)
-        echo "  Worker $WORKER_IDX ($MN #$i): PID ${ALL_PIDS[-1]}, port $WORKER_PORT"
+            MN_SAFE="${MN//\//_}"
+            "${BACKEND_CPU_PREFIX[@]}" env HF_HUB_OFFLINE=1 DYN_NAMESPACE="$DYNAMO_NAMESPACE" \
+                DYN_SYSTEM_PORT="$WORKER_PORT" DYN_REQUEST_PLANE="$REQUEST_PLANE" DYN_EVENT_PLANE="$EVENT_PLANE" \
+                python -m dynamo.mocker "${MOCKER_ARGS[@]}" \
+                > "$OUTPUT_DIR/logs/mocker_${MN_SAFE}_${i}.log" 2>&1 &
+            WORKER_PID=$!
+            ALL_PIDS+=("$WORKER_PID")
+            BACKEND_PIDS+=("$WORKER_PID")
+            OBSERVED_PIDS+=("$WORKER_PID")
+            OBSERVED_LABELS+=("mocker_${WORKER_IDX}")
+            echo "  Worker $WORKER_IDX ($MN #$i): PID $WORKER_PID, port $WORKER_PORT"
+        done
     done
-done
-# Update NUM_WORKERS to total for Prometheus scraping later
-NUM_WORKERS_TOTAL=$WORKER_IDX
+    NUM_WORKERS_TOTAL=$WORKER_IDX
+else
+    echo "  topology: frontend -> TCP request plane -> vLLM sidecar -> native gRPC -> vLLM Mocker server"
+    if nc -z 127.0.0.1 "$GRPC_PORT" 2>/dev/null; then
+        echo "ERROR: gRPC port $GRPC_PORT is already in use"
+        exit 1
+    fi
+    if [[ -z "$VLLM_MOCKER_SERVER_BIN" ]]; then
+        VLLM_MOCKER_SERVER_BIN=$(command -v dynamo-vllm-mocker-server 2>/dev/null || true)
+    fi
+    if [[ -z "$VLLM_SIDECAR_BIN" ]]; then
+        VLLM_SIDECAR_BIN=$(command -v dynamo-vllm-sidecar 2>/dev/null || true)
+    fi
+    if [[ -z "$VLLM_MOCKER_SERVER_BIN" || ! -x "$VLLM_MOCKER_SERVER_BIN" ]]; then
+        echo "ERROR: dynamo-vllm-mocker-server not found; use --vllm-mocker-server-bin"
+        exit 1
+    fi
+    if [[ -z "$VLLM_SIDECAR_BIN" || ! -x "$VLLM_SIDECAR_BIN" ]]; then
+        echo "ERROR: dynamo-vllm-sidecar not found; use --vllm-sidecar-bin"
+        exit 1
+    fi
+
+    VLLM_SERVER_ARGS=(
+        --listen "127.0.0.1:$GRPC_PORT"
+        --model "$MODEL_NAME"
+        --max-concurrent-requests 8192
+    )
+    [[ -n "$MOCKER_CONFIG" ]] && VLLM_SERVER_ARGS+=(--extra-engine-args "$MOCKER_CONFIG")
+    "${BACKEND_CPU_PREFIX[@]}" "$VLLM_MOCKER_SERVER_BIN" "${VLLM_SERVER_ARGS[@]}" \
+        > "$OUTPUT_DIR/logs/vllm_mocker_server.log" 2>&1 &
+    VLLM_MOCKER_SERVER_PID=$!
+    ALL_PIDS+=("$VLLM_MOCKER_SERVER_PID")
+    BACKEND_PIDS+=("$VLLM_MOCKER_SERVER_PID")
+    OBSERVED_PIDS+=("$VLLM_MOCKER_SERVER_PID")
+    OBSERVED_LABELS+=("vllm_mocker_server")
+    for _try in $(seq 1 60); do
+        nc -z 127.0.0.1 "$GRPC_PORT" 2>/dev/null && break
+        if ! kill -0 "$VLLM_MOCKER_SERVER_PID" 2>/dev/null; then
+            echo "ERROR: vLLM Mocker server exited during startup"
+            tail -40 "$OUTPUT_DIR/logs/vllm_mocker_server.log" 2>/dev/null || true
+            exit 1
+        fi
+        [[ "$_try" -eq 60 ]] && { echo "ERROR: vLLM Mocker server did not listen on port $GRPC_PORT"; exit 1; }
+        sleep 1
+    done
+
+    "${BACKEND_CPU_PREFIX[@]}" env HF_HUB_OFFLINE=1 DYN_NAMESPACE="$DYNAMO_NAMESPACE" \
+        DYN_SYSTEM_PORT="$BASE_SYSTEM_PORT" DYN_REQUEST_PLANE="$REQUEST_PLANE" DYN_EVENT_PLANE="$EVENT_PLANE" \
+        "$VLLM_SIDECAR_BIN" \
+        --vllm-endpoint "127.0.0.1:$GRPC_PORT" \
+        --model-path "$MODEL" \
+        --grpc-connections "$GRPC_CONNECTIONS" \
+        --namespace "$DYNAMO_NAMESPACE" \
+        > "$OUTPUT_DIR/logs/vllm_sidecar.log" 2>&1 &
+    SIDECAR_PID=$!
+    ALL_PIDS+=("$SIDECAR_PID")
+    BACKEND_PIDS+=("$SIDECAR_PID")
+    OBSERVED_PIDS+=("$SIDECAR_PID")
+    OBSERVED_LABELS+=("vllm_sidecar")
+    echo "  Mocker gRPC server: PID $VLLM_MOCKER_SERVER_PID, port $GRPC_PORT"
+    echo "  vLLM sidecar: PID $SIDECAR_PID, connections $GRPC_CONNECTIONS"
+    NUM_WORKERS_TOTAL=1
+fi
 
 # ─── Step 2: Start frontend (optionally under nsys) ─────────────────────────
 echo ""
@@ -424,6 +637,7 @@ echo "--- Starting frontend ---"
 
 FRONTEND_ENV=(
     HF_HUB_OFFLINE=1
+    DYN_NAMESPACE="$DYNAMO_NAMESPACE"
     DYN_HTTP_PORT="$FRONTEND_PORT"
     DYN_PERF_DIAG=1
     DYN_ENABLE_NVTX=1
@@ -455,7 +669,7 @@ fi
 
 if [[ "$HAS_NSYS" == true ]]; then
     echo "  (under nsys profiling)"
-    env "${FRONTEND_ENV[@]}" \
+    "${FRONTEND_CPU_PREFIX[@]}" env "${FRONTEND_ENV[@]}" \
         "$NSYS_CMD" profile \
         --trace=osrt,nvtx \
         --sample=cpu \
@@ -465,7 +679,7 @@ if [[ "$HAS_NSYS" == true ]]; then
         python -m dynamo.frontend \
         > "$OUTPUT_DIR/logs/frontend.log" 2>&1 &
     NSYS_WRAPPER_PID=$!
-    ALL_PIDS+=($NSYS_WRAPPER_PID)
+    ALL_PIDS+=("$NSYS_WRAPPER_PID")
     # Resolve the actual python child PID for perf stat / proc polling.
     # nsys spawns python as a child; we need the real PID for --pid attachments.
     FRONTEND_PID=""
@@ -485,12 +699,21 @@ if [[ "$HAS_NSYS" == true ]]; then
     echo "  nsys wrapper PID: $NSYS_WRAPPER_PID"
     echo "  Frontend PID: $FRONTEND_PID"
 else
-    env "${FRONTEND_ENV[@]}" python -m dynamo.frontend \
+    "${FRONTEND_CPU_PREFIX[@]}" env "${FRONTEND_ENV[@]}" python -m dynamo.frontend \
         > "$OUTPUT_DIR/logs/frontend.log" 2>&1 &
     FRONTEND_PID=$!
-    ALL_PIDS+=($FRONTEND_PID)
+    ALL_PIDS+=("$FRONTEND_PID")
     echo "  Frontend PID: $FRONTEND_PID"
 fi
+OBSERVED_PIDS+=("$FRONTEND_PID")
+OBSERVED_LABELS+=("frontend")
+
+case "$PROFILE_TARGET" in
+    frontend) PROFILE_PIDS=("$FRONTEND_PID"); PROFILE_LABELS=("frontend") ;;
+    backend) PROFILE_PIDS=("${BACKEND_PIDS[@]}"); PROFILE_LABELS=("${OBSERVED_LABELS[@]:0:${#BACKEND_PIDS[@]}}") ;;
+    all) PROFILE_PIDS=("${OBSERVED_PIDS[@]}"); PROFILE_LABELS=("${OBSERVED_LABELS[@]}") ;;
+esac
+PROFILE_PID_LIST=$(IFS=,; echo "${PROFILE_PIDS[*]}")
 
 # ─── Step 3: Wait for readiness ─────────────────────────────────────────────
 echo ""
@@ -527,6 +750,26 @@ while [[ "$_all_models_ready" == false ]]; do
 done
 echo "All ${#MODEL_NAMES[@]} model(s) ready (waited ${WAITED}s)"
 
+curl -sf --max-time 5 "http://127.0.0.1:$FRONTEND_PORT/v1/models" \
+    > "$OUTPUT_DIR/system/models.json"
+
+if [[ "$BACKEND_MODE" == "vllm-sidecar-mocker" ]]; then
+    ss -Hnt state established "( dport = :$GRPC_PORT )" 2>/dev/null \
+        > "$OUTPUT_DIR/system/grpc_connections.txt"
+    LIVE_GRPC_CONNECTIONS=$(wc -l < "$OUTPUT_DIR/system/grpc_connections.txt")
+    jq -n \
+        --argjson expected "$GRPC_CONNECTIONS" \
+        --argjson observed "$LIVE_GRPC_CONNECTIONS" \
+        --arg endpoint "127.0.0.1:$GRPC_PORT" \
+        '{expected: $expected, observed: $observed, endpoint: $endpoint, valid: ($expected == $observed)}' \
+        > "$OUTPUT_DIR/system/grpc_connection_check.json"
+    if [[ "$LIVE_GRPC_CONNECTIONS" -ne "$GRPC_CONNECTIONS" ]]; then
+        echo "ERROR: expected $GRPC_CONNECTIONS sidecar-to-Mocker sockets, observed $LIVE_GRPC_CONNECTIONS"
+        exit 1
+    fi
+    echo "  Verified $LIVE_GRPC_CONNECTIONS established sidecar-to-Mocker sockets"
+fi
+
 # Capture initial Prometheus snapshot (baseline for histogram delta analysis)
 echo "  Capturing initial Prometheus snapshot..."
 {
@@ -548,16 +791,16 @@ if [[ "$HAS_PERF" == true ]]; then
         # NMI watchdog holds a HW PMU counter, causing <not counted> for
         # most hardware events. Fall back to software counters + userspace-
         # qualified cycles/instructions which work on the remaining PMUs.
-        echo "  [perf stat] pid=$FRONTEND_PID (NMI watchdog active — using software + :u counters)"
+        echo "  [perf stat] pids=$PROFILE_PID_LIST (NMI watchdog active — using software + :u counters)"
         echo "  TIP: disable watchdog for full HW counters: sudo sysctl kernel.nmi_watchdog=0"
-        perf stat --pid "$FRONTEND_PID" \
+        "${INFRA_CPU_PREFIX[@]}" perf stat --pid "$PROFILE_PID_LIST" \
             -e task-clock,context-switches,cpu-migrations,page-faults,cycles:u,instructions:u \
             -o "$OUTPUT_DIR/perf/perf_stat.txt" \
             -- sleep "$CAPTURE_DURATION" &
         CAPTURE_PIDS+=($!)
     else
-        echo "  [perf stat] pid=$FRONTEND_PID"
-        perf stat --pid "$FRONTEND_PID" \
+        echo "  [perf stat] pids=$PROFILE_PID_LIST"
+        "${INFRA_CPU_PREFIX[@]}" perf stat --pid "$PROFILE_PID_LIST" \
             -o "$OUTPUT_DIR/perf/perf_stat.txt" \
             -- sleep "$CAPTURE_DURATION" &
         CAPTURE_PIDS+=($!)
@@ -568,35 +811,50 @@ fi
 # run.sh --batch waits for its children internally and forwards TERM→INT
 # so bpftrace flushes aggregation maps before exiting.
 if [[ "$HAS_BPF" == true ]]; then
-    "${SCRIPT_DIR}/bpf/run.sh" --batch \
-        --pid "$FRONTEND_PID" \
-        --output-dir "$OUTPUT_DIR/bpf" \
-        --duration "$CAPTURE_DURATION" &
-    CAPTURE_PIDS+=($!)
+    for _profile_idx in "${!PROFILE_PIDS[@]}"; do
+        _profile_pid="${PROFILE_PIDS[$_profile_idx]}"
+        _profile_label="${PROFILE_LABELS[$_profile_idx]}"
+        _bpf_output_dir="$OUTPUT_DIR/bpf"
+        [[ "${#PROFILE_PIDS[@]}" -gt 1 ]] && _bpf_output_dir="$OUTPUT_DIR/bpf/$_profile_label"
+        mkdir -p "$_bpf_output_dir"
+        "${INFRA_CPU_PREFIX[@]}" "${SCRIPT_DIR}/bpf/run.sh" --batch \
+            --pid "$_profile_pid" \
+            --output-dir "$_bpf_output_dir" \
+            --duration "$CAPTURE_DURATION" &
+        CAPTURE_PIDS+=("$!")
+    done
 fi
 
 # 4e. Flamegraph captures — delegate to flamegraph/ scripts
 if [[ "$SKIP_FLAMEGRAPH" == false ]]; then
     if command -v perf &>/dev/null || command -v samply &>/dev/null; then
-        echo "  [flamegraph] CPU, pid=$FRONTEND_PID"
-        "${SCRIPT_DIR}/flamegraph/cpu_flamegraph.sh" \
-            --pid "$FRONTEND_PID" \
-            --duration "$CAPTURE_DURATION" \
-            --output-dir "$OUTPUT_DIR/perf" \
-            --output cpu_flamegraph &
-        CAPTURE_PIDS+=($!)
+        for _profile_idx in "${!PROFILE_PIDS[@]}"; do
+            _profile_pid="${PROFILE_PIDS[$_profile_idx]}"
+            _profile_label="${PROFILE_LABELS[$_profile_idx]}"
+            echo "  [flamegraph] CPU, pid=$_profile_pid ($_profile_label)"
+            "${INFRA_CPU_PREFIX[@]}" "${SCRIPT_DIR}/flamegraph/cpu_flamegraph.sh" \
+                --pid "$_profile_pid" \
+                --duration "$CAPTURE_DURATION" \
+                --output-dir "$OUTPUT_DIR/perf" \
+                --output "${_profile_label}_cpu_flamegraph" &
+            CAPTURE_PIDS+=("$!")
+        done
     else
         echo "  [flamegraph] SKIP CPU — install perf or samply:"
         echo "    apt install linux-tools-\$(uname -r)  OR  cargo install samply"
     fi
     if [[ "$HAS_BPF" == true ]]; then
-        echo "  [flamegraph] Off-CPU, pid=$FRONTEND_PID"
-        "${SCRIPT_DIR}/flamegraph/offcpu_flamegraph.sh" \
-            --pid "$FRONTEND_PID" \
-            --duration "$CAPTURE_DURATION" \
-            --output-dir "$OUTPUT_DIR/perf" \
-            --output offcpu_flamegraph &
-        CAPTURE_PIDS+=($!)
+        for _profile_idx in "${!PROFILE_PIDS[@]}"; do
+            _profile_pid="${PROFILE_PIDS[$_profile_idx]}"
+            _profile_label="${PROFILE_LABELS[$_profile_idx]}"
+            echo "  [flamegraph] Off-CPU, pid=$_profile_pid ($_profile_label)"
+            "${INFRA_CPU_PREFIX[@]}" "${SCRIPT_DIR}/flamegraph/offcpu_flamegraph.sh" \
+                --pid "$_profile_pid" \
+                --duration "$CAPTURE_DURATION" \
+                --output-dir "$OUTPUT_DIR/perf" \
+                --output "${_profile_label}_offcpu_flamegraph" &
+            CAPTURE_PIDS+=("$!")
+        done
     else
         echo "  [flamegraph] SKIP Off-CPU — needs bpftrace with root or CAP_BPF"
     fi
@@ -605,29 +863,38 @@ fi
 # 4c. System capture (/proc polling, thread/fd counts, socket stats)
 echo "  [system] /proc stats, thread/fd count, ss"
 (
+    [[ -n "$INFRA_CPUSET" ]] && taskset --pid --cpu-list "$INFRA_CPUSET" "$BASHPID" >/dev/null
     INTERVAL=1
     for _i in $(seq 1 "$CAPTURE_DURATION"); do
         TS=$(date -Iseconds)
 
-        # /proc status
-        echo "--- $TS ---" >> "$OUTPUT_DIR/system/proc_status.txt"
-        cat "/proc/$FRONTEND_PID/status" >> "$OUTPUT_DIR/system/proc_status.txt" 2>/dev/null || true
+        for _proc_idx in "${!OBSERVED_PIDS[@]}"; do
+            _proc_pid="${OBSERVED_PIDS[$_proc_idx]}"
+            _proc_label="${OBSERVED_LABELS[$_proc_idx]}"
+            [[ -d "/proc/$_proc_pid" ]] || continue
 
-        # /proc stat — raw scheduler/CPU time info
-        echo "--- $TS ---" >> "$OUTPUT_DIR/system/proc_stat.txt"
-        cat "/proc/$FRONTEND_PID/stat" >> "$OUTPUT_DIR/system/proc_stat.txt" 2>/dev/null || true
+            echo "--- $TS pid=$_proc_pid ---" >> "$OUTPUT_DIR/system/proc_status_${_proc_label}.txt"
+            cat "/proc/$_proc_pid/status" >> "$OUTPUT_DIR/system/proc_status_${_proc_label}.txt" 2>/dev/null || true
 
-        # /proc statm — page-level memory info
-        echo "--- $TS ---" >> "$OUTPUT_DIR/system/proc_statm.txt"
-        cat "/proc/$FRONTEND_PID/statm" >> "$OUTPUT_DIR/system/proc_statm.txt" 2>/dev/null || true
+            echo "--- $TS pid=$_proc_pid ---" >> "$OUTPUT_DIR/system/proc_stat_${_proc_label}.txt"
+            cat "/proc/$_proc_pid/stat" >> "$OUTPUT_DIR/system/proc_stat_${_proc_label}.txt" 2>/dev/null || true
 
-        # Thread count
-        THREADS=$(ls -1 "/proc/$FRONTEND_PID/task/" 2>/dev/null | wc -l)
-        echo "$TS threads=$THREADS" >> "$OUTPUT_DIR/system/thread_count.txt"
+            echo "--- $TS pid=$_proc_pid ---" >> "$OUTPUT_DIR/system/proc_statm_${_proc_label}.txt"
+            cat "/proc/$_proc_pid/statm" >> "$OUTPUT_DIR/system/proc_statm_${_proc_label}.txt" 2>/dev/null || true
 
-        # FD count
-        FDS=$(ls -1 "/proc/$FRONTEND_PID/fd/" 2>/dev/null | wc -l)
-        echo "$TS fds=$FDS" >> "$OUTPUT_DIR/system/fd_count.txt"
+            echo "--- $TS pid=$_proc_pid ---" >> "$OUTPUT_DIR/system/proc_io_${_proc_label}.txt"
+            cat "/proc/$_proc_pid/io" >> "$OUTPUT_DIR/system/proc_io_${_proc_label}.txt" 2>/dev/null || true
+
+            _task_entries=("/proc/$_proc_pid/task/"*)
+            _fd_entries=("/proc/$_proc_pid/fd/"*)
+            THREADS=${#_task_entries[@]}
+            FDS=${#_fd_entries[@]}
+            echo "$TS pid=$_proc_pid threads=$THREADS fds=$FDS" >> "$OUTPUT_DIR/system/process_counts_${_proc_label}.txt"
+            if [[ "$_proc_label" == "frontend" ]]; then
+                echo "$TS threads=$THREADS" >> "$OUTPUT_DIR/system/thread_count.txt"
+                echo "$TS fds=$FDS" >> "$OUTPUT_DIR/system/fd_count.txt"
+            fi
+        done
 
         # Socket stats
         echo "--- $TS ---" >> "$OUTPUT_DIR/system/ss_stats.txt"
@@ -642,7 +909,7 @@ CAPTURE_PIDS+=($!)
 if [[ "$ENABLE_TCPDUMP" == true ]]; then
     if command -v tcpdump &>/dev/null; then
         echo "  [tcpdump] port=$TCPDUMP_PORT"
-        timeout "$CAPTURE_DURATION" tcpdump -i any \
+        "${INFRA_CPU_PREFIX[@]}" timeout "$CAPTURE_DURATION" tcpdump -i any \
             -w "$OUTPUT_DIR/system/capture.pcap" \
             "port $TCPDUMP_PORT" \
             -s 96 -c 100000 &>/dev/null &
@@ -655,6 +922,7 @@ fi
 # 4d. Periodic Prometheus /metrics scraping (frontend + all mocker workers)
 echo "  [prometheus] scraping every 1s"
 (
+    [[ -n "$INFRA_CPUSET" ]] && taskset --pid --cpu-list "$INFRA_CPUSET" "$BASHPID" >/dev/null
     for _i in $(seq 1 "$CAPTURE_DURATION"); do
         METRICS=$(curl -s --max-time 3 "http://127.0.0.1:$FRONTEND_PORT/metrics" 2>/dev/null || echo "")
         # Append mocker worker metrics (ports BASE_SYSTEM_PORT .. BASE_SYSTEM_PORT+NUM_WORKERS-1)
@@ -720,9 +988,19 @@ _WARMUP_ARGS=()
 if [[ -n "$WARMUP_DURATION" ]]; then
     _WARMUP_ARGS+=(--warmup-duration "$WARMUP_DURATION")
 elif [[ -n "$WARMUP_COUNT" ]]; then
-    _WARMUP_ARGS+=(--warmup-request-count "$WARMUP_COUNT")
+    if (( WARMUP_COUNT % AIPERF_SHARDS != 0 )); then
+        echo "ERROR: warmup count ($WARMUP_COUNT) must be divisible by aiperf shards ($AIPERF_SHARDS)"
+        exit 1
+    fi
+    _WARMUP_ARGS+=(--warmup-request-count "$((WARMUP_COUNT / AIPERF_SHARDS))")
 else
-    _WARMUP_ARGS+=(--warmup-request-count "$CONCURRENCY")
+    _WARMUP_ARGS+=(--warmup-request-count "$((CONCURRENCY / AIPERF_SHARDS))")
+fi
+
+if [[ "$ENDPOINT_TYPE" == "completions" ]]; then
+    AIPERF_ENDPOINT="/v1/completions"
+else
+    AIPERF_ENDPOINT="/v1/chat/completions"
 fi
 
 # Build the list of models to target
@@ -732,8 +1010,11 @@ if [[ "$AIPERF_TARGETS" == "all" && ${#MODEL_NAMES[@]} -gt 1 ]]; then
 else
     _AIPERF_MODELS=("${MODEL_NAMES[0]}")
 fi
-echo "  aiperf targets: ${_AIPERF_MODELS[*]} (mode=$AIPERF_TARGETS)"
+echo "  aiperf targets: ${_AIPERF_MODELS[*]} (mode=$AIPERF_TARGETS, endpoint=$AIPERF_ENDPOINT, shards=$AIPERF_SHARDS)"
 
+AIPERF_PIDS=()
+AIPERF_LABELS=()
+AIPERF_FAILED=false
 for _AIPERF_MODEL in "${_AIPERF_MODELS[@]}"; do
     if [[ ${#_AIPERF_MODELS[@]} -gt 1 ]]; then
         AIPERF_ARTIFACT_DIR="$OUTPUT_DIR/aiperf/${_AIPERF_MODEL}"
@@ -742,8 +1023,6 @@ for _AIPERF_MODEL in "${_AIPERF_MODELS[@]}"; do
     else
         AIPERF_ARTIFACT_DIR="$OUTPUT_DIR/aiperf"
     fi
-    mkdir -p "$AIPERF_ARTIFACT_DIR"
-
     # When the served model name differs from the HF model path (multi-model),
     # tell aiperf where to find the tokenizer.
     _AIPERF_TOK_ARGS=()
@@ -751,36 +1030,99 @@ for _AIPERF_MODEL in "${_AIPERF_MODELS[@]}"; do
         _AIPERF_TOK_ARGS=(--tokenizer "$MODEL")
     fi
 
-    HF_HUB_OFFLINE=1 aiperf profile --artifact-dir "$AIPERF_ARTIFACT_DIR" \
-        --model "$_AIPERF_MODEL" \
-        "${_AIPERF_TOK_ARGS[@]}" \
-        --endpoint-type chat \
-        --endpoint /v1/chat/completions \
-        --streaming \
-        --url "http://127.0.0.1:$FRONTEND_PORT" \
-        --synthetic-input-tokens-mean "$ISL" \
-        --synthetic-input-tokens-stddev 0 \
-        --output-tokens-mean "$OSL" \
-        --output-tokens-stddev 0 \
-        --extra-inputs max_tokens:"$OSL" \
-        --extra-inputs min_tokens:"$OSL" \
-        --extra-inputs ignore_eos:true \
-        --extra-inputs repetition_penalty:1.0 \
-        --extra-inputs temperature:0.0 \
-        --concurrency "$CONCURRENCY" \
-        "${_LOAD_ARGS[@]}" \
-        "${_WARMUP_ARGS[@]}" \
-        --num-dataset-entries 12800 \
-        --random-seed 100 \
-        --workers-max "$CONCURRENCY" \
-        --record-processors 32 \
-        --ui simple || echo "WARNING: aiperf failed for model ${_AIPERF_MODEL}"
+    for _shard in $(seq 1 "$AIPERF_SHARDS"); do
+        _SHARD_CONCURRENCY=$((CONCURRENCY / AIPERF_SHARDS))
+        _SHARD_LOAD_ARGS=("${_LOAD_ARGS[@]}")
+        if [[ "$_EFFECTIVE_REQUESTS" != "null" ]]; then
+            if (( _EFFECTIVE_REQUESTS % AIPERF_SHARDS != 0 )); then
+                echo "ERROR: request count ($_EFFECTIVE_REQUESTS) must be divisible by aiperf shards ($AIPERF_SHARDS)"
+                exit 1
+            fi
+            _SHARD_LOAD_ARGS=(--request-count "$((_EFFECTIVE_REQUESTS / AIPERF_SHARDS))")
+        fi
+        if [[ "$AIPERF_SHARDS" -gt 1 ]]; then
+            _SHARD_ARTIFACT_DIR="$AIPERF_ARTIFACT_DIR/shard-$(printf '%03d' "$_shard")"
+        else
+            _SHARD_ARTIFACT_DIR="$AIPERF_ARTIFACT_DIR"
+        fi
+        mkdir -p "$_SHARD_ARTIFACT_DIR"
+        _SHARD_RECORD_PROCESSORS=$((32 / AIPERF_SHARDS))
+        [[ "$_SHARD_RECORD_PROCESSORS" -lt 1 ]] && _SHARD_RECORD_PROCESSORS=1
+        _SHARD_LABEL="${_AIPERF_MODEL//\//_}_shard_${_shard}"
+        "${LOADGEN_CPU_PREFIX[@]}" env HF_HUB_OFFLINE=1 aiperf profile --artifact-dir "$_SHARD_ARTIFACT_DIR" \
+            --model "$_AIPERF_MODEL" \
+            "${_AIPERF_TOK_ARGS[@]}" \
+            --endpoint-type "$ENDPOINT_TYPE" \
+            --endpoint "$AIPERF_ENDPOINT" \
+            --streaming \
+            --url "http://127.0.0.1:$FRONTEND_PORT" \
+            --synthetic-input-tokens-mean "$ISL" \
+            --synthetic-input-tokens-stddev 0 \
+            --output-tokens-mean "$OSL" \
+            --output-tokens-stddev 0 \
+            --extra-inputs max_tokens:"$OSL" \
+            --extra-inputs min_tokens:"$OSL" \
+            --extra-inputs ignore_eos:true \
+            --extra-inputs repetition_penalty:1.0 \
+            --extra-inputs temperature:0.0 \
+            --concurrency "$_SHARD_CONCURRENCY" \
+            "${_SHARD_LOAD_ARGS[@]}" \
+            "${_WARMUP_ARGS[@]}" \
+            --num-dataset-entries 12800 \
+            --random-seed "$RANDOM_SEED" \
+            --workers-max "$_SHARD_CONCURRENCY" \
+            --record-processors "$_SHARD_RECORD_PROCESSORS" \
+            --export-level "$AIPERF_EXPORT_LEVEL" \
+            --ui simple > "$OUTPUT_DIR/logs/aiperf_${_SHARD_LABEL}.log" 2>&1 &
+        AIPERF_PIDS+=("$!")
+        AIPERF_LABELS+=("$_SHARD_LABEL")
+    done
 done
+
+for _aiperf_idx in "${!AIPERF_PIDS[@]}"; do
+    if ! wait "${AIPERF_PIDS[$_aiperf_idx]}"; then
+        echo "WARNING: aiperf failed for ${AIPERF_LABELS[$_aiperf_idx]}"
+        AIPERF_FAILED=true
+    fi
+done
+
+PROCESS_HEALTH_VALID=true
+: > "$OUTPUT_DIR/system/process_health.txt"
+for _proc_idx in "${!OBSERVED_PIDS[@]}"; do
+    _proc_pid="${OBSERVED_PIDS[$_proc_idx]}"
+    _proc_label="${OBSERVED_LABELS[$_proc_idx]}"
+    if kill -0 "$_proc_pid" 2>/dev/null; then
+        echo "$_proc_label pid=$_proc_pid alive=true" >> "$OUTPUT_DIR/system/process_health.txt"
+    else
+        echo "$_proc_label pid=$_proc_pid alive=false" >> "$OUTPUT_DIR/system/process_health.txt"
+        PROCESS_HEALTH_VALID=false
+    fi
+done
+jq -n --argjson valid "$PROCESS_HEALTH_VALID" '{valid: $valid}' \
+    > "$OUTPUT_DIR/system/process_health.json"
+
+if [[ "$BACKEND_MODE" == "vllm-sidecar-mocker" ]]; then
+    FINAL_GRPC_CONNECTIONS=$(ss -Hnt state established "( dport = :$GRPC_PORT )" 2>/dev/null | wc -l)
+    jq --argjson final "$FINAL_GRPC_CONNECTIONS" \
+        '.final_observed = $final | .valid = (.expected == .observed and .expected == $final)' \
+        "$OUTPUT_DIR/system/grpc_connection_check.json" \
+        > "$OUTPUT_DIR/system/grpc_connection_check.tmp"
+    mv "$OUTPUT_DIR/system/grpc_connection_check.tmp" "$OUTPUT_DIR/system/grpc_connection_check.json"
+fi
+
+if [[ "$PROCESS_HEALTH_VALID" != true ]]; then
+    echo "ERROR: a frontend or backend process exited during the leg"
+    exit 1
+fi
+if [[ "$BACKEND_MODE" == "vllm-sidecar-mocker" && "$FINAL_GRPC_CONNECTIONS" -ne "$GRPC_CONNECTIONS" ]]; then
+    echo "ERROR: expected $GRPC_CONNECTIONS sidecar-to-Mocker sockets after load, observed $FINAL_GRPC_CONNECTIONS"
+    exit 1
+fi
 
 # Check for server_metrics_export.json in the primary aiperf dir
 _PRIMARY_AIPERF_DIR="$OUTPUT_DIR/aiperf"
 [[ ${#_AIPERF_MODELS[@]} -gt 1 ]] && _PRIMARY_AIPERF_DIR="$OUTPUT_DIR/aiperf/${_AIPERF_MODELS[0]}"
-if [[ -f "$_PRIMARY_AIPERF_DIR/server_metrics_export.json" ]]; then
+if compgen -G "$_PRIMARY_AIPERF_DIR/**/server_metrics_export.json" >/dev/null || [[ -f "$_PRIMARY_AIPERF_DIR/server_metrics_export.json" ]]; then
     echo "  Found server_metrics_export.json"
 fi
 
@@ -891,9 +1233,31 @@ else
 fi
 
 # ─── Step 8: Save config ────────────────────────────────────────────────────
+MOCKER_CONFIG_SHA256=""
+[[ -n "$MOCKER_CONFIG" ]] && MOCKER_CONFIG_SHA256=$(sha256sum "$MOCKER_CONFIG" | awk '{print $1}')
+VLLM_MOCKER_SERVER_SHA256=""
+VLLM_SIDECAR_SHA256=""
+if [[ "$BACKEND_MODE" == "vllm-sidecar-mocker" ]]; then
+    VLLM_MOCKER_SERVER_SHA256=$(sha256sum "$VLLM_MOCKER_SERVER_BIN" | awk '{print $1}')
+    VLLM_SIDECAR_SHA256=$(sha256sum "$VLLM_SIDECAR_BIN" | awk '{print $1}')
+fi
+SOURCE_COMMIT=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)
+SOURCE_DIRTY=false
+[[ -n "$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null || true)" ]] && SOURCE_DIRTY=true
+RUN_PERF_SHA256=$(sha256sum "$REPO_ROOT/benchmarks/frontend/scripts/run_perf.sh" | awk '{print $1}')
+CARGO_LOCK_SHA256=$(sha256sum "$REPO_ROOT/Cargo.lock" | awk '{print $1}')
+VLLM_PROTO_PATH="$REPO_ROOT/lib/sidecar/vllm/proto/vllm_grpc.proto"
+VLLM_PROTO_SHA256=$(sha256sum "$VLLM_PROTO_PATH" | awk '{print $1}')
+_AIPERF_VERSION_JSON=$(jq -Rn --arg value "$_AIPERF_VERSION_OUTPUT" '$value')
 cat > "$OUTPUT_DIR/config.json" <<EOF
 {
   "timestamp": "$TIMESTAMP",
+  "source_commit": "$SOURCE_COMMIT",
+  "source_dirty": $SOURCE_DIRTY,
+  "run_perf_sha256": "$RUN_PERF_SHA256",
+  "cargo_lock_sha256": "$CARGO_LOCK_SHA256",
+  "vllm_grpc_schema_version": "0.25.1",
+  "vllm_grpc_schema_sha256": "$VLLM_PROTO_SHA256",
   "model": "$MODEL",
   "model_name": "$MODEL_NAME",
   "model_names": $(printf '%s\n' "${MODEL_NAMES[@]}" | jq -R . | jq -s .),
@@ -904,6 +1268,19 @@ cat > "$OUTPUT_DIR/config.json" <<EOF
   "data_parallel_size": $DATA_PARALLEL_SIZE,
   "request_plane": "$REQUEST_PLANE",
   "event_plane": "$EVENT_PLANE",
+  "backend_mode": "$BACKEND_MODE",
+  "backend_pids": $(printf '%s\n' "${BACKEND_PIDS[@]}" | jq -R 'tonumber' | jq -s .),
+  "grpc_connections": $GRPC_CONNECTIONS,
+  "grpc_port": $GRPC_PORT,
+  "mocker_config": "$MOCKER_CONFIG",
+  "mocker_config_sha256": "$MOCKER_CONFIG_SHA256",
+  "vllm_mocker_server": "$VLLM_MOCKER_SERVER_BIN",
+  "vllm_mocker_server_sha256": "$VLLM_MOCKER_SERVER_SHA256",
+  "vllm_sidecar": "$VLLM_SIDECAR_BIN",
+  "vllm_sidecar_sha256": "$VLLM_SIDECAR_SHA256",
+  "namespace": "$DYNAMO_NAMESPACE",
+  "endpoint_type": "$ENDPOINT_TYPE",
+  "endpoint": "$AIPERF_ENDPOINT",
   "frontend_port": $FRONTEND_PORT,
   "tokenizer_backend": "${TOKENIZER_BACKEND:-hf}",
   "concurrency": $CONCURRENCY,
@@ -913,6 +1290,17 @@ cat > "$OUTPUT_DIR/config.json" <<EOF
   "isl": $ISL,
   "osl": $OSL,
   "capture_duration": $CAPTURE_DURATION,
+  "aiperf_version": $_AIPERF_VERSION_JSON,
+  "random_seed": $RANDOM_SEED,
+  "aiperf_shards": $AIPERF_SHARDS,
+  "aiperf_export_level": "$AIPERF_EXPORT_LEVEL",
+  "aiperf_failed": $AIPERF_FAILED,
+  "frontend_cpuset": "$FRONTEND_CPUSET",
+  "backend_cpuset": "$BACKEND_CPUSET",
+  "loadgen_cpuset": "$LOADGEN_CPUSET",
+  "infra_cpuset": "$INFRA_CPUSET",
+  "profile_target": "$PROFILE_TARGET",
+  "profile_pids": $(printf '%s\n' "${PROFILE_PIDS[@]}" | jq -R 'tonumber' | jq -s .),
   "frontend_pid": $FRONTEND_PID,
   "has_nsys": $HAS_NSYS,
   "has_perf": $HAS_PERF,
@@ -920,6 +1308,7 @@ cat > "$OUTPUT_DIR/config.json" <<EOF
   "skip_bpf": $SKIP_BPF,
   "skip_nsys": $SKIP_NSYS,
   "skip_flamegraph": $SKIP_FLAMEGRAPH,
+  "skip_perf": $SKIP_PERF,
   "tcpdump": $ENABLE_TCPDUMP,
   "tcpdump_port": $TCPDUMP_PORT,
   "nsys_path": "${NSYS_PATH:-auto}"
@@ -937,9 +1326,14 @@ echo ""
 echo "Contents:"
 find "$OUTPUT_DIR" -type f | sort | while read -r f; do
     SIZE=$(stat -c%s "$f" 2>/dev/null || echo "?")
-    REL="${f#$OUTPUT_DIR/}"
+    REL="${f#"$OUTPUT_DIR"/}"
     printf "  %-50s %s bytes\n" "$REL" "$SIZE"
 done
 echo ""
 echo "Run analysis:"
 echo "  python3 ${SCRIPT_DIR}/analysis/create_report.py analyze $OUTPUT_DIR"
+
+if [[ "$AIPERF_FAILED" == true ]]; then
+    echo "ERROR: one or more AIPerf shards failed; artifacts were preserved"
+    exit 1
+fi
