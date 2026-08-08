@@ -52,6 +52,10 @@ class CampaignDryRunTest(unittest.TestCase):
             (model_path / "tokenizer.json").read_text(encoding="utf-8")
         )
         self.assertGreater(len(tokenizer["model"]["vocab"]), 0)
+        tokenizer_config = json.loads(
+            (model_path / "tokenizer_config.json").read_text(encoding="utf-8")
+        )
+        self.assertTrue(tokenizer_config["chat_template"])
 
         with tempfile.TemporaryDirectory() as temporary:
             output_root = Path(temporary)

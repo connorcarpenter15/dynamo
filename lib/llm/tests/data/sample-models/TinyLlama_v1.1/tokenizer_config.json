@@ -9,6 +9,7 @@
     "rstrip": false,
     "single_word": false
   },
+  "chat_template": "{% for message in messages %}{{ message['role'] + ': ' + message['content'] + '\n' }}{% endfor %}{% if add_generation_prompt %}{{ 'assistant: ' }}{% endif %}",
   "clean_up_tokenization_spaces": false,
   "eos_token": {
     "__type": "AddedToken",
