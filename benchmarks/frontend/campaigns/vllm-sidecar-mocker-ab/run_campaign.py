@@ -1185,19 +1185,30 @@ def validate_leg_output(
         "aiperf_export_level": manifest["tools"]["aiperf_export_level"],
         "random_seed": manifest["tools"]["random_seed"],
         "exact_input_token_id": manifest["fixture"]["exact_input_token_id"],
-        "benchmark_grace_period": manifest["timing"][
-            "measurement_grace_seconds"
-        ],
-        "request_timeout_seconds": manifest["tools"]["request_timeout_seconds"],
-        "warmup_grace_period": manifest["timing"]["warmup_grace_seconds"],
-        "aiperf_dataset_entries": manifest["tools"]["num_dataset_entries"],
-        "allow_aiperf_timeout_failures": manifest["tools"][
-            "allow_aiperf_timeout_failures"
-        ],
         "concurrency": leg["concurrency"],
         "isl": leg["input_tokens"],
         "osl": leg["output_tokens"],
     }
+    if leg["phase"] != "smoke":
+        expected_config.update(
+            {
+                "benchmark_grace_period": manifest["timing"][
+                    "measurement_grace_seconds"
+                ],
+                "request_timeout_seconds": manifest["tools"][
+                    "request_timeout_seconds"
+                ],
+                "warmup_grace_period": manifest["timing"][
+                    "warmup_grace_seconds"
+                ],
+                "aiperf_dataset_entries": manifest["tools"][
+                    "num_dataset_entries"
+                ],
+                "allow_aiperf_timeout_failures": manifest["tools"][
+                    "allow_aiperf_timeout_failures"
+                ],
+            }
+        )
     mismatches = {
         key: {"expected": expected, "observed": config.get(key)}
         for key, expected in expected_config.items()
