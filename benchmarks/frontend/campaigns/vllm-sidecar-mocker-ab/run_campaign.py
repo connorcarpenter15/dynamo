@@ -787,6 +787,7 @@ def prepare_environment(
             "TMPDIR",
             "UV_CACHE_DIR",
             "VIRTUAL_ENV",
+            "XDG_CACHE_HOME",
         ]
         if key in os.environ
     }
