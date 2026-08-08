@@ -386,6 +386,9 @@ fn is_exclusively_mistral_model(directory: &Path) -> bool {
 /// isolates worker sets that share a model name but publish different
 /// file content.
 fn mdc_cache_root() -> PathBuf {
+    if let Some(cache_home) = std::env::var_os("XDG_CACHE_HOME").filter(|value| !value.is_empty()) {
+        return PathBuf::from(cache_home).join("dynamo/mdc");
+    }
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| ".".to_string());
@@ -2627,38 +2630,45 @@ mod tests {
         let workspace = tempfile::tempdir()?;
         let snapshot = hf_cache_fixture(workspace.path())?;
         let home = tempfile::tempdir()?;
-        let home_path = home.path().to_path_buf();
+        let cache_home = tempfile::tempdir()?;
+        let cache_path = cache_home.path().to_path_buf();
 
-        temp_env::async_with_vars([("HOME", Some(home.path()))], async {
-            let mut mdc = super::ModelDeploymentCard::load_from_disk(&snapshot, None)?;
-            let slug = mdc.slug.clone();
-            let mdcsum = mdc.mdcsum().to_string();
-            mdc.download_config(None).await?;
+        temp_env::async_with_vars(
+            [
+                ("HOME", Some(home.path())),
+                ("XDG_CACHE_HOME", Some(cache_home.path())),
+            ],
+            async {
+                let mut mdc = super::ModelDeploymentCard::load_from_disk(&snapshot, None)?;
+                let slug = mdc.slug.clone();
+                let mdcsum = mdc.mdcsum().to_string();
+                mdc.download_config(None).await?;
 
-            let blobs = std::fs::canonicalize(home_path.join(".cache/dynamo/mdc/blobs"))?;
-            let snap = home_path
-                .join(".cache/dynamo/mdc/by-slug")
-                .join(slug.to_string())
-                .join(&mdcsum);
+                let blobs = std::fs::canonicalize(cache_path.join("dynamo/mdc/blobs"))?;
+                let snap = cache_path
+                    .join("dynamo/mdc/by-slug")
+                    .join(slug.to_string())
+                    .join(&mdcsum);
 
-            assert!(snap.join("config.json").exists());
-            assert!(snap.join("tokenizer.json").exists());
-            assert!(snap.join("generation_config.json").exists());
+                assert!(snap.join("config.json").exists());
+                assert!(snap.join("tokenizer.json").exists());
+                assert!(snap.join("generation_config.json").exists());
 
-            // Sibling harvest: TinyLlama_v1.1 fixture ships
-            // `special_tokens_map.json` and `tokenizer.model` outside the
-            // typed slots — both must land in local_dir for
-            // `from_pretrained()` to see a complete model dir.
-            assert!(snap.join("special_tokens_map.json").exists());
-            assert!(snap.join("tokenizer.model").exists());
+                // Sibling harvest: TinyLlama_v1.1 fixture ships
+                // `special_tokens_map.json` and `tokenizer.model` outside the
+                // typed slots — both must land in local_dir for
+                // `from_pretrained()` to see a complete model dir.
+                assert!(snap.join("special_tokens_map.json").exists());
+                assert!(snap.join("tokenizer.model").exists());
 
-            for (cf, _) in mdc.iter_metadata_files() {
-                let path = cf.path().expect("post-download local path");
-                assert!(path.starts_with(&snap));
-                assert!(std::fs::canonicalize(path)?.starts_with(&blobs));
-            }
-            Ok::<_, anyhow::Error>(())
-        })
+                for (cf, _) in mdc.iter_metadata_files() {
+                    let path = cf.path().expect("post-download local path");
+                    assert!(path.starts_with(&snap));
+                    assert!(std::fs::canonicalize(path)?.starts_with(&blobs));
+                }
+                Ok::<_, anyhow::Error>(())
+            },
+        )
         .await
     }
 
