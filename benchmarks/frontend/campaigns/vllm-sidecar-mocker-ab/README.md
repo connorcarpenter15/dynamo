@@ -59,6 +59,8 @@ When saturation produces request timeouts or HTTP 500/503 responses, AIPerf exit
 
 The output root contains the manifest and SHA-256, source/environment/binary hashes, the resolved schedule, per-leg raw artifacts, individual runs, matched-pair CSV/JSON, point-level paired medians, connection-pool diagnostics, SVG comparison charts, flagged points, and `results/report.md`. Four-shard latency percentiles are pooled from AIPerf's records exports; throughput uses aggregate token/request totals divided by the maximum shard wall time.
 
+The sidecar socket gate uses the established connection count captured immediately before load. The post-load count is retained as `final_observed` with an informational `post_load_valid` field because AIPerf record export can outlive an idle gRPC channel; it does not retroactively invalidate a leg whose pre-load pool matched the locked setting.
+
 ## Validation
 
 ```bash
