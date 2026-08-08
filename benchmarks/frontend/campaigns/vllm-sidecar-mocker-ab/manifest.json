@@ -35,7 +35,7 @@
     "aiperf_export_level": "records",
     "num_dataset_entries": 1,
     "request_timeout_seconds": 15,
-    "allow_aiperf_timeout_failures": true,
+    "allow_aiperf_saturation_failures": true,
     "random_seed": 100,
     "request_rate": "unlimited"
   },

@@ -55,7 +55,7 @@ For completion requests, the campaign overrides AIPerf's approximate synthetic t
 
 Timed phases use a 15-second request timeout and a bounded 15-second grace after the warmup and measurement boundaries. Saturated requests therefore become recorded failures and drain before the next phase. Because the explicit prompt replaces every generated prompt, AIPerf materializes one reusable synthetic dataset entry per leg.
 
-When every profiling request times out, AIPerf exits nonzero but still emits complete records. The campaign accepts only complete timeout-only records exports in that case; other AIPerf failures remain invalid infrastructure legs.
+When saturation produces request timeouts or HTTP 500/503 responses, AIPerf exits nonzero but still emits complete records. The campaign accepts only complete exports containing successes and those three saturation failure classes; configuration errors such as HTTP 400 and other AIPerf failures remain invalid infrastructure legs.
 
 The output root contains the manifest and SHA-256, source/environment/binary hashes, the resolved schedule, per-leg raw artifacts, individual runs, matched-pair CSV/JSON, point-level paired medians, connection-pool diagnostics, SVG comparison charts, flagged points, and `results/report.md`. Four-shard latency percentiles are pooled from AIPerf's records exports; throughput uses aggregate token/request totals divided by the maximum shard wall time.
 

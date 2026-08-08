@@ -603,7 +603,7 @@ def build_run_perf_command(
                 str(timing["warmup_grace_seconds"]),
                 "--aiperf-dataset-entries",
                 str(manifest["tools"]["num_dataset_entries"]),
-                "--allow-aiperf-timeout-failures",
+                "--allow-aiperf-saturation-failures",
                 "--capture-duration",
                 str(
                     timing["measurement_seconds"]
@@ -1204,8 +1204,8 @@ def validate_leg_output(
                 "aiperf_dataset_entries": manifest["tools"][
                     "num_dataset_entries"
                 ],
-                "allow_aiperf_timeout_failures": manifest["tools"][
-                    "allow_aiperf_timeout_failures"
+                "allow_aiperf_saturation_failures": manifest["tools"][
+                    "allow_aiperf_saturation_failures"
                 ],
             }
         )
@@ -1219,13 +1219,14 @@ def validate_leg_output(
     expected_mocker_hash = sha256_file(REPO_ROOT / manifest["fixture"]["mocker_config"])
     if config.get("mocker_config_sha256") != expected_mocker_hash:
         raise CampaignError(f"Mocker config hash mismatch in {config_path}")
-    accepted_timeouts = bool(config.get("aiperf_timeout_failures_accepted"))
+    accepted_saturation = bool(config.get("aiperf_saturation_failures_accepted"))
     if config.get("aiperf_failed") and not (
-        manifest["tools"]["allow_aiperf_timeout_failures"] and accepted_timeouts
+        manifest["tools"]["allow_aiperf_saturation_failures"]
+        and accepted_saturation
     ):
         raise CampaignError(f"an AIPerf shard failed in {output_dir}")
-    if accepted_timeouts and not config.get("aiperf_failed"):
-        raise CampaignError("AIPerf timeout acceptance was set without a failed shard")
+    if accepted_saturation and not config.get("aiperf_failed"):
+        raise CampaignError("AIPerf saturation acceptance was set without a failed shard")
     models = json.loads(models_path.read_text(encoding="utf-8"))
     model_ids = {entry.get("id") for entry in models.get("data", [])}
     if served_model_name not in model_ids:

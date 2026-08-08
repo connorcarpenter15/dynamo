@@ -144,8 +144,8 @@ class CampaignDryRunTest(unittest.TestCase):
             self.assertIn("--vllm-sidecar-bin", sidecar)
             self.assertNotIn("--request-rate", direct)
             self.assertNotIn("--request-rate", sidecar)
-            self.assertIn("--allow-aiperf-timeout-failures", direct)
-            self.assertIn("--allow-aiperf-timeout-failures", sidecar)
+            self.assertIn("--allow-aiperf-saturation-failures", direct)
+            self.assertIn("--allow-aiperf-saturation-failures", sidecar)
             self.assertEqual(
                 campaign.flag_value(direct, "--model"),
                 campaign.flag_value(direct, "--model-name"),
