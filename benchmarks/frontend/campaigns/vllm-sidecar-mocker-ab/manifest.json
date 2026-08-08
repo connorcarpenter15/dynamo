@@ -27,6 +27,7 @@
     "served_model_name": {
       "policy": "resolved-model-path"
     },
+    "exact_input_token_id": 42,
     "mocker_config": "benchmarks/frontend/campaigns/vllm-sidecar-mocker-ab/mocker-config.json"
   },
   "tools": {

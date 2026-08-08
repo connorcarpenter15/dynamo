@@ -74,6 +74,7 @@ AIPERF_SHARDS="${AIPERF_SHARDS:-1}"
 AIPERF_EXPORT_LEVEL="${AIPERF_EXPORT_LEVEL:-summary}"
 REQUIRED_AIPERF_VERSION="${REQUIRED_AIPERF_VERSION:-}"
 RANDOM_SEED="${RANDOM_SEED:-100}"
+EXACT_INPUT_TOKEN_ID="${EXACT_INPUT_TOKEN_ID:-}"
 FRONTEND_CPUSET="${FRONTEND_CPUSET:-}"
 BACKEND_CPUSET="${BACKEND_CPUSET:-}"
 LOADGEN_CPUSET="${LOADGEN_CPUSET:-}"
@@ -132,6 +133,7 @@ while [[ $# -gt 0 ]]; do
         --aiperf-export-level)  AIPERF_EXPORT_LEVEL="$2"; shift 2 ;;
         --require-aiperf-version) REQUIRED_AIPERF_VERSION="$2"; shift 2 ;;
         --random-seed)          RANDOM_SEED="$2"; shift 2 ;;
+        --exact-input-token-id) EXACT_INPUT_TOKEN_ID="$2"; shift 2 ;;
         --frontend-cpuset)      FRONTEND_CPUSET="$2"; shift 2 ;;
         --backend-cpuset)       BACKEND_CPUSET="$2"; shift 2 ;;
         --loadgen-cpuset)       LOADGEN_CPUSET="$2"; shift 2 ;;
@@ -184,6 +186,7 @@ Service Options:
   --require-aiperf-version V
                             Require an exact AIPerf version
   --random-seed N           AIPerf synthetic workload seed (default: 100)
+  --exact-input-token-id N   Override completion prompts with exactly --isl copies of token N
   --frontend-cpuset LIST    taskset CPU list for the frontend
   --backend-cpuset LIST     Shared taskset CPU list for either backend topology
   --loadgen-cpuset LIST     taskset CPU list for AIPerf
@@ -242,6 +245,14 @@ for _positive_name in GRPC_CONNECTIONS GRPC_PORT AIPERF_SHARDS; do
 done
 if [[ ! "$RANDOM_SEED" =~ ^[0-9]+$ ]]; then
     echo "ERROR: RANDOM_SEED must be a non-negative integer, got '$RANDOM_SEED'"
+    exit 1
+fi
+if [[ -n "$EXACT_INPUT_TOKEN_ID" && ! "$EXACT_INPUT_TOKEN_ID" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: EXACT_INPUT_TOKEN_ID must be a non-negative integer, got '$EXACT_INPUT_TOKEN_ID'"
+    exit 1
+fi
+if [[ -n "$EXACT_INPUT_TOKEN_ID" && "$ENDPOINT_TYPE" != "completions" ]]; then
+    echo "ERROR: --exact-input-token-id requires --endpoint-type completions"
     exit 1
 fi
 if [[ -n "$MOCKER_CONFIG" && ! -f "$MOCKER_CONFIG" ]]; then
@@ -1003,6 +1014,15 @@ else
     AIPERF_ENDPOINT="/v1/chat/completions"
 fi
 
+_EXACT_PROMPT_ARGS=()
+if [[ -n "$EXACT_INPUT_TOKEN_ID" ]]; then
+    _EXACT_PROMPT_JSON=$(jq -cn \
+        --argjson token "$EXACT_INPUT_TOKEN_ID" \
+        --argjson count "$ISL" \
+        '{prompt: [range(0; $count) | $token]}')
+    _EXACT_PROMPT_ARGS=(--extra-inputs "$_EXACT_PROMPT_JSON")
+fi
+
 # Build the list of models to target
 _AIPERF_MODELS=()
 if [[ "$AIPERF_TARGETS" == "all" && ${#MODEL_NAMES[@]} -gt 1 ]]; then
@@ -1072,6 +1092,7 @@ for _AIPERF_MODEL in "${_AIPERF_MODELS[@]}"; do
             --extra-inputs ignore_eos:true \
             --extra-inputs repetition_penalty:1.0 \
             --extra-inputs temperature:0.0 \
+            "${_EXACT_PROMPT_ARGS[@]}" \
             --concurrency "$_SHARD_CONCURRENCY" \
             "${_SHARD_LOAD_ARGS[@]}" \
             "${_WARMUP_ARGS[@]}" \
@@ -1298,6 +1319,7 @@ cat > "$OUTPUT_DIR/config.json" <<EOF
   "capture_duration": $CAPTURE_DURATION,
   "aiperf_version": $_AIPERF_VERSION_JSON,
   "random_seed": $RANDOM_SEED,
+  "exact_input_token_id": ${EXACT_INPUT_TOKEN_ID:-null},
   "aiperf_shards": $AIPERF_SHARDS,
   "aiperf_export_level": "$AIPERF_EXPORT_LEVEL",
   "aiperf_failed": $AIPERF_FAILED,

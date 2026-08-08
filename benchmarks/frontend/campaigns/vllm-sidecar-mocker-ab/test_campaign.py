@@ -125,12 +125,17 @@ class CampaignDryRunTest(unittest.TestCase):
                 "--aiperf-shards",
                 "--require-aiperf-version",
                 "--random-seed",
+                "--exact-input-token-id",
             ]:
                 self.assertEqual(
                     campaign.flag_value(direct, flag),
                     campaign.flag_value(sidecar, flag),
                     flag,
                 )
+            self.assertEqual(
+                campaign.flag_value(direct, "--exact-input-token-id"),
+                str(manifest["fixture"]["exact_input_token_id"]),
+            )
             self.assertNotEqual(
                 campaign.flag_value(direct, "--namespace"),
                 campaign.flag_value(sidecar, "--namespace"),

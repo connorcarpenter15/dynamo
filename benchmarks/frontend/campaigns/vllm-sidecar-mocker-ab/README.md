@@ -51,6 +51,8 @@ python3 benchmarks/frontend/campaigns/vllm-sidecar-mocker-ab/run_campaign.py ana
 
 The native sidecar currently publishes its resolved `--model-path` as the served model identity and has no separate served-name override. The driver therefore passes the fixture's absolute resolved path as both `--model` and `--model-name` in both arms; the local fixture remains the tokenizer source as well.
 
+For completion requests, the campaign overrides AIPerf's approximate synthetic text with exactly `isl` copies of the manifest-locked token ID. This keeps server-visible input lengths exact without changing the shared model or tokenizer identity.
+
 The output root contains the manifest and SHA-256, source/environment/binary hashes, the resolved schedule, per-leg raw artifacts, individual runs, matched-pair CSV/JSON, point-level paired medians, connection-pool diagnostics, SVG comparison charts, flagged points, and `results/report.md`. Four-shard latency percentiles are pooled from AIPerf's records exports; throughput uses aggregate token/request totals divided by the maximum shard wall time.
 
 ## Validation
