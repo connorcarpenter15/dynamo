@@ -9,7 +9,7 @@ This campaign compares the direct Dynamo Mocker request path with `dynamo-vllm-s
 
 ## Prerequisites
 
-- Use a clean committed Dynamo worktree descended from `f9863c6e420a4fc7af9d9458f0216957e3f757bf`.
+- Use a clean committed Dynamo worktree descended from `12356a1d03d344260adafed3eb14f8f12f6aa77c`, the `ai-dynamo/main` tip selected for the LiveEngine-control rerun.
 - Build release-mode Rust binaries and install the Dynamo Python package and bindings from the same worktree.
 - Install AIPerf 0.10.0, etcd, NATS, `jq`, `ss`, `taskset`, and `nc`.
 - Run on a dedicated host with at least 48 physical cores. The driver selects one logical CPU per physical core and aborts when preflight utilization exceeds 5%.
