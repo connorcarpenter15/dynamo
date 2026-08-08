@@ -44,11 +44,18 @@ fn request(id: &str) -> pb::GenerateRequest {
     }
 }
 
+fn prepare(
+    request: pb::GenerateRequest,
+    config: &MockerServerConfig,
+) -> BoxedStatusResult<PreparedRequest> {
+    PreparedRequest::new(request, config, false)
+}
+
 #[test]
 fn preparation_is_deterministic() {
     let config = MockerServerConfig::default();
-    let first = PreparedRequest::new(request("stable"), &config).unwrap();
-    let second = PreparedRequest::new(request("stable"), &config).unwrap();
+    let first = prepare(request("stable"), &config).unwrap();
+    let second = prepare(request("stable"), &config).unwrap();
     assert_eq!(first.uuid, second.uuid);
     assert_eq!(first.output_token(0), second.output_token(0));
     assert_eq!(first.output_token(1), second.output_token(1));
@@ -62,7 +69,7 @@ fn preparation_is_deterministic() {
 fn oversized_generation_is_rejected_before_token_planning() {
     let mut oversized = request("too-many-tokens");
     oversized.stopping.as_mut().unwrap().max_new_tokens = MAX_NEW_TOKENS + 1;
-    let error = PreparedRequest::new(oversized, &MockerServerConfig::default()).unwrap_err();
+    let error = prepare(oversized, &MockerServerConfig::default()).unwrap_err();
     assert_eq!(error.code(), tonic::Code::InvalidArgument);
 }
 
@@ -73,21 +80,21 @@ fn minimum_tokens_must_not_exceed_the_effective_maximum() {
     let stopping = contradictory.stopping.as_mut().unwrap();
     stopping.max_new_tokens = 1;
     stopping.min_new_tokens = 2;
-    let error = PreparedRequest::new(contradictory, &config).unwrap_err();
+    let error = prepare(contradictory, &config).unwrap_err();
     assert_eq!(error.code(), tonic::Code::InvalidArgument);
 
     let mut default_boundary = request("default-boundary");
     let stopping = default_boundary.stopping.as_mut().unwrap();
     stopping.max_new_tokens = 0;
     stopping.min_new_tokens = DEFAULT_MAX_NEW_TOKENS;
-    let prepared = PreparedRequest::new(default_boundary, &config).unwrap();
+    let prepared = prepare(default_boundary, &config).unwrap();
     assert_eq!(prepared.max_output_tokens, DEFAULT_MAX_NEW_TOKENS as usize);
 
     let mut above_default = request("above-default");
     let stopping = above_default.stopping.as_mut().unwrap();
     stopping.max_new_tokens = 0;
     stopping.min_new_tokens = DEFAULT_MAX_NEW_TOKENS + 1;
-    let error = PreparedRequest::new(above_default, &config).unwrap_err();
+    let error = prepare(above_default, &config).unwrap_err();
     assert_eq!(error.code(), tonic::Code::InvalidArgument);
 }
 
@@ -97,7 +104,7 @@ fn role_validation_rejects_missing_ambiguous_or_malformed_handoffs() {
         mode: ServerMode::Prefill,
         ..Default::default()
     };
-    let error = PreparedRequest::new(request("missing"), &prefill_config).unwrap_err();
+    let error = prepare(request("missing"), &prefill_config).unwrap_err();
     assert_eq!(error.code(), tonic::Code::FailedPrecondition);
 
     let mut ambiguous = request("ambiguous");
@@ -110,7 +117,7 @@ fn role_validation_rejects_missing_ambiguous_or_malformed_handoffs() {
         }),
         ..Default::default()
     });
-    let error = PreparedRequest::new(ambiguous, &prefill_config).unwrap_err();
+    let error = prepare(ambiguous, &prefill_config).unwrap_err();
     assert_eq!(error.code(), tonic::Code::InvalidArgument);
 
     for field in DECODE_RENDEZVOUS_FIELDS {
@@ -124,7 +131,7 @@ fn role_validation_rejects_missing_ambiguous_or_malformed_handoffs() {
             }),
             ..Default::default()
         });
-        let error = PreparedRequest::new(contradictory, &prefill_config).unwrap_err();
+        let error = prepare(contradictory, &prefill_config).unwrap_err();
         assert_eq!(error.code(), tonic::Code::InvalidArgument, "field: {field}");
     }
 
@@ -142,7 +149,7 @@ fn role_validation_rejects_missing_ambiguous_or_malformed_handoffs() {
         mode: ServerMode::Decode,
         ..Default::default()
     };
-    let error = PreparedRequest::new(malformed, &decode_config).unwrap_err();
+    let error = prepare(malformed, &decode_config).unwrap_err();
     assert_eq!(error.code(), tonic::Code::InvalidArgument);
 }
 
@@ -150,9 +157,24 @@ fn role_validation_rejects_missing_ambiguous_or_malformed_handoffs() {
 fn text_prompts_fail_with_an_actionable_status() {
     let mut request = request("text");
     request.prompt = Some(pb::generate_request::Prompt::Text("hello".to_string()));
-    let error = PreparedRequest::new(request, &MockerServerConfig::default()).unwrap_err();
+    let error = prepare(request, &MockerServerConfig::default()).unwrap_err();
     assert_eq!(error.code(), tonic::Code::Unimplemented);
     assert!(error.message().contains("token_ids"));
+}
+
+#[test]
+fn cache_salt_requires_prefix_caching_to_be_disabled() {
+    let config = MockerServerConfig::default();
+    let mut salted = request("salted");
+    salted.kv = Some(pb::KvCacheParameters {
+        cache_salt: "model-card-checksum".to_string(),
+        ..Default::default()
+    });
+
+    assert!(prepare(salted.clone(), &config).is_ok());
+    let error = PreparedRequest::new(salted, &config, true).unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    assert!(error.message().contains("prefix caching"));
 }
 
 #[test]
@@ -188,18 +210,6 @@ fn service_rejects_non_vllm_or_multi_rank_engines() {
             .unwrap()
             .to_string()
             .contains("worker_type")
-    );
-
-    let prefix_caching = MockEngineArgs::builder()
-        .enable_prefix_caching(true)
-        .build()
-        .unwrap();
-    assert!(
-        VllmMockerService::new(MockerServerConfig::default(), prefix_caching)
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("prefix caching")
     );
 
     let disabled = MockerServerConfig {
@@ -298,7 +308,7 @@ fn decode_rejects_a_handoff_missing_the_opacity_sentinel() {
         }),
         ..Default::default()
     });
-    let prepared = PreparedRequest::new(prefill_request, &prefill_config).unwrap();
+    let prepared = prepare(prefill_request, &prefill_config).unwrap();
     let mut handoff = prepared.handoff();
     assert!(
         handoff.fields.remove(HANDOFF_SENTINEL_FIELD).is_some(),
@@ -314,7 +324,7 @@ fn decode_rejects_a_handoff_missing_the_opacity_sentinel() {
         mode: ServerMode::Decode,
         ..Default::default()
     };
-    let error = PreparedRequest::new(decode_request, &decode_config).unwrap_err();
+    let error = prepare(decode_request, &decode_config).unwrap_err();
     assert_eq!(error.code(), tonic::Code::InvalidArgument);
     assert!(error.message().contains(HANDOFF_SENTINEL_FIELD));
 }

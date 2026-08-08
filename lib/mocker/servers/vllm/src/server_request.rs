@@ -67,6 +67,7 @@ impl PreparedRequest {
     pub(super) fn new(
         mut request: pb::GenerateRequest,
         config: &MockerServerConfig,
+        prefix_caching_enabled: bool,
     ) -> BoxedStatusResult<Self> {
         if !request.model.is_empty() && request.model != config.model {
             return Err(Status::not_found(format!(
@@ -106,6 +107,12 @@ impl PreparedRequest {
             if kv.bypass_prefix_cache {
                 return Err(Status::invalid_argument(
                     "bypass_prefix_cache is not supported by the Mocker server",
+                )
+                .into());
+            }
+            if prefix_caching_enabled && !kv.cache_salt.is_empty() {
+                return Err(Status::invalid_argument(
+                    "cache_salt requires prefix caching to be disabled in the Mocker server",
                 )
                 .into());
             }

@@ -65,6 +65,7 @@ impl Default for MockerServerConfig {
 pub struct VllmMockerService {
     config: Arc<MockerServerConfig>,
     engine: LiveEngine,
+    prefix_caching_enabled: bool,
     request_permits: Arc<Semaphore>,
 }
 
@@ -83,14 +84,12 @@ impl VllmMockerService {
             engine_args.worker_type == WorkerType::Aggregated,
             "Mocker worker_type must be aggregated; use the server mode for the emulated wire role"
         );
-        anyhow::ensure!(
-            !engine_args.enable_prefix_caching,
-            "Mocker vLLM gRPC server does not support prefix caching"
-        );
         let max_concurrent_requests = config.max_concurrent_requests;
+        let prefix_caching_enabled = engine_args.enable_prefix_caching;
         Ok(Self {
             config: Arc::new(config),
             engine: LiveEngine::start(engine_args, DP_RANK)?,
+            prefix_caching_enabled,
             request_permits: Arc::new(Semaphore::new(max_concurrent_requests)),
         })
     }
@@ -116,7 +115,8 @@ impl VllmMockerService {
             .clone()
             .try_acquire_owned()
             .map_err(|_| Status::resource_exhausted("Mocker concurrent request limit reached"))?;
-        let prepared = PreparedRequest::new(request, &self.config).map_err(|status| *status)?;
+        let prepared = PreparedRequest::new(request, &self.config, self.prefix_caching_enabled)
+            .map_err(|status| *status)?;
         let live = self
             .engine
             .submit(prepared.direct_request())

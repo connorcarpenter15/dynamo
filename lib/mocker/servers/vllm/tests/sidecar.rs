@@ -68,6 +68,7 @@ fn fast_engine_args() -> MockEngineArgs {
         .max_num_seqs(Some(64))
         .max_num_batched_tokens(Some(1024))
         .speedup_ratio(0.0)
+        .enable_prefix_caching(false)
         .dp_size(1)
         .build()
         .unwrap()
