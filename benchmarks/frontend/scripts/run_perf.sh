@@ -308,10 +308,15 @@ INFRA_CPU_PREFIX=()
 [[ -n "$LOADGEN_CPUSET" ]] && LOADGEN_CPU_PREFIX=(taskset --cpu-list "$LOADGEN_CPUSET")
 [[ -n "$INFRA_CPUSET" ]] && INFRA_CPU_PREFIX=(taskset --cpu-list "$INFRA_CPUSET")
 
-# AIPerf 0.10.0 can strand the final record when multiple record processors
-# drain a timeout-heavy phase. A single processor preserves the complete export;
-# request workers still use the full load-generator CPU set.
+# AIPerf 0.10.0 can strand the final direct-Mocker timeout record when multiple
+# processors drain that phase, while sidecar saturation can emit hundreds of
+# thousands of immediate 5xx records and needs parallel draining. Exact boundary
+# validation covers these topology-specific settings; request workers retain the
+# full load-generator CPU set in both cases.
 AIPERF_RECORD_PROCESSOR_BUDGET=1
+if [[ "$BACKEND_MODE" == "vllm-sidecar-mocker" ]]; then
+    AIPERF_RECORD_PROCESSOR_BUDGET=16
+fi
 
 # Default model-name to model if not set
 [[ -z "$MODEL_NAME" ]] && MODEL_NAME="$MODEL"
