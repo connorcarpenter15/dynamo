@@ -1077,7 +1077,6 @@ for _AIPERF_MODEL in "${_AIPERF_MODELS[@]}"; do
             "${_WARMUP_ARGS[@]}" \
             --num-dataset-entries 12800 \
             --random-seed "$RANDOM_SEED" \
-            --workers-max "$_SHARD_CONCURRENCY" \
             --record-processors "$_SHARD_RECORD_PROCESSORS" \
             --export-level "$AIPERF_EXPORT_LEVEL" \
             --ui simple > "$OUTPUT_DIR/logs/aiperf_${_SHARD_LABEL}.log" 2>&1 &
