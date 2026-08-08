@@ -50,20 +50,59 @@ class CampaignDryRunTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             frontend_log = Path(temporary) / "frontend.log"
             frontend_log.write_text(
-                "\x1b[3mx_request_id\x1b[0m=\x1b[0m\"warmup\" "
-                "request completed input_tokens=99 output_tokens=99\n"
-                "request completed x_request_id=\"profile\" "
-                "input_tokens=32 output_tokens=16\n",
+                '\x1b[3mx_request_id\x1b[0m=\x1b[0m"warmup" '
+                "request completed status=success input_tokens=99 output_tokens=99\n"
+                'request completed x_request_id="profile" '
+                "status=success input_tokens=32 output_tokens=16\n",
                 encoding="utf-8",
             )
-            metrics = campaign.parse_frontend_token_metrics(
-                frontend_log, {"profile"}
-            )
+            metrics = campaign.parse_frontend_token_metrics(frontend_log, {"profile"})
         self.assertEqual(metrics["request_count"], 1)
         self.assertEqual(metrics["total_input_tokens"], 32)
         self.assertEqual(metrics["total_output_tokens"], 16)
         self.assertEqual(metrics["output_length_min"], 16)
         self.assertEqual(metrics["output_length_max"], 16)
+
+    def test_frontend_stream_errors_remain_analyzable_saturation_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            (output / "aiperf").mkdir()
+            (output / "logs").mkdir()
+            (output / "system").mkdir()
+            records = [
+                {
+                    "metadata": {
+                        "benchmark_phase": "profiling",
+                        "x_request_id": request_id,
+                    },
+                    "metrics": {"request_latency": {"value": latency, "unit": "ms"}},
+                }
+                for request_id, latency in (("complete", 10), ("failed", 1000))
+            ]
+            (output / "aiperf/profile_export.jsonl").write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+            (output / "logs/frontend.log").write_text(
+                'request completed x_request_id="complete" status=success '
+                "input_tokens=32 output_tokens=16\n"
+                'request completed x_request_id="failed" status=error '
+                "input_tokens=32 output_tokens=7\n",
+                encoding="utf-8",
+            )
+            (output / "config.json").write_text(
+                json.dumps({"benchmark_duration": 60, "aiperf_version": "0.10.0"}),
+                encoding="utf-8",
+            )
+            metrics = campaign.parse_leg_metrics(output)
+        self.assertEqual(metrics["completed_requests"], 1)
+        self.assertEqual(metrics["failed_requests"], 1)
+        self.assertEqual(metrics["server_failed_requests"], 1)
+        self.assertEqual(metrics["failed_request_fraction"], 0.5)
+        self.assertEqual(metrics["output_throughput_tps"], 16 / 60)
+        self.assertEqual(metrics["total_output_tokens"], 23)
+        self.assertEqual(metrics["completed_total_output_tokens"], 16)
+        self.assertEqual(metrics["e2e_p50_ms"], 10)
 
     def test_topologies_share_workload_affinity_and_crossover_contract(self) -> None:
         """Regression: topology drift could invalidate the A/B result; dry-run commands expose it."""
@@ -184,9 +223,7 @@ class CampaignDryRunTest(unittest.TestCase):
                 campaign.flag_value(direct, "--exact-input-token-id"),
                 str(manifest["fixture"]["exact_input_token_id"]),
             )
-            self.assertEqual(
-                campaign.flag_value(direct, "--warmup-grace-period"), "15"
-            )
+            self.assertEqual(campaign.flag_value(direct, "--warmup-grace-period"), "15")
             self.assertEqual(
                 campaign.flag_value(direct, "--benchmark-grace-period"), "15"
             )

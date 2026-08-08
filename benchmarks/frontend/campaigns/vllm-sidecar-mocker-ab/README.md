@@ -57,6 +57,8 @@ Timed phases use a 15-second request timeout and a bounded 15-second grace after
 
 When saturation produces request timeouts or HTTP 500/503 responses, AIPerf exits nonzero but still emits complete records. The campaign accepts only complete exports containing successes and those three saturation failure classes; configuration errors such as HTTP 400 and other AIPerf failures remain invalid infrastructure legs.
 
+For streaming responses, AIPerf can record a transport-level success after the Dynamo frontend has completed the request with `status=error` and a partial token count. The campaign correlates frontend completions by `x_request_id`, reclassifies those records as server failures, excludes them from completed-request throughput and latency percentiles, and preserves their partial token totals for diagnosis. Exact output-length validation applies to completed requests; smoke legs still require zero failures.
+
 The output root contains the manifest and SHA-256, source/environment/binary hashes, the resolved schedule, per-leg raw artifacts, individual runs, matched-pair CSV/JSON, point-level paired medians, connection-pool diagnostics, SVG comparison charts, flagged points, and `results/report.md`. Four-shard latency percentiles are pooled from AIPerf's records exports; throughput uses aggregate token/request totals divided by the maximum shard wall time.
 
 The sidecar socket gate uses the established connection count captured immediately before load. The post-load count is retained as `final_observed` with an informational `post_load_valid` field because AIPerf record export can outlive an idle gRPC channel; it does not retroactively invalidate a leg whose pre-load pool matched the locked setting.

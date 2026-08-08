@@ -897,7 +897,7 @@ def percentile(values: list[float], fraction: float) -> float:
 
 def pooled_record_metrics(
     paths: list[Path],
-) -> tuple[dict[str, list[float]], set[str], dict[str, int]]:
+) -> tuple[dict[str, dict[str, float]], set[str], dict[str, int]]:
     metric_names = (
         "time_to_first_token",
         "inter_token_latency",
@@ -905,7 +905,7 @@ def pooled_record_metrics(
         "output_sequence_length",
         "input_sequence_length",
     )
-    pooled = {name: [] for name in metric_names}
+    by_request = {name: {} for name in metric_names}
     request_ids: set[str] = set()
     outcomes = {"completed": 0, "failed": 0}
     for path in paths:
@@ -927,7 +927,12 @@ def pooled_record_metrics(
             request_id = record.get("metadata", {}).get("x_request_id")
             if not request_id:
                 raise CampaignError(f"profiling record lacks x_request_id in {path}")
-            request_ids.add(str(request_id))
+            request_id = str(request_id)
+            if request_id in request_ids:
+                raise CampaignError(
+                    f"duplicate profiling record for {request_id} in {path}"
+                )
+            request_ids.add(request_id)
             metrics = record.get("metrics", {})
             for name in metric_names:
                 value = metrics.get(name)
@@ -938,22 +943,24 @@ def pooled_record_metrics(
                     raise CampaignError(
                         f"unexpected {name} unit in {path}: {value.get('unit')}"
                     )
-                pooled[name].append(float(value["value"]))
-    return pooled, request_ids, outcomes
+                by_request[name][request_id] = float(value["value"])
+    return by_request, request_ids, outcomes
 
 
 def parse_frontend_token_metrics(
     frontend_log: Path, request_ids: set[str]
-) -> dict[str, float]:
+) -> dict[str, Any]:
     ansi_escape = re.compile(r"\x1b\[[0-9;]*m")
     request_id_pattern = re.compile(r'x_request_id="?([^"\s]+)"?')
+    status_pattern = re.compile(r"\bstatus=(success|error)\b")
     token_pattern = re.compile(r"\binput_tokens=(\d+)\s+output_tokens=(\d+)\b")
     matched: set[str] = set()
     input_tokens: list[int] = []
     output_tokens: list[int] = []
-    for line in frontend_log.read_text(
-        encoding="utf-8", errors="replace"
-    ).splitlines():
+    statuses: dict[str, str] = {}
+    input_tokens_by_status: dict[str, list[int]] = {"success": [], "error": []}
+    output_tokens_by_status: dict[str, list[int]] = {"success": [], "error": []}
+    for line in frontend_log.read_text(encoding="utf-8", errors="replace").splitlines():
         if "request completed" not in line:
             continue
         clean = ansi_escape.sub("", line)
@@ -971,16 +978,27 @@ def parse_frontend_token_metrics(
                 f"frontend completion lacks token totals for "
                 f"{request_id} in {frontend_log}"
             )
+        status_match = status_pattern.search(clean)
+        if not status_match:
+            raise CampaignError(
+                f"frontend completion lacks status for {request_id} in {frontend_log}"
+            )
+        status = status_match.group(1)
+        input_count = int(token_match.group(1))
+        output_count = int(token_match.group(2))
         matched.add(request_id)
-        input_tokens.append(int(token_match.group(1)))
-        output_tokens.append(int(token_match.group(2)))
+        statuses[request_id] = status
+        input_tokens.append(input_count)
+        output_tokens.append(output_count)
+        input_tokens_by_status[status].append(input_count)
+        output_tokens_by_status[status].append(output_count)
     missing = request_ids - matched
     if missing:
         raise CampaignError(
             f"frontend token totals missing for {len(missing)} profiling requests "
             f"in {frontend_log}"
         )
-    return {
+    result: dict[str, Any] = {
         "request_count": float(len(matched)),
         "total_input_tokens": float(sum(input_tokens)),
         "total_output_tokens": float(sum(output_tokens)),
@@ -988,7 +1006,17 @@ def parse_frontend_token_metrics(
         "input_length_max": float(max(input_tokens, default=0)),
         "output_length_min": float(min(output_tokens, default=0)),
         "output_length_max": float(max(output_tokens, default=0)),
+        "request_statuses": statuses,
     }
+    for status in ("success", "error"):
+        status_inputs = input_tokens_by_status[status]
+        status_outputs = output_tokens_by_status[status]
+        result[f"{status}_request_count"] = float(len(status_outputs))
+        result[f"{status}_total_input_tokens"] = float(sum(status_inputs))
+        result[f"{status}_total_output_tokens"] = float(sum(status_outputs))
+        result[f"{status}_output_length_min"] = float(min(status_outputs, default=0))
+        result[f"{status}_output_length_max"] = float(max(status_outputs, default=0))
+    return result
 
 
 def parse_process_metrics(system_dir: Path) -> dict[str, Any]:
@@ -1059,18 +1087,34 @@ def parse_leg_metrics(output_dir: Path) -> dict[str, Any]:
             f"{len(record_paths)} != {len(profiles)}"
         )
     shards = [json.loads(path.read_text(encoding="utf-8")) for path in profiles]
-    records, request_ids, outcomes = pooled_record_metrics(record_paths)
+    records_by_request, request_ids, outcomes = pooled_record_metrics(record_paths)
     server_tokens = parse_frontend_token_metrics(
         output_dir / "logs/frontend.log", request_ids
     )
+    request_statuses = server_tokens.pop("request_statuses")
+    successful_request_ids = {
+        request_id
+        for request_id, status in request_statuses.items()
+        if status == "success"
+    }
+    records = {
+        name: [
+            value
+            for request_id, value in values.items()
+            if request_id in successful_request_ids
+        ]
+        for name, values in records_by_request.items()
+    }
     config = json.loads((output_dir / "config.json").read_text(encoding="utf-8"))
     if shards:
-        completed = sum(metric_average(shard, "request_count") for shard in shards)
-        failures = sum(
+        aiperf_completed = sum(
+            metric_average(shard, "request_count") for shard in shards
+        )
+        aiperf_failures = sum(
             metric_average(shard, "error_request_count") for shard in shards
         )
-        if failures == 0:
-            failures = sum(
+        if aiperf_failures == 0:
+            aiperf_failures = sum(
                 error_count(shard.get("error_summary", [])) for shard in shards
             )
         durations = [metric_average(shard, "benchmark_duration") for shard in shards]
@@ -1079,25 +1123,28 @@ def parse_leg_metrics(output_dir: Path) -> dict[str, Any]:
             {str(shard.get("aiperf_version", "unknown")) for shard in shards}
         )
     else:
-        completed = float(outcomes["completed"])
-        failures = float(outcomes["failed"])
+        aiperf_completed = float(outcomes["completed"])
+        aiperf_failures = float(outcomes["failed"])
         wall_seconds = float(config.get("benchmark_duration") or 0.0)
         versions = [str(config.get("aiperf_version", "unknown"))]
-    if completed != float(outcomes["completed"]):
+    if aiperf_completed != float(outcomes["completed"]):
         raise CampaignError(
-            f"AIPerf summary completed {completed:g} requests but records contain "
+            f"AIPerf summary completed {aiperf_completed:g} requests but records contain "
             f"{outcomes['completed']} successes"
         )
-    if failures != float(outcomes["failed"]):
+    if aiperf_failures != float(outcomes["failed"]):
         raise CampaignError(
-            f"AIPerf summary recorded {failures:g} failures but records contain "
+            f"AIPerf summary recorded {aiperf_failures:g} failures but records contain "
             f"{outcomes['failed']} errors"
         )
-    if completed != server_tokens["request_count"]:
+    if aiperf_completed != server_tokens["request_count"]:
         raise CampaignError(
-            f"AIPerf completed {completed:g} requests but frontend token totals "
+            f"AIPerf completed {aiperf_completed:g} requests but frontend token totals "
             f"matched {server_tokens['request_count']:g}"
         )
+    completed = server_tokens["success_request_count"]
+    server_failures = server_tokens["error_request_count"]
+    failures = aiperf_failures + server_failures
     aiperf_total_input_tokens = sum(
         metric_average(shard, "total_isl") for shard in shards
     )
@@ -1110,16 +1157,20 @@ def parse_leg_metrics(output_dir: Path) -> dict[str, Any]:
     metric = {
         "shards": len(record_paths),
         "request_throughput_rps": completed / wall_seconds if wall_seconds else 0.0,
-        "output_throughput_tps": server_tokens["total_output_tokens"] / wall_seconds
+        "output_throughput_tps": server_tokens["success_total_output_tokens"]
+        / wall_seconds
         if wall_seconds
         else 0.0,
         "completed_requests": completed,
         "failed_requests": failures,
+        "aiperf_failed_requests": aiperf_failures,
+        "server_failed_requests": server_failures,
         "failed_request_fraction": failures / (completed + failures)
         if completed + failures
         else 0.0,
         "total_input_tokens": server_tokens["total_input_tokens"],
         "total_output_tokens": server_tokens["total_output_tokens"],
+        "completed_total_output_tokens": server_tokens["success_total_output_tokens"],
         "aiperf_total_input_tokens": aiperf_total_input_tokens,
         "aiperf_total_output_tokens": aiperf_total_output_tokens,
         "aiperf_total_output_sequence_tokens": aiperf_total_output_sequence_tokens,
@@ -1134,18 +1185,14 @@ def parse_leg_metrics(output_dir: Path) -> dict[str, Any]:
         "input_length_max": server_tokens["input_length_max"],
         "output_length_min": server_tokens["output_length_min"],
         "output_length_max": server_tokens["output_length_max"],
-        "aiperf_input_length_min": min(
-            records["input_sequence_length"], default=0.0
-        ),
-        "aiperf_input_length_max": max(
-            records["input_sequence_length"], default=0.0
-        ),
-        "aiperf_output_length_min": min(
-            records["output_sequence_length"], default=0.0
-        ),
-        "aiperf_output_length_max": max(
-            records["output_sequence_length"], default=0.0
-        ),
+        "completed_output_length_min": server_tokens["success_output_length_min"],
+        "completed_output_length_max": server_tokens["success_output_length_max"],
+        "failed_output_length_min": server_tokens["error_output_length_min"],
+        "failed_output_length_max": server_tokens["error_output_length_max"],
+        "aiperf_input_length_min": min(records["input_sequence_length"], default=0.0),
+        "aiperf_input_length_max": max(records["input_sequence_length"], default=0.0),
+        "aiperf_output_length_min": min(records["output_sequence_length"], default=0.0),
+        "aiperf_output_length_max": max(records["output_sequence_length"], default=0.0),
         "aiperf_versions": versions,
     }
     metric["process_metrics"] = parse_process_metrics(output_dir / "system")
@@ -1195,15 +1242,9 @@ def validate_leg_output(
                 "benchmark_grace_period": manifest["timing"][
                     "measurement_grace_seconds"
                 ],
-                "request_timeout_seconds": manifest["tools"][
-                    "request_timeout_seconds"
-                ],
-                "warmup_grace_period": manifest["timing"][
-                    "warmup_grace_seconds"
-                ],
-                "aiperf_dataset_entries": manifest["tools"][
-                    "num_dataset_entries"
-                ],
+                "request_timeout_seconds": manifest["tools"]["request_timeout_seconds"],
+                "warmup_grace_period": manifest["timing"]["warmup_grace_seconds"],
+                "aiperf_dataset_entries": manifest["tools"]["num_dataset_entries"],
                 "allow_aiperf_saturation_failures": manifest["tools"][
                     "allow_aiperf_saturation_failures"
                 ],
@@ -1221,12 +1262,13 @@ def validate_leg_output(
         raise CampaignError(f"Mocker config hash mismatch in {config_path}")
     accepted_saturation = bool(config.get("aiperf_saturation_failures_accepted"))
     if config.get("aiperf_failed") and not (
-        manifest["tools"]["allow_aiperf_saturation_failures"]
-        and accepted_saturation
+        manifest["tools"]["allow_aiperf_saturation_failures"] and accepted_saturation
     ):
         raise CampaignError(f"an AIPerf shard failed in {output_dir}")
     if accepted_saturation and not config.get("aiperf_failed"):
-        raise CampaignError("AIPerf saturation acceptance was set without a failed shard")
+        raise CampaignError(
+            "AIPerf saturation acceptance was set without a failed shard"
+        )
     models = json.loads(models_path.read_text(encoding="utf-8"))
     model_ids = {entry.get("id") for entry in models.get("data", [])}
     if served_model_name not in model_ids:
@@ -1263,22 +1305,24 @@ def validate_leg_output(
                 f"{metrics['input_length_min']:g}..{metrics['input_length_max']:g}"
             )
         if (
-            metrics["output_length_min"] != expected_output
-            or metrics["output_length_max"] != expected_output
+            metrics["completed_output_length_min"] != expected_output
+            or metrics["completed_output_length_max"] != expected_output
         ):
             raise CampaignError(
-                f"output length was not exactly {expected_output:g}: "
-                f"{metrics['output_length_min']:g}..{metrics['output_length_max']:g}"
+                f"completed output length was not exactly {expected_output:g}: "
+                f"{metrics['completed_output_length_min']:g}.."
+                f"{metrics['completed_output_length_max']:g}"
             )
     if leg["phase"] == "smoke":
         expected_tokens = float(manifest["smoke"]["expected_output_tokens"])
         if (
-            metrics["output_length_min"] != expected_tokens
-            or metrics["output_length_max"] != expected_tokens
+            metrics["completed_output_length_min"] != expected_tokens
+            or metrics["completed_output_length_max"] != expected_tokens
         ):
             raise CampaignError(
                 f"smoke output length was not exactly {expected_tokens:g}: "
-                f"{metrics['output_length_min']:g}..{metrics['output_length_max']:g}"
+                f"{metrics['completed_output_length_min']:g}.."
+                f"{metrics['completed_output_length_max']:g}"
             )
         if metrics["failed_requests"]:
             raise CampaignError("smoke request failed")
@@ -1711,9 +1755,7 @@ def analyze_campaign(output_root: Path) -> None:
             "failed_request_fraction": metrics.get("failed_request_fraction", 0.0),
             "total_input_tokens": metrics.get("total_input_tokens", 0.0),
             "total_output_tokens": metrics.get("total_output_tokens", 0.0),
-            "aiperf_total_input_tokens": metrics.get(
-                "aiperf_total_input_tokens", 0.0
-            ),
+            "aiperf_total_input_tokens": metrics.get("aiperf_total_input_tokens", 0.0),
             "aiperf_total_output_tokens": metrics.get(
                 "aiperf_total_output_tokens", 0.0
             ),
