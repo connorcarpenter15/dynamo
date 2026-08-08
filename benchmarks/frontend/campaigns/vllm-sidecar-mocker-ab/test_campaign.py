@@ -13,6 +13,38 @@ import run_campaign as campaign
 
 
 class CampaignDryRunTest(unittest.TestCase):
+    def test_timeout_only_records_preserve_an_all_failure_leg(self) -> None:
+        """Regression: genuine saturation remains analyzable without a summary export."""
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            (output / "aiperf").mkdir()
+            (output / "logs").mkdir()
+            (output / "system").mkdir()
+            (output / "aiperf/profile_export.jsonl").write_text(
+                json.dumps(
+                    {
+                        "metadata": {
+                            "benchmark_phase": "profiling",
+                            "x_request_id": "timeout",
+                        },
+                        "metrics": {"error_isl": {"value": 8192, "unit": "tokens"}},
+                        "error": {"type": "TimeoutError", "message": "TimeoutError()"},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (output / "logs/frontend.log").write_text("", encoding="utf-8")
+            (output / "config.json").write_text(
+                json.dumps({"benchmark_duration": 60, "aiperf_version": "0.10.0"}),
+                encoding="utf-8",
+            )
+            metrics = campaign.parse_leg_metrics(output)
+        self.assertEqual(metrics["completed_requests"], 0)
+        self.assertEqual(metrics["failed_requests"], 1)
+        self.assertEqual(metrics["failed_request_fraction"], 1)
+        self.assertEqual(metrics["output_throughput_tps"], 0)
+
     def test_frontend_tokens_are_correlated_to_profiling_request_ids(self) -> None:
         """Regression: tokenizer-added tokens must not replace server token totals."""
         with tempfile.TemporaryDirectory() as temporary:
@@ -102,6 +134,8 @@ class CampaignDryRunTest(unittest.TestCase):
             self.assertIn("--vllm-sidecar-bin", sidecar)
             self.assertNotIn("--request-rate", direct)
             self.assertNotIn("--request-rate", sidecar)
+            self.assertIn("--allow-aiperf-timeout-failures", direct)
+            self.assertIn("--allow-aiperf-timeout-failures", sidecar)
             self.assertEqual(
                 campaign.flag_value(direct, "--model"),
                 campaign.flag_value(direct, "--model-name"),

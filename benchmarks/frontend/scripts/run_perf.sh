@@ -87,6 +87,7 @@ VLLM_MOCKER_SERVER_BIN="${VLLM_MOCKER_SERVER_BIN:-}"
 VLLM_SIDECAR_BIN="${VLLM_SIDECAR_BIN:-}"
 PROFILE_TARGET="${PROFILE_TARGET:-frontend}"
 REQUIRE_MANAGED_INFRA=false
+ALLOW_AIPERF_TIMEOUT_FAILURES=false
 
 # Opt-out flags
 SKIP_BPF=false
@@ -150,6 +151,7 @@ while [[ $# -gt 0 ]]; do
         --vllm-sidecar-bin)     VLLM_SIDECAR_BIN="$2"; shift 2 ;;
         --profile-target)       PROFILE_TARGET="$2"; shift 2 ;;
         --require-managed-infra) REQUIRE_MANAGED_INFRA=true; shift ;;
+        --allow-aiperf-timeout-failures) ALLOW_AIPERF_TIMEOUT_FAILURES=true; shift ;;
         --skip-bpf)             SKIP_BPF=true; shift ;;
         --skip-nsys)            SKIP_NSYS=true; shift ;;
         --skip-flamegraph)      SKIP_FLAMEGRAPH=true; shift ;;
@@ -198,6 +200,8 @@ Service Options:
   --aiperf-export-level N   AIPerf summary|records|raw export level
   --aiperf-dataset-entries N
                             Synthetic dataset entries to materialize (default: 12800)
+  --allow-aiperf-timeout-failures
+                            Accept complete timeout-only records exports when AIPerf exits nonzero
   --require-aiperf-version V
                             Require an exact AIPerf version
   --random-seed N           AIPerf synthetic workload seed (default: 100)
@@ -1140,6 +1144,35 @@ for _aiperf_idx in "${!AIPERF_PIDS[@]}"; do
     fi
 done
 
+AIPERF_TIMEOUT_FAILURES_ACCEPTED=false
+if [[ "$AIPERF_FAILED" == true && "$ALLOW_AIPERF_TIMEOUT_FAILURES" == true ]]; then
+    mapfile -t _AIPERF_RECORD_EXPORTS < <(find "$OUTPUT_DIR/aiperf" -type f -name profile_export.jsonl -print)
+    _TIMEOUT_EXPORTS_VALID=true
+    _SAW_TIMEOUT=false
+    if [[ ${#_AIPERF_RECORD_EXPORTS[@]} -ne ${#AIPERF_PIDS[@]} ]]; then
+        _TIMEOUT_EXPORTS_VALID=false
+    fi
+    for _record_export in "${_AIPERF_RECORD_EXPORTS[@]}"; do
+        if ! jq -s -e '
+            [.[] | select(.metadata.benchmark_phase == "profiling")] as $records
+            | ($records | length) > 0
+              and all($records[]; .error == null or .error.type == "TimeoutError")
+        ' "$_record_export" >/dev/null; then
+            _TIMEOUT_EXPORTS_VALID=false
+        fi
+        if jq -s -e '
+            any(.[] | select(.metadata.benchmark_phase == "profiling");
+                .error.type? == "TimeoutError")
+        ' "$_record_export" >/dev/null; then
+            _SAW_TIMEOUT=true
+        fi
+    done
+    if [[ "$_TIMEOUT_EXPORTS_VALID" == true && "$_SAW_TIMEOUT" == true ]]; then
+        AIPERF_TIMEOUT_FAILURES_ACCEPTED=true
+        echo "  Accepted complete timeout-only AIPerf records exports"
+    fi
+fi
+
 PROCESS_HEALTH_VALID=true
 : > "$OUTPUT_DIR/system/process_health.txt"
 for _proc_idx in "${!OBSERVED_PIDS[@]}"; do
@@ -1354,6 +1387,8 @@ cat > "$OUTPUT_DIR/config.json" <<EOF
   "aiperf_shards": $AIPERF_SHARDS,
   "aiperf_export_level": "$AIPERF_EXPORT_LEVEL",
   "aiperf_failed": $AIPERF_FAILED,
+  "aiperf_timeout_failures_accepted": $AIPERF_TIMEOUT_FAILURES_ACCEPTED,
+  "allow_aiperf_timeout_failures": $ALLOW_AIPERF_TIMEOUT_FAILURES,
   "frontend_cpuset": "$FRONTEND_CPUSET",
   "backend_cpuset": "$BACKEND_CPUSET",
   "loadgen_cpuset": "$LOADGEN_CPUSET",
@@ -1392,7 +1427,7 @@ echo ""
 echo "Run analysis:"
 echo "  python3 ${SCRIPT_DIR}/analysis/create_report.py analyze $OUTPUT_DIR"
 
-if [[ "$AIPERF_FAILED" == true ]]; then
+if [[ "$AIPERF_FAILED" == true && "$AIPERF_TIMEOUT_FAILURES_ACCEPTED" != true ]]; then
     echo "ERROR: one or more AIPerf shards failed; artifacts were preserved"
     exit 1
 fi

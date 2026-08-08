@@ -603,6 +603,7 @@ def build_run_perf_command(
                 str(timing["warmup_grace_seconds"]),
                 "--aiperf-dataset-entries",
                 str(manifest["tools"]["num_dataset_entries"]),
+                "--allow-aiperf-timeout-failures",
                 "--capture-duration",
                 str(
                     timing["measurement_seconds"]
@@ -896,7 +897,7 @@ def percentile(values: list[float], fraction: float) -> float:
 
 def pooled_record_metrics(
     paths: list[Path],
-) -> tuple[dict[str, list[float]], set[str]]:
+) -> tuple[dict[str, list[float]], set[str], dict[str, int]]:
     metric_names = (
         "time_to_first_token",
         "inter_token_latency",
@@ -906,6 +907,7 @@ def pooled_record_metrics(
     )
     pooled = {name: [] for name in metric_names}
     request_ids: set[str] = set()
+    outcomes = {"completed": 0, "failed": 0}
     for path in paths:
         for line_number, line in enumerate(
             path.read_text(encoding="utf-8", errors="strict").splitlines(), start=1
@@ -919,7 +921,9 @@ def pooled_record_metrics(
             if record.get("metadata", {}).get("benchmark_phase") != "profiling":
                 continue
             if record.get("error") is not None:
+                outcomes["failed"] += 1
                 continue
+            outcomes["completed"] += 1
             request_id = record.get("metadata", {}).get("x_request_id")
             if not request_id:
                 raise CampaignError(f"profiling record lacks x_request_id in {path}")
@@ -935,7 +939,7 @@ def pooled_record_metrics(
                         f"unexpected {name} unit in {path}: {value.get('unit')}"
                     )
                 pooled[name].append(float(value["value"]))
-    return pooled, request_ids
+    return pooled, request_ids, outcomes
 
 
 def parse_frontend_token_metrics(
@@ -1046,25 +1050,49 @@ def parse_process_metrics(system_dir: Path) -> dict[str, Any]:
 
 def parse_leg_metrics(output_dir: Path) -> dict[str, Any]:
     profiles = sorted((output_dir / "aiperf").rglob("profile_export_aiperf.json"))
-    if not profiles:
-        raise CampaignError(f"missing AIPerf profile export in {output_dir}")
     record_paths = sorted((output_dir / "aiperf").rglob("profile_export.jsonl"))
-    if len(record_paths) != len(profiles):
+    if not record_paths:
+        raise CampaignError(f"missing AIPerf records export in {output_dir}")
+    if profiles and len(record_paths) != len(profiles):
         raise CampaignError(
             f"expected one AIPerf records export per shard in {output_dir}: "
             f"{len(record_paths)} != {len(profiles)}"
         )
     shards = [json.loads(path.read_text(encoding="utf-8")) for path in profiles]
-    records, request_ids = pooled_record_metrics(record_paths)
+    records, request_ids, outcomes = pooled_record_metrics(record_paths)
     server_tokens = parse_frontend_token_metrics(
         output_dir / "logs/frontend.log", request_ids
     )
-    completed = sum(metric_average(shard, "request_count") for shard in shards)
-    failures = sum(metric_average(shard, "error_request_count") for shard in shards)
-    if failures == 0:
-        failures = sum(error_count(shard.get("error_summary", [])) for shard in shards)
-    durations = [metric_average(shard, "benchmark_duration") for shard in shards]
-    wall_seconds = max(durations, default=0.0)
+    config = json.loads((output_dir / "config.json").read_text(encoding="utf-8"))
+    if shards:
+        completed = sum(metric_average(shard, "request_count") for shard in shards)
+        failures = sum(
+            metric_average(shard, "error_request_count") for shard in shards
+        )
+        if failures == 0:
+            failures = sum(
+                error_count(shard.get("error_summary", [])) for shard in shards
+            )
+        durations = [metric_average(shard, "benchmark_duration") for shard in shards]
+        wall_seconds = max(durations, default=0.0)
+        versions = sorted(
+            {str(shard.get("aiperf_version", "unknown")) for shard in shards}
+        )
+    else:
+        completed = float(outcomes["completed"])
+        failures = float(outcomes["failed"])
+        wall_seconds = float(config.get("benchmark_duration") or 0.0)
+        versions = [str(config.get("aiperf_version", "unknown"))]
+    if completed != float(outcomes["completed"]):
+        raise CampaignError(
+            f"AIPerf summary completed {completed:g} requests but records contain "
+            f"{outcomes['completed']} successes"
+        )
+    if failures != float(outcomes["failed"]):
+        raise CampaignError(
+            f"AIPerf summary recorded {failures:g} failures but records contain "
+            f"{outcomes['failed']} errors"
+        )
     if completed != server_tokens["request_count"]:
         raise CampaignError(
             f"AIPerf completed {completed:g} requests but frontend token totals "
@@ -1080,7 +1108,7 @@ def parse_leg_metrics(output_dir: Path) -> dict[str, Any]:
         metric_average(shard, "total_osl") for shard in shards
     )
     metric = {
-        "shards": len(shards),
+        "shards": len(record_paths),
         "request_throughput_rps": completed / wall_seconds if wall_seconds else 0.0,
         "output_throughput_tps": server_tokens["total_output_tokens"] / wall_seconds
         if wall_seconds
@@ -1118,9 +1146,7 @@ def parse_leg_metrics(output_dir: Path) -> dict[str, Any]:
         "aiperf_output_length_max": max(
             records["output_sequence_length"], default=0.0
         ),
-        "aiperf_versions": sorted(
-            {str(shard.get("aiperf_version", "unknown")) for shard in shards}
-        ),
+        "aiperf_versions": versions,
     }
     metric["process_metrics"] = parse_process_metrics(output_dir / "system")
     grpc_check = output_dir / "system/grpc_connection_check.json"
@@ -1159,6 +1185,15 @@ def validate_leg_output(
         "aiperf_export_level": manifest["tools"]["aiperf_export_level"],
         "random_seed": manifest["tools"]["random_seed"],
         "exact_input_token_id": manifest["fixture"]["exact_input_token_id"],
+        "benchmark_grace_period": manifest["timing"][
+            "measurement_grace_seconds"
+        ],
+        "request_timeout_seconds": manifest["tools"]["request_timeout_seconds"],
+        "warmup_grace_period": manifest["timing"]["warmup_grace_seconds"],
+        "aiperf_dataset_entries": manifest["tools"]["num_dataset_entries"],
+        "allow_aiperf_timeout_failures": manifest["tools"][
+            "allow_aiperf_timeout_failures"
+        ],
         "concurrency": leg["concurrency"],
         "isl": leg["input_tokens"],
         "osl": leg["output_tokens"],
@@ -1173,8 +1208,13 @@ def validate_leg_output(
     expected_mocker_hash = sha256_file(REPO_ROOT / manifest["fixture"]["mocker_config"])
     if config.get("mocker_config_sha256") != expected_mocker_hash:
         raise CampaignError(f"Mocker config hash mismatch in {config_path}")
-    if config.get("aiperf_failed"):
+    accepted_timeouts = bool(config.get("aiperf_timeout_failures_accepted"))
+    if config.get("aiperf_failed") and not (
+        manifest["tools"]["allow_aiperf_timeout_failures"] and accepted_timeouts
+    ):
         raise CampaignError(f"an AIPerf shard failed in {output_dir}")
+    if accepted_timeouts and not config.get("aiperf_failed"):
+        raise CampaignError("AIPerf timeout acceptance was set without a failed shard")
     models = json.loads(models_path.read_text(encoding="utf-8"))
     model_ids = {entry.get("id") for entry in models.get("data", [])}
     if served_model_name not in model_ids:
