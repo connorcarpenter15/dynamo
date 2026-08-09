@@ -146,6 +146,9 @@ class CampaignDryRunTest(unittest.TestCase):
         self.assertFalse(mocker_config["enable_prefix_caching"])
         self.assertEqual(mocker_config["max_num_seqs"], 524288)
         self.assertEqual(manifest["transport"]["max_concurrent_requests"], 524288)
+        self.assertEqual(
+            manifest["transport"]["dynamo_env"]["DYN_TCP_REQUEST_TIMEOUT"], "300"
+        )
         self.assertGreaterEqual(mocker_config["num_gpu_blocks"], 4_194_304)
         model_path = campaign.REPO_ROOT / manifest["fixture"]["model"]
         tokenizer = json.loads(

@@ -68,6 +68,7 @@
     "production_grpc_connections": 8,
     "max_concurrent_requests": 524288,
     "dynamo_env": {
+      "DYN_TCP_REQUEST_TIMEOUT": "300",
       "DYN_TCP_POOL_SIZE": "4096",
       "DYN_TCP_CHANNEL_BUFFER": "256",
       "DYN_TCP_GLOBAL_CONNECT_LIMIT": "524288",
