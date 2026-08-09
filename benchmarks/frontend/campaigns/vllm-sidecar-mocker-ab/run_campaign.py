@@ -578,6 +578,8 @@ def build_run_perf_command(
                 str(manifest["tools"]["aiperf_record_processors"]),
                 "--aiperf-loopback-targets",
                 str(manifest["tools"]["aiperf_loopback_targets"]),
+                "--aiperf-concurrency-ramp-duration",
+                str(workload["concurrency_ramp_duration_seconds"]),
                 "--random-seed",
                 str(workload["random_seed"]),
                 "--benchmark-duration",
@@ -1372,6 +1374,9 @@ def validate_leg_output(
                     "aiperf_record_processors"
                 ],
                 "aiperf_loopback_targets": manifest["tools"]["aiperf_loopback_targets"],
+                "aiperf_concurrency_ramp_duration": workload[
+                    "concurrency_ramp_duration_seconds"
+                ],
                 "benchmark_grace_period": manifest["timing"][
                     "measurement_grace_seconds"
                 ],

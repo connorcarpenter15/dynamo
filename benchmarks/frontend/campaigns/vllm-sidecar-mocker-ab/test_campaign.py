@@ -230,6 +230,7 @@ class CampaignDryRunTest(unittest.TestCase):
                 "--aiperf-workers",
                 "--aiperf-record-processors",
                 "--aiperf-loopback-targets",
+                "--aiperf-concurrency-ramp-duration",
                 "--max-concurrent-requests",
             ]:
                 self.assertEqual(
@@ -242,6 +243,10 @@ class CampaignDryRunTest(unittest.TestCase):
             )
             self.assertEqual(
                 campaign.flag_value(direct, "--request-timeout-seconds"), "300"
+            )
+            self.assertEqual(
+                campaign.flag_value(direct, "--aiperf-concurrency-ramp-duration"),
+                "60",
             )
             self.assertEqual(
                 campaign.flag_value(direct, "--aiperf-scenario"),
