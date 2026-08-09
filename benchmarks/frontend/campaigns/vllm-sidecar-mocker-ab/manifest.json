@@ -47,7 +47,7 @@
   },
   "tools": {
     "aiperf_version": "0.12.0",
-    "aiperf_commit": "ee3a5170d9abea6136cc65abe9cb4f25ed4e991a",
+    "aiperf_commit": "8f64c88eef3a5e28f89f4f1e3b9afa6cfb3e295a",
     "aiperf_export_level": "records",
     "aiperf_workers": 64,
     "aiperf_record_processors": 16,
