@@ -11,9 +11,9 @@ This campaign compares the direct Python vLLM Mocker LiveEngine boundary with `d
 
 - AIPerf 0.12.0 at the exact commit in `manifest.json`.
 - Scenario `inferencex-agentx-mvp` with `semianalysis_cc_traces_weka_062126_256k`, chat streaming, server token counts, a 262,144-token context limit, seed `20260809`, and throughput-oriented burst phase starts. Trace selection and inter-turn timing remain AgentX-faithful; only the multi-day recorded warmup/profiling boundary ramps are collapsed.
-- Live trajectory-tree concurrency `{1024,4096,8192,16384,32768,65536}`.
+- Live trajectory-tree concurrency `{1024,4096,8192,16384,32768}`.
 - Four 900-second legs per point in crossover order `direct, sidecar, sidecar, direct`.
-- One 65,536-concurrency qualification leg before measurement. It rejects load-generator CPU, trajectory realization, FD, socket, or admission-queue contamination. A preserved `c131072` pre-campaign attempt saturated all 64 load-generator cores, so the locked matrix stops at the largest concurrency that can be validly generated on the fixed host allocation.
+- One 32,768-concurrency qualification leg before measurement. It rejects load-generator CPU, trajectory realization, FD, socket, or admission-queue contamination. Preserved `c131072` and `c65536` pre-campaign attempts saturated the 64 load-generator cores, so the locked matrix stops at the largest concurrency the fixed host allocation can validly generate.
 - AIPerf round-robins over eight equivalent `127.0.0.x` frontend addresses so local TCP tuple capacity does not cap concurrency at one ephemeral-port range. This changes neither frontend routing nor the measured backend topology.
 - Sidecar pool sweep `{8,16,32,64,128}` ascending and descending at concurrency 32,768 and the measured sidecar capacity peak. Valid eight-connection main legs are reused.
 
