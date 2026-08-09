@@ -194,6 +194,9 @@ class CampaignDryRunTest(unittest.TestCase):
             self.assertIn("--aiperf-burst-phase-starts", sidecar)
             self.assertTrue(manifest["workload"]["burst_phase_starts"])
             self.assertEqual(
+                campaign.flag_value(direct, "--aiperf-loopback-targets"), "8"
+            )
+            self.assertEqual(
                 campaign.flag_value(direct, "--model"),
                 campaign.flag_value(direct, "--model-name"),
             )
@@ -221,6 +224,7 @@ class CampaignDryRunTest(unittest.TestCase):
                 "--aiperf-max-context-length",
                 "--aiperf-workers",
                 "--aiperf-record-processors",
+                "--aiperf-loopback-targets",
                 "--max-concurrent-requests",
             ]:
                 self.assertEqual(

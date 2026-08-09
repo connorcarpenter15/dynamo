@@ -81,6 +81,7 @@ AIPERF_PUBLIC_DATASET="${AIPERF_PUBLIC_DATASET:-}"
 AIPERF_MAX_CONTEXT_LENGTH="${AIPERF_MAX_CONTEXT_LENGTH:-}"
 AIPERF_WORKERS="${AIPERF_WORKERS:-}"
 AIPERF_RECORD_PROCESSORS="${AIPERF_RECORD_PROCESSORS:-}"
+AIPERF_LOOPBACK_TARGETS="${AIPERF_LOOPBACK_TARGETS:-1}"
 AIPERF_BURST_PHASE_STARTS=false
 REQUIRED_AIPERF_VERSION="${REQUIRED_AIPERF_VERSION:-}"
 RANDOM_SEED="${RANDOM_SEED:-100}"
@@ -152,6 +153,7 @@ while [[ $# -gt 0 ]]; do
         --aiperf-max-context-length) AIPERF_MAX_CONTEXT_LENGTH="$2"; shift 2 ;;
         --aiperf-workers)       AIPERF_WORKERS="$2"; shift 2 ;;
         --aiperf-record-processors) AIPERF_RECORD_PROCESSORS="$2"; shift 2 ;;
+        --aiperf-loopback-targets) AIPERF_LOOPBACK_TARGETS="$2"; shift 2 ;;
         --aiperf-burst-phase-starts) AIPERF_BURST_PHASE_STARTS=true; shift ;;
         --require-aiperf-version) REQUIRED_AIPERF_VERSION="$2"; shift 2 ;;
         --random-seed)          RANDOM_SEED="$2"; shift 2 ;;
@@ -223,6 +225,8 @@ Service Options:
   --aiperf-workers N        Explicit AIPerf request-worker count
   --aiperf-record-processors N
                             Explicit AIPerf record-processor count, identical across arms
+  --aiperf-loopback-targets N
+                            Round-robin over 127.0.0.1..N to expand local TCP tuple space
   --aiperf-burst-phase-starts
                             Synchronize AgentX warmup/profiling phase starts for throughput runs
   --allow-aiperf-saturation-failures
@@ -282,13 +286,17 @@ case "$AIPERF_EXPORT_LEVEL" in
     summary|records|raw) ;;
     *) echo "ERROR: unsupported --aiperf-export-level '$AIPERF_EXPORT_LEVEL'"; exit 1 ;;
 esac
-for _positive_name in GRPC_CONNECTIONS GRPC_PORT AIPERF_SHARDS AIPERF_DATASET_ENTRIES MAX_CONCURRENT_REQUESTS; do
+for _positive_name in GRPC_CONNECTIONS GRPC_PORT AIPERF_SHARDS AIPERF_DATASET_ENTRIES AIPERF_LOOPBACK_TARGETS MAX_CONCURRENT_REQUESTS; do
     _positive_value="${!_positive_name}"
     if [[ ! "$_positive_value" =~ ^[1-9][0-9]*$ ]]; then
         echo "ERROR: $_positive_name must be a positive integer, got '$_positive_value'"
         exit 1
     fi
 done
+if (( AIPERF_LOOPBACK_TARGETS > 254 )); then
+    echo "ERROR: AIPERF_LOOPBACK_TARGETS must be at most 254, got '$AIPERF_LOOPBACK_TARGETS'"
+    exit 1
+fi
 for _optional_positive_name in AIPERF_MAX_CONTEXT_LENGTH AIPERF_WORKERS AIPERF_RECORD_PROCESSORS; do
     _optional_positive_value="${!_optional_positive_name}"
     if [[ -n "$_optional_positive_value" && ! "$_optional_positive_value" =~ ^[1-9][0-9]*$ ]]; then
@@ -1112,6 +1120,12 @@ else
 fi
 echo "  aiperf targets: ${_AIPERF_MODELS[*]} (mode=$AIPERF_TARGETS, endpoint=$AIPERF_ENDPOINT, shards=$AIPERF_SHARDS)"
 
+_AIPERF_URL_ARGS=(--url)
+for _loopback_octet in $(seq 1 "$AIPERF_LOOPBACK_TARGETS"); do
+    _AIPERF_URL_ARGS+=("http://127.0.0.${_loopback_octet}:$FRONTEND_PORT")
+done
+echo "  aiperf loopback targets: $AIPERF_LOOPBACK_TARGETS"
+
 AIPERF_PIDS=()
 AIPERF_LABELS=()
 AIPERF_FAILED=false
@@ -1196,7 +1210,7 @@ for _AIPERF_MODEL in "${_AIPERF_MODELS[@]}"; do
             --endpoint-type "$ENDPOINT_TYPE" \
             --endpoint "$AIPERF_ENDPOINT" \
             --streaming \
-            --url "http://127.0.0.1:$FRONTEND_PORT" \
+            "${_AIPERF_URL_ARGS[@]}" \
             "${_REQUEST_TIMEOUT_ARGS[@]}" \
             "${_AIPERF_WORKLOAD_ARGS[@]}" \
             --concurrency "$_SHARD_CONCURRENCY" \
@@ -1513,6 +1527,7 @@ cat > "$OUTPUT_DIR/config.json" <<EOF
   "aiperf_max_context_length": ${AIPERF_MAX_CONTEXT_LENGTH:-null},
   "aiperf_workers": ${AIPERF_WORKERS:-null},
   "aiperf_record_processors": ${AIPERF_RECORD_PROCESSORS:-null},
+  "aiperf_loopback_targets": $AIPERF_LOOPBACK_TARGETS,
   "aiperf_burst_phase_starts": $AIPERF_BURST_PHASE_STARTS,
   "aiperf_dataset_mmap_cache_dir": "$_AIPERF_DATASET_MMAP_CACHE_DIR",
   "aiperf_dataset_mmap_base_path": "$_AIPERF_DATASET_MMAP_BASE_PATH",

@@ -51,6 +51,7 @@
     "aiperf_export_level": "records",
     "aiperf_workers": 64,
     "aiperf_record_processors": 16,
+    "aiperf_loopback_targets": 8,
     "aiperf_http_connection_limit": 8192,
     "aiperf_zmq_pull_max_concurrency": 10000000,
     "aiperf_dataset_configuration_timeout_seconds": 1800,

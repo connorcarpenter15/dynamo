@@ -576,6 +576,8 @@ def build_run_perf_command(
                 str(manifest["tools"]["aiperf_workers"]),
                 "--aiperf-record-processors",
                 str(manifest["tools"]["aiperf_record_processors"]),
+                "--aiperf-loopback-targets",
+                str(manifest["tools"]["aiperf_loopback_targets"]),
                 "--random-seed",
                 str(workload["random_seed"]),
                 "--benchmark-duration",
@@ -1369,6 +1371,7 @@ def validate_leg_output(
                 "aiperf_record_processors": manifest["tools"][
                     "aiperf_record_processors"
                 ],
+                "aiperf_loopback_targets": manifest["tools"]["aiperf_loopback_targets"],
                 "benchmark_grace_period": manifest["timing"][
                     "measurement_grace_seconds"
                 ],
@@ -1482,9 +1485,12 @@ def validate_leg_output(
             qualification["maximum_fd_fraction"]
         ):
             violations["max_process_fds"] = loadgen["max_process_fds"]
-        if loadgen["max_http_sockets"] / int(
+        total_http_connection_limit = int(
             manifest["tools"]["aiperf_http_connection_limit"]
-        ) > float(qualification["maximum_socket_fraction"]):
+        ) * int(manifest["tools"]["aiperf_workers"])
+        if loadgen["max_http_sockets"] / total_http_connection_limit > float(
+            qualification["maximum_socket_fraction"]
+        ):
             violations["max_http_sockets"] = loadgen["max_http_sockets"]
         if (
             qualification["reject_queue_admission_failures"]
