@@ -1171,15 +1171,14 @@ def parse_loadgen_metrics(
 
 
 def parse_leg_metrics(output_dir: Path) -> dict[str, Any]:
-    profiles = sorted((output_dir / "aiperf").rglob("profile_export_aiperf.json"))
     record_paths = sorted((output_dir / "aiperf").rglob("profile_export.jsonl"))
     if not record_paths:
         raise CampaignError(f"missing AIPerf records export in {output_dir}")
-    if profiles and len(record_paths) != len(profiles):
-        raise CampaignError(
-            f"expected one AIPerf records export per shard in {output_dir}: "
-            f"{len(record_paths)} != {len(profiles)}"
-        )
+    profiles = [
+        record_path.with_name("profile_export_aiperf.json")
+        for record_path in record_paths
+        if record_path.with_name("profile_export_aiperf.json").is_file()
+    ]
     shards = [json.loads(path.read_text(encoding="utf-8")) for path in profiles]
     records_by_request, request_ids, outcomes = pooled_record_metrics(record_paths)
     server_tokens = parse_frontend_token_metrics(

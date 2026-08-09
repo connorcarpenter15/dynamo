@@ -34,6 +34,12 @@ class CampaignDryRunTest(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
+            for phase in ("warmup", "profiling"):
+                phase_dir = output / "aiperf/phases" / phase
+                phase_dir.mkdir(parents=True)
+                (phase_dir / "profile_export_aiperf.json").write_text(
+                    "{}", encoding="utf-8"
+                )
             (output / "logs/frontend.log").write_text("", encoding="utf-8")
             (output / "config.json").write_text(
                 json.dumps({"benchmark_duration": 60, "aiperf_version": "0.10.0"}),
