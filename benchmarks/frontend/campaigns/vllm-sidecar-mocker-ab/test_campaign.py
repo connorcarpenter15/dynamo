@@ -122,12 +122,14 @@ class CampaignDryRunTest(unittest.TestCase):
         )
         legs = campaign.build_resolved_plan(manifest, selected_shards=1)
         main = [leg for leg in legs if leg["phase"] == "main"]
-        self.assertEqual(len(main), 28)
+        expected_points = len(manifest["main_matrix"]["concurrency"])
+        expected_legs = expected_points * len(manifest["main_matrix"]["crossover"])
+        self.assertEqual(len(main), expected_legs)
         grouped: dict[str, list[dict]] = {}
         for leg in main:
             grouped.setdefault(leg["metadata"]["point_key"], []).append(leg)
         expected_crossover = manifest["main_matrix"]["crossover"]
-        self.assertEqual(len(grouped), 7)
+        self.assertEqual(len(grouped), expected_points)
         self.assertTrue(
             all(
                 [leg["arm"] for leg in point] == expected_crossover

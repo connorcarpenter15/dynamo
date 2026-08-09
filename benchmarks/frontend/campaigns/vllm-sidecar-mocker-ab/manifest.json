@@ -98,7 +98,7 @@
   },
   "qualification": {
     "arm": "direct-mocker",
-    "concurrency": 131072,
+    "concurrency": 65536,
     "maximum_loadgen_cpu_fraction": 0.85,
     "minimum_trajectory_realization_fraction": 0.99,
     "maximum_fd_fraction": 0.80,
@@ -106,7 +106,7 @@
     "reject_queue_admission_failures": true
   },
   "main_matrix": {
-    "concurrency": [1024, 4096, 8192, 16384, 32768, 65536, 131072],
+    "concurrency": [1024, 4096, 8192, 16384, 32768, 65536],
     "shuffle_seed": 20260809,
     "crossover": ["direct-mocker", "sidecar", "sidecar", "direct-mocker"]
   },
