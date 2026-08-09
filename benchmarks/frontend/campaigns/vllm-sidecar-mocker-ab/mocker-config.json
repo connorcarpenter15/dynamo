@@ -2,7 +2,7 @@
   "engine_type": "vllm",
   "num_gpu_blocks": 4194304,
   "block_size": 64,
-  "max_num_seqs": 8192,
+  "max_num_seqs": 524288,
   "max_num_batched_tokens": 67108864,
   "enable_prefix_caching": false,
   "enable_chunked_prefill": true,

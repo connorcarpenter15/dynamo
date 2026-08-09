@@ -3,65 +3,45 @@ SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All 
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# CPU-only vLLM sidecar A/B campaign
+# CPU-only vLLM sidecar AgentX A/B campaign
 
-This campaign compares the direct Dynamo Mocker request path with `dynamo-vllm-sidecar` and the CPU-only `dynamo-vllm-mocker-server`. It measures the incremental native-vLLM gRPC sidecar cost; it does not run vLLM EngineCore, load weights, or use a GPU.
+This campaign compares the direct Python vLLM Mocker LiveEngine boundary with `dynamo-vllm-sidecar` plus the CPU-only `dynamo-vllm-mocker-server`. It measures native request-plane/gRPC overhead under the pinned InferenceX AgentX traffic shape; it does not run vLLM EngineCore, load model weights, use a GPU, or represent official AgentX cache performance.
 
-## Prerequisites
+## Locked workload
 
-- Use a clean committed Dynamo worktree descended from `12356a1d03d352e00129717d97a90afbb3b39106`, the `ai-dynamo/main` tip selected for the LiveEngine-control rerun.
-- Build release-mode Rust binaries and install the Dynamo Python package and bindings from the same worktree.
-- Install AIPerf 0.10.0, etcd, NATS, `jq`, `ss`, `taskset`, and `nc`.
-- Run on a dedicated host with at least 48 physical cores. The driver selects one logical CPU per physical core and aborts when preflight utilization exceeds 5%.
-- Put the output root outside the Git worktree.
+- AIPerf 0.12.0 at the exact commit in `manifest.json`.
+- Scenario `inferencex-agentx-mvp` with `semianalysis_cc_traces_weka_062126_256k`, chat streaming, server token counts, a 262,144-token context limit, and seed `20260809`.
+- Live trajectory-tree concurrency `{1024,4096,8192,16384,32768,65536,131072}`.
+- Four 900-second legs per point in crossover order `direct, sidecar, sidecar, direct`.
+- One 131,072-concurrency qualification leg before measurement. It rejects load-generator CPU, trajectory realization, FD, socket, or admission-queue contamination.
+- Sidecar pool sweep `{8,16,32,64,128}` ascending and descending at concurrency 32,768 and the measured sidecar capacity peak. Valid eight-connection main legs are reused.
 
-Example build:
+The Mocker scheduler is shared between arms: DP1 aggregated vLLM mode, speedup zero, block size 64, prefix caching disabled, 524,288 sequences, 67,108,864 batch tokens, and 4,194,304 simulated KV blocks. Prefix caching is intentionally disabled so this remains a request-boundary comparison, not a cache benchmark.
 
-```bash
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:?set CARGO_TARGET_DIR outside the worktree}"
-cargo build --release -p dynamo-vllm-sidecar --bin dynamo-vllm-sidecar
-cargo build --release -p dynamo-vllm-mocker --bin dynamo-vllm-mocker-server
-cd lib/bindings/python
-maturin develop --uv --release
-cd ../../..
-uv pip install --no-deps -e .
-```
+## Host requirements
+
+- A clean committed Dynamo worktree descended from the manifest’s pinned `ai-dynamo/main` ancestor.
+- A dedicated DLCluster node with at least 128 physical cores, 512 GiB RAM, and a soft FD limit of at least 262,144.
+- Release `dynamo-vllm-sidecar` and `dynamo-vllm-mocker-server` binaries plus Dynamo Python bindings from the same worktree.
+- etcd, NATS, `jq`, `ss`, `taskset`, `nc`, and the pinned AIPerf source installed in the same environment.
+- Output outside the source worktree. DLCluster `/tmp` is temporary only; copy results to approved storage before releasing the allocation.
 
 ## Inspect and run
 
-Render the deterministic schedule without launching processes:
-
 ```bash
-python3 benchmarks/frontend/campaigns/vllm-sidecar-mocker-ab/run_campaign.py plan --high-concurrency-shards 4
-```
+python3 benchmarks/frontend/campaigns/vllm-sidecar-mocker-ab/run_campaign.py plan
 
-Run the smoke and load-generator preflight first. The preflight writes an immutable one-or-four-shard decision; later phases refuse to run without it.
-
-```bash
-CAMPAIGN_OUTPUT=/home/connorc/vllm-sidecar-mocker-ab-$(date -u +%Y%m%dT%H%M%SZ)
+CAMPAIGN_OUTPUT=/approved/scratch/vllm-sidecar-agentx-ab
 python3 benchmarks/frontend/campaigns/vllm-sidecar-mocker-ab/run_campaign.py run --output-root "$CAMPAIGN_OUTPUT" --phase smoke
-python3 benchmarks/frontend/campaigns/vllm-sidecar-mocker-ab/run_campaign.py run --output-root "$CAMPAIGN_OUTPUT" --phase preflight
+python3 benchmarks/frontend/campaigns/vllm-sidecar-mocker-ab/run_campaign.py run --output-root "$CAMPAIGN_OUTPUT" --phase qualification
 python3 benchmarks/frontend/campaigns/vllm-sidecar-mocker-ab/run_campaign.py run --output-root "$CAMPAIGN_OUTPUT" --phase main
 python3 benchmarks/frontend/campaigns/vllm-sidecar-mocker-ab/run_campaign.py run --output-root "$CAMPAIGN_OUTPUT" --phase connections
-python3 benchmarks/frontend/campaigns/vllm-sidecar-mocker-ab/run_campaign.py run --output-root "$CAMPAIGN_OUTPUT" --phase profiles
 python3 benchmarks/frontend/campaigns/vllm-sidecar-mocker-ab/run_campaign.py analyze --output-root "$CAMPAIGN_OUTPUT"
 ```
 
-`--phase all` performs the same sequence and runs analysis. A failed leg stops the campaign and preserves its artifacts. `--retry-failed` repeats the identical locked leg in a new attempt directory; it cannot change the workload, topology, affinity, or crossover order.
+`--phase all` performs the sequence and analysis. A failed leg stops the campaign and preserves its immutable attempt. `--retry-failed` repeats the same locked leg in a new attempt directory.
 
-The native sidecar currently publishes its resolved `--model-path` as the served model identity and has no separate served-name override. The driver therefore passes the fixture's absolute resolved path as both `--model` and `--model-name` in both arms; the local fixture remains the tokenizer source as well.
-
-For completion requests, the campaign overrides AIPerf's approximate synthetic text with exactly `isl` copies of the manifest-locked token ID. This keeps server-visible input lengths exact without changing the shared model or tokenizer identity.
-
-Timed phases use a 15-second request timeout and a bounded 15-second grace after the warmup and measurement boundaries. Saturated requests therefore become recorded failures and drain before the next phase. Because the explicit prompt replaces every generated prompt, AIPerf materializes one reusable synthetic dataset entry per leg.
-
-When saturation produces request timeouts or HTTP 500/503 responses, AIPerf exits nonzero but still emits complete records. The campaign accepts only complete exports containing successes and those three saturation failure classes; configuration errors such as HTTP 400 and other AIPerf failures remain invalid infrastructure legs.
-
-For streaming responses, AIPerf can record a transport-level success after the Dynamo frontend has completed the request with `status=error` and a partial token count. The campaign correlates frontend completions by `x_request_id`, reclassifies those records as server failures, excludes them from completed-request throughput and latency percentiles, and preserves their partial token totals for diagnosis. Exact output-length validation applies to completed requests; smoke legs still require zero failures.
-
-The output root contains the manifest and SHA-256, source/environment/binary hashes, the resolved schedule, per-leg raw artifacts, individual runs, matched-pair CSV/JSON, point-level paired medians, connection-pool diagnostics, SVG comparison charts, flagged points, and `results/report.md`. Four-shard latency percentiles are pooled from AIPerf's records exports; throughput uses aggregate token/request totals divided by the maximum shard wall time.
-
-The sidecar socket gate uses the established connection count captured immediately before load. The post-load count is retained as `final_observed` with an informational `post_load_valid` field because AIPerf record export can outlive an idle gRPC channel; it does not retroactively invalidate a leg whose pre-load pool matched the locked setting.
+The driver records the manifest and SHA-256, exact source and binary hashes, environment inventory, core and resolved plans, the capacity-peak decision, raw AIPerf records and logs, process/CPU/socket telemetry, every individual run, paired comparisons, connection diagnostics, charts, flags, and a scoped report.
 
 ## Validation
 

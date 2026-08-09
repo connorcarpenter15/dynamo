@@ -1,10 +1,10 @@
 {
   "schema_version": 1,
-  "campaign": "vllm-sidecar-mocker-ab",
-  "description": "CPU-only direct Dynamo Mocker versus native-vLLM sidecar/gRPC request-plane campaign",
+  "campaign": "vllm-sidecar-agentx-high-concurrency-ab",
+  "description": "CPU-only direct LiveEngine Mocker versus native-vLLM sidecar/gRPC under the pinned InferenceX AgentX workload",
   "source": {
     "repository": "ai-dynamo/dynamo",
-    "required_ancestor": "12356a1d03d352e00129717d97a90afbb3b39106",
+    "required_ancestor": "cb5082f61b06d6b31423ba07000f010e25192af1",
     "require_clean_worktree": true
   },
   "protocol": {
@@ -15,11 +15,11 @@
   "arms": {
     "direct-mocker": {
       "backend_mode": "direct-vllm-mocker",
-      "topology": "AIPerf -> Dynamo frontend -> TCP request plane -> python -m dynamo.mocker --engine-type vllm"
+      "topology": "AIPerf -> Dynamo frontend -> TCP request plane -> Python vLLM Mocker LiveEngine"
     },
     "sidecar": {
       "backend_mode": "vllm-sidecar-mocker",
-      "topology": "AIPerf -> Dynamo frontend -> TCP request plane -> dynamo-vllm-sidecar -> native vLLM Generate gRPC -> dynamo-vllm-mocker-server"
+      "topology": "AIPerf -> Dynamo frontend -> TCP request plane -> native vLLM sidecar -> vLLM Generate gRPC -> vLLM Mocker server"
     }
   },
   "fixture": {
@@ -27,91 +27,114 @@
     "served_model_name": {
       "policy": "resolved-model-path"
     },
-    "exact_input_token_id": 42,
     "mocker_config": "benchmarks/frontend/campaigns/vllm-sidecar-mocker-ab/mocker-config.json"
   },
+  "workload": {
+    "scenario": "inferencex-agentx-mvp",
+    "public_dataset": "semianalysis_cc_traces_weka_062126_256k",
+    "endpoint_type": "chat",
+    "streaming": true,
+    "max_context_length": 262144,
+    "use_server_token_count": true,
+    "random_seed": 20260809,
+    "benchmark_duration_seconds": 900,
+    "trajectory_start_min_ratio": 0.0,
+    "trajectory_start_max_ratio": 1.0,
+    "cache_bust": "first_turn_prefix",
+    "system_idle_gap_cap_seconds": 10.0,
+    "ignore_eos": true
+  },
   "tools": {
-    "aiperf_version": "0.10.0",
+    "aiperf_version": "0.12.0",
+    "aiperf_commit": "ee3a5170d9abea6136cc65abe9cb4f25ed4e991a",
     "aiperf_export_level": "records",
-    "num_dataset_entries": 1,
-    "request_timeout_seconds": 15,
-    "allow_aiperf_saturation_failures": true,
-    "random_seed": 100,
-    "request_rate": "unlimited"
+    "aiperf_workers": 64,
+    "aiperf_record_processors": 16,
+    "aiperf_http_connection_limit": 8192,
+    "aiperf_zmq_pull_max_concurrency": 10000000,
+    "aiperf_dataset_configuration_timeout_seconds": 1800,
+    "aiperf_profile_configure_timeout_seconds": 1800,
+    "aiperf_process_records_timeout_seconds": 1800,
+    "request_timeout_seconds": 300,
+    "allow_aiperf_saturation_failures": true
   },
   "transport": {
     "request_plane": "tcp",
     "event_plane": "nats",
-    "endpoint_type": "completions",
-    "streaming": true,
     "grpc_host": "127.0.0.1",
     "grpc_port": 50051,
-    "production_grpc_connections": 8
+    "production_grpc_connections": 8,
+    "max_concurrent_requests": 524288,
+    "dynamo_env": {
+      "DYN_TCP_POOL_SIZE": "4096",
+      "DYN_TCP_CHANNEL_BUFFER": "256",
+      "DYN_TCP_GLOBAL_CONNECT_LIMIT": "524288",
+      "DYN_ENGINE_REQUEST_LIMIT": "524288",
+      "DYN_DYNAMO_REQUEST_QUEUE_LIMIT": "524288",
+      "DYN_TCP_WORKER_POOL_SIZE": "4096",
+      "DYN_TCP_WORK_QUEUE_SIZE": "524288"
+    }
   },
   "hardware": {
-    "minimum_physical_cores": 48,
+    "cluster": "dlcluster",
+    "minimum_physical_cores": 128,
+    "minimum_memory_gib": 512,
     "maximum_preflight_busy_fraction": 0.05,
     "busy_sample_seconds": 5,
     "one_hardware_thread_per_core": true,
     "roles": {
-      "frontend_cores": 8,
-      "backend_cores": 16,
-      "loadgen_cores": 16,
-      "minimum_infra_cores": 8
+      "frontend_cores": 16,
+      "backend_cores": 32,
+      "loadgen_cores": 64,
+      "minimum_infra_cores": 16
     }
   },
   "timing": {
-    "warmup_seconds": 15,
-    "measurement_seconds": 60,
-    "warmup_grace_seconds": 15,
-    "measurement_grace_seconds": 15,
-    "cooldown_seconds": 5
+    "measurement_seconds": 900,
+    "measurement_grace_seconds": 300,
+    "cooldown_seconds": 60
   },
-  "loadgen_preflight": {
+  "qualification": {
     "arm": "direct-mocker",
-    "input_tokens": 32,
-    "output_tokens": 16,
-    "concurrency": 4096,
-    "candidate_shards": [1, 4],
-    "improvement_threshold": 0.05,
-    "four_shard_minimum_concurrency": 1024
+    "concurrency": 131072,
+    "maximum_loadgen_cpu_fraction": 0.85,
+    "minimum_trajectory_realization_fraction": 0.99,
+    "maximum_fd_fraction": 0.80,
+    "maximum_socket_fraction": 0.80,
+    "reject_queue_admission_failures": true
   },
   "main_matrix": {
-    "input_tokens": [32, 8192],
-    "output_tokens": [16, 1024],
-    "concurrency": [1, 16, 64, 256, 1024, 2048, 4096],
-    "shuffle_seed": 20260807,
+    "concurrency": [1024, 4096, 8192, 16384, 32768, 65536, 131072],
+    "shuffle_seed": 20260809,
     "crossover": ["direct-mocker", "sidecar", "sidecar", "direct-mocker"]
   },
   "connection_diagnostic": {
-    "connections": [1, 2, 4, 8, 16],
+    "connections": [8, 16, 32, 64, 128],
     "orders": ["ascending", "descending"],
-    "anchors": [
-      {"input_tokens": 32, "output_tokens": 1024, "concurrency": 1024},
-      {"input_tokens": 8192, "output_tokens": 1024, "concurrency": 4096}
-    ],
-    "reuse_main_connections": 8
-  },
-  "profiles": {
-    "input_tokens": 32,
-    "output_tokens": 1024,
-    "concurrency": 1024,
-    "direct_mocker_runs": 1,
-    "sidecar_connections": [1, 8, 16],
-    "profile_target": "backend"
+    "anchor_concurrency": [32768, "capacity_peak"],
+    "reuse_main_connections": 8,
+    "insufficient_throughput_improvement_fraction": 0.05,
+    "insufficient_failure_reduction_percentage_points": 0.1
   },
   "smoke": {
     "input_tokens": 32,
     "output_tokens": 16,
     "concurrency": 1,
     "request_count": 1,
-    "expected_output_tokens": 16
+    "expected_output_tokens": 16,
+    "exact_input_token_id": 42
   },
   "flags": {
     "throughput_loss_fraction": 0.10,
     "p99_ttft_increase_fraction": 0.25,
-    "failed_request_fraction": 0.001,
-    "pool_throughput_improvement_fraction": 0.05,
-    "pool_failure_reduction_percentage_points": 0.1
+    "failed_request_fraction": 0.001
+  },
+  "interpretation": {
+    "scope": "AgentX-shaped native request-plane and gRPC overhead with CPU Mockers",
+    "out_of_scope": [
+      "real vLLM EngineCore performance",
+      "GPU kernels and model weights",
+      "official AgentX cache performance because prefix caching is disabled"
+    ]
   }
 }

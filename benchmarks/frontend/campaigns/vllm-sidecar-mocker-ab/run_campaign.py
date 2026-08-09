@@ -15,6 +15,7 @@ import math
 import os
 import random
 import re
+import resource
 import shutil
 import statistics
 import subprocess
@@ -257,8 +258,8 @@ def sample_busy_fraction(layout: CpuLayout, seconds: int) -> float:
     return 1.0 - idle_delta / total_delta
 
 
-def point_key(input_tokens: int, output_tokens: int, concurrency: int) -> str:
-    return f"i{input_tokens}-o{output_tokens}-c{concurrency}"
+def point_key(concurrency: int) -> str:
+    return f"agentx-c{concurrency}"
 
 
 def make_leg(
@@ -291,8 +292,8 @@ def make_leg(
 def high_concurrency_shards(
     manifest: dict[str, Any], concurrency: int, selected: int
 ) -> int:
-    minimum = int(manifest["loadgen_preflight"]["four_shard_minimum_concurrency"])
-    return selected if concurrency >= minimum else 1
+    del manifest, concurrency, selected
+    return 1
 
 
 def build_smoke_legs(manifest: dict[str, Any]) -> list[dict[str, Any]]:
@@ -305,26 +306,26 @@ def build_smoke_legs(manifest: dict[str, Any]) -> list[dict[str, Any]]:
             smoke["input_tokens"],
             smoke["output_tokens"],
             smoke["concurrency"],
-            metadata={"request_count": smoke["request_count"]},
+            metadata={"request_count": smoke["request_count"], "workload": "synthetic"},
         )
         for arm in ("direct-mocker", "sidecar")
     ]
 
 
-def build_preflight_legs(manifest: dict[str, Any]) -> list[dict[str, Any]]:
-    preflight = manifest["loadgen_preflight"]
+def build_qualification_legs(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    qualification = manifest["qualification"]
+    concurrency = int(qualification["concurrency"])
     return [
         make_leg(
-            "preflight",
-            f"loadgen-preflight-shards-{shards}",
-            preflight["arm"],
-            preflight["input_tokens"],
-            preflight["output_tokens"],
-            preflight["concurrency"],
-            shards=shards,
-            metadata={"candidate_shards": shards},
+            "qualification",
+            f"qualification-{point_key(concurrency)}-{qualification['arm']}",
+            qualification["arm"],
+            0,
+            0,
+            concurrency,
+            grpc_connections=int(manifest["transport"]["production_grpc_connections"]),
+            metadata={"point_key": point_key(concurrency), "workload": "agentx"},
         )
-        for shards in preflight["candidate_shards"]
     ]
 
 
@@ -332,28 +333,23 @@ def build_main_legs(
     manifest: dict[str, Any], selected_shards: int
 ) -> list[dict[str, Any]]:
     matrix = manifest["main_matrix"]
-    points = [
-        (input_tokens, output_tokens, concurrency)
-        for input_tokens in matrix["input_tokens"]
-        for output_tokens in matrix["output_tokens"]
-        for concurrency in matrix["concurrency"]
-    ]
+    points = list(matrix["concurrency"])
     random.Random(matrix["shuffle_seed"]).shuffle(points)
     legs: list[dict[str, Any]] = []
-    for point_index, (input_tokens, output_tokens, concurrency) in enumerate(points):
+    for point_index, concurrency in enumerate(points):
         occurrences = {"direct-mocker": 0, "sidecar": 0}
         for crossover_index, arm in enumerate(matrix["crossover"]):
             occurrence = occurrences[arm]
             occurrences[arm] += 1
             pair_index = 0 if crossover_index < 2 else 1
-            key = point_key(input_tokens, output_tokens, concurrency)
+            key = point_key(concurrency)
             legs.append(
                 make_leg(
                     "main",
                     f"main-{point_index:02d}-{key}-x{crossover_index}-{arm}",
                     arm,
-                    input_tokens,
-                    output_tokens,
+                    0,
+                    0,
                     concurrency,
                     grpc_connections=manifest["transport"][
                         "production_grpc_connections"
@@ -367,6 +363,7 @@ def build_main_legs(
                         "crossover_index": crossover_index,
                         "pair_index": pair_index,
                         "arm_occurrence": occurrence,
+                        "workload": "agentx",
                     },
                 )
             )
@@ -374,7 +371,10 @@ def build_main_legs(
 
 
 def build_connection_legs(
-    manifest: dict[str, Any], selected_shards: int, main_legs: list[dict[str, Any]]
+    manifest: dict[str, Any],
+    selected_shards: int,
+    main_legs: list[dict[str, Any]],
+    capacity_peak: int,
 ) -> list[dict[str, Any]]:
     diagnostic = manifest["connection_diagnostic"]
     reuse_connections = int(diagnostic["reuse_main_connections"])
@@ -387,10 +387,13 @@ def build_connection_legs(
         if leg["arm"] == "sidecar"
     }
     legs: list[dict[str, Any]] = []
-    for anchor_index, anchor in enumerate(diagnostic["anchors"]):
-        key = point_key(
-            anchor["input_tokens"], anchor["output_tokens"], anchor["concurrency"]
-        )
+    anchors = [
+        capacity_peak if value == "capacity_peak" else int(value)
+        for value in diagnostic["anchor_concurrency"]
+    ]
+    anchors = list(dict.fromkeys(anchors))
+    for anchor_index, concurrency in enumerate(anchors):
+        key = point_key(concurrency)
         for order_index, order in enumerate(diagnostic["orders"]):
             connections = list(diagnostic["connections"])
             if order == "descending":
@@ -409,75 +412,44 @@ def build_connection_legs(
                         "connections",
                         f"connections-a{anchor_index}-{order}-g{connections_count}",
                         "sidecar",
-                        anchor["input_tokens"],
-                        anchor["output_tokens"],
-                        anchor["concurrency"],
+                        0,
+                        0,
+                        concurrency,
                         grpc_connections=connections_count,
                         shards=high_concurrency_shards(
-                            manifest, anchor["concurrency"], selected_shards
+                            manifest, concurrency, selected_shards
                         ),
-                        metadata=metadata,
+                        metadata={**metadata, "workload": "agentx"},
                     )
                 )
-    return legs
-
-
-def build_profile_legs(
-    manifest: dict[str, Any], selected_shards: int
-) -> list[dict[str, Any]]:
-    profiles = manifest["profiles"]
-    common = {
-        "input_tokens": profiles["input_tokens"],
-        "output_tokens": profiles["output_tokens"],
-        "concurrency": profiles["concurrency"],
-    }
-    shards = high_concurrency_shards(manifest, profiles["concurrency"], selected_shards)
-    direct_runs = int(profiles["direct_mocker_runs"])
-    legs = [
-        make_leg(
-            "profiles",
-            "profile-direct-mocker"
-            if direct_runs == 1
-            else f"profile-direct-mocker-{index}",
-            "direct-mocker",
-            **common,
-            shards=shards,
-            profile=True,
-        )
-        for index in range(direct_runs)
-    ]
-    legs.extend(
-        make_leg(
-            "profiles",
-            f"profile-sidecar-g{connections}",
-            "sidecar",
-            **common,
-            grpc_connections=connections,
-            shards=shards,
-            profile=True,
-        )
-        for connections in profiles["sidecar_connections"]
-    )
     return legs
 
 
 def build_resolved_plan(
     manifest: dict[str, Any], selected_shards: int
 ) -> list[dict[str, Any]]:
-    if selected_shards not in manifest["loadgen_preflight"]["candidate_shards"]:
-        raise CampaignError(f"invalid locked shard count: {selected_shards}")
+    if selected_shards != 1:
+        raise CampaignError("AgentX uses one AIPerf controller with internal workers")
     main = build_main_legs(manifest, selected_shards)
-    legs = (
-        build_smoke_legs(manifest)
-        + build_preflight_legs(manifest)
-        + main
-        + build_connection_legs(manifest, selected_shards, main)
-        + build_profile_legs(manifest, selected_shards)
-    )
+    legs = build_smoke_legs(manifest) + build_qualification_legs(manifest) + main
     for ordinal, leg in enumerate(legs):
         leg["ordinal"] = ordinal
         leg["output_rel"] = f"legs/{ordinal:04d}-{leg['id']}"
     return legs
+
+
+def append_connection_plan(
+    manifest: dict[str, Any],
+    core_legs: list[dict[str, Any]],
+    capacity_peak: int,
+) -> list[dict[str, Any]]:
+    main = [leg for leg in core_legs if leg["phase"] == "main"]
+    connections = build_connection_legs(manifest, 1, main, capacity_peak)
+    start = len(core_legs)
+    for offset, leg in enumerate(connections):
+        leg["ordinal"] = start + offset
+        leg["output_rel"] = f"legs/{start + offset:04d}-{leg['id']}"
+    return core_legs + connections
 
 
 def flag_value(command: list[str], name: str) -> str:
@@ -506,8 +478,6 @@ def build_run_perf_command(
     attempt: int = 1,
 ) -> list[str]:
     model, served_model_name = resolve_model_identity(manifest)
-    if manifest["tools"]["request_rate"] != "unlimited":
-        raise CampaignError("campaign requires an unlimited request rate")
     mocker_config = REPO_ROOT / manifest["fixture"]["mocker_config"]
     namespace = f"vllm-ab-{run_id}-{leg['ordinal']:04d}"
     output_dir = output_root / leg["output_rel"] / f"attempt-{attempt:03d}"
@@ -533,8 +503,6 @@ def build_run_perf_command(
         str(manifest["transport"]["grpc_port"]),
         "--mocker-config",
         str(mocker_config),
-        "--endpoint-type",
-        manifest["transport"]["endpoint_type"],
         "--namespace",
         namespace,
         "--aiperf-shards",
@@ -543,10 +511,8 @@ def build_run_perf_command(
         manifest["tools"]["aiperf_export_level"],
         "--require-aiperf-version",
         manifest["tools"]["aiperf_version"],
-        "--random-seed",
-        str(manifest["tools"]["random_seed"]),
-        "--exact-input-token-id",
-        str(manifest["fixture"]["exact_input_token_id"]),
+        "--max-concurrent-requests",
+        str(manifest["transport"]["max_concurrent_requests"]),
         "--frontend-cpuset",
         layout.frontend,
         "--backend-cpuset",
@@ -557,10 +523,6 @@ def build_run_perf_command(
         layout.infra,
         "--concurrency",
         str(leg["concurrency"]),
-        "--isl",
-        str(leg["input_tokens"]),
-        "--osl",
-        str(leg["output_tokens"]),
         "--output-dir",
         str(output_dir),
         "--tokenizer-backend",
@@ -579,6 +541,16 @@ def build_run_perf_command(
     if leg["phase"] == "smoke":
         command.extend(
             [
+                "--endpoint-type",
+                "completions",
+                "--random-seed",
+                str(manifest["workload"]["random_seed"]),
+                "--exact-input-token-id",
+                str(manifest["smoke"]["exact_input_token_id"]),
+                "--isl",
+                str(leg["input_tokens"]),
+                "--osl",
+                str(leg["output_tokens"]),
                 "--num-requests",
                 str(leg["metadata"]["request_count"]),
                 "--warmup-count",
@@ -589,37 +561,33 @@ def build_run_perf_command(
         )
     else:
         timing = manifest["timing"]
+        workload = manifest["workload"]
         command.extend(
             [
+                "--endpoint-type",
+                workload["endpoint_type"],
+                "--aiperf-scenario",
+                workload["scenario"],
+                "--aiperf-public-dataset",
+                workload["public_dataset"],
+                "--aiperf-max-context-length",
+                str(workload["max_context_length"]),
+                "--aiperf-workers",
+                str(manifest["tools"]["aiperf_workers"]),
+                "--aiperf-record-processors",
+                str(manifest["tools"]["aiperf_record_processors"]),
+                "--random-seed",
+                str(workload["random_seed"]),
                 "--benchmark-duration",
                 str(timing["measurement_seconds"]),
                 "--benchmark-grace-period",
                 str(timing["measurement_grace_seconds"]),
                 "--request-timeout-seconds",
                 str(manifest["tools"]["request_timeout_seconds"]),
-                "--warmup-duration",
-                str(timing["warmup_seconds"]),
-                "--warmup-grace-period",
-                str(timing["warmup_grace_seconds"]),
-                "--aiperf-dataset-entries",
-                str(manifest["tools"]["num_dataset_entries"]),
                 "--allow-aiperf-saturation-failures",
-                "--capture-duration",
-                str(
-                    timing["measurement_seconds"]
-                    + timing["warmup_seconds"]
-                    + timing["cooldown_seconds"]
-                ),
             ]
         )
-    if leg["profile"]:
-        command.extend(
-            ["--profile-target", manifest["profiles"]["profile_target"], "--skip-nsys"]
-        )
-    else:
-        command.extend(
-            ["--skip-nsys", "--skip-perf", "--skip-bpf", "--skip-flamegraph"]
-        )
+    command.extend(["--skip-nsys", "--skip-perf", "--skip-bpf", "--skip-flamegraph"])
     return command
 
 
@@ -665,6 +633,37 @@ def aiperf_version(required: str) -> str:
     if not re.search(rf"(^|\D){re.escape(required)}(\D|$)", output):
         raise CampaignError(f"required AIPerf {required}, got {output or 'unknown'}")
     return output
+
+
+def aiperf_source_inventory(manifest: dict[str, Any]) -> dict[str, str]:
+    script = "import aiperf, pathlib; print(pathlib.Path(aiperf.__file__).resolve())"
+    package_path = Path(run_text([sys.executable, "-c", script]))
+    source_root = run_text(
+        ["git", "-C", str(package_path.parent), "rev-parse", "--show-toplevel"]
+    )
+    commit = run_text(["git", "-C", source_root, "rev-parse", "HEAD"])
+    status = run_text(["git", "-C", source_root, "status", "--porcelain"])
+    expected = manifest["tools"]["aiperf_commit"]
+    if commit != expected or status:
+        raise CampaignError(
+            f"AIPerf must be clean at {expected}; observed commit={commit} dirty={bool(status)}"
+        )
+    return {
+        "root": source_root,
+        "commit": commit,
+        "clean": str(not bool(status)).lower(),
+    }
+
+
+def physical_memory_gib() -> float:
+    match = re.search(
+        r"^MemTotal:\s+(\d+)\s+kB$",
+        Path("/proc/meminfo").read_text(encoding="utf-8"),
+        re.MULTILINE,
+    )
+    if not match:
+        raise CampaignError("could not determine host memory")
+    return int(match.group(1)) / 1024**2
 
 
 def python_runtime_inventory() -> dict[str, str]:
@@ -760,6 +759,8 @@ def prepare_environment(
                 f"host busy fraction {busy_fraction:.3%} exceeds the locked limit"
             )
         aiperf_version(manifest["tools"]["aiperf_version"])
+        if aiperf_source_inventory(manifest) != environment["aiperf_source"]:
+            raise CampaignError("AIPerf source changed since campaign initialization")
         return environment
 
     source = verify_source(manifest)
@@ -778,6 +779,16 @@ def prepare_environment(
     )
     layout = discover_cpu_layout(manifest)
     hardware = manifest["hardware"]
+    memory_gib = physical_memory_gib()
+    if memory_gib < float(hardware["minimum_memory_gib"]):
+        raise CampaignError(
+            f"host has {memory_gib:.1f} GiB RAM; campaign requires {hardware['minimum_memory_gib']} GiB"
+        )
+    nofile_limit = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+    if nofile_limit < 262144:
+        raise CampaignError(
+            f"open-file limit {nofile_limit} is below the locked 262144 minimum"
+        )
     busy_fraction = sample_busy_fraction(layout, int(hardware["busy_sample_seconds"]))
     if busy_fraction > float(hardware["maximum_preflight_busy_fraction"]):
         raise CampaignError(
@@ -811,7 +822,10 @@ def prepare_environment(
         "manifest_sha256": sha256_file(MANIFEST_PATH),
         "cpu_layout": layout.as_dict(),
         "preflight_busy_fraction": busy_fraction,
+        "physical_memory_gib": memory_gib,
+        "open_file_limit": nofile_limit,
         "aiperf_version": aiperf_version(manifest["tools"]["aiperf_version"]),
+        "aiperf_source": aiperf_source_inventory(manifest),
         "tool_versions": {
             "python": run_text([sys.executable, "--version"]),
             "cargo": run_text(["cargo", "--version"]),
@@ -839,18 +853,20 @@ def prepare_environment(
     return environment
 
 
-def lock_resolved_plan(output_root: Path, legs: list[dict[str, Any]]) -> None:
-    path = output_root / "resolved-plan.json"
+def lock_resolved_plan(
+    output_root: Path, legs: list[dict[str, Any]], stem: str = "resolved-plan"
+) -> None:
+    path = output_root / f"{stem}.json"
     value = {"schema_version": 1, "legs": legs}
     if path.exists():
         with path.open(encoding="utf-8") as handle:
             existing = json.load(handle)
         if canonical_json(existing) != canonical_json(value):
-            raise CampaignError("resolved plan differs from the already locked plan")
+            raise CampaignError(f"{stem} differs from the already locked plan")
         return
     atomic_write_json(path, value)
-    (output_root / "resolved-plan.sha256").write_text(
-        f"{sha256_bytes(canonical_json(value))}  resolved-plan.json\n", encoding="utf-8"
+    (output_root / f"{stem}.sha256").write_text(
+        f"{sha256_bytes(canonical_json(value))}  {stem}.json\n", encoding="utf-8"
     )
 
 
@@ -897,7 +913,7 @@ def percentile(values: list[float], fraction: float) -> float:
 
 def pooled_record_metrics(
     paths: list[Path],
-) -> tuple[dict[str, dict[str, float]], set[str], dict[str, int]]:
+) -> tuple[dict[str, dict[str, float]], set[str], dict[str, Any]]:
     metric_names = (
         "time_to_first_token",
         "inter_token_latency",
@@ -907,43 +923,54 @@ def pooled_record_metrics(
     )
     by_request = {name: {} for name in metric_names}
     request_ids: set[str] = set()
-    outcomes = {"completed": 0, "failed": 0}
+    outcomes: dict[str, Any] = {"completed": 0, "failed": 0, "errors_by_kind": {}}
     for path in paths:
-        for line_number, line in enumerate(
-            path.read_text(encoding="utf-8", errors="strict").splitlines(), start=1
-        ):
-            if not line.strip():
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError as error:
-                raise CampaignError(f"invalid JSONL at {path}:{line_number}") from error
-            if record.get("metadata", {}).get("benchmark_phase") != "profiling":
-                continue
-            if record.get("error") is not None:
-                outcomes["failed"] += 1
-                continue
-            outcomes["completed"] += 1
-            request_id = record.get("metadata", {}).get("x_request_id")
-            if not request_id:
-                raise CampaignError(f"profiling record lacks x_request_id in {path}")
-            request_id = str(request_id)
-            if request_id in request_ids:
-                raise CampaignError(
-                    f"duplicate profiling record for {request_id} in {path}"
-                )
-            request_ids.add(request_id)
-            metrics = record.get("metrics", {})
-            for name in metric_names:
-                value = metrics.get(name)
-                if not isinstance(value, dict) or value.get("value") is None:
+        with path.open(encoding="utf-8", errors="strict") as handle:
+            lines = enumerate(handle, start=1)
+            for line_number, line in lines:
+                if not line.strip():
                     continue
-                expected_unit = "tokens" if name.endswith("sequence_length") else "ms"
-                if value.get("unit") != expected_unit:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as error:
                     raise CampaignError(
-                        f"unexpected {name} unit in {path}: {value.get('unit')}"
+                        f"invalid JSONL at {path}:{line_number}"
+                    ) from error
+                if record.get("metadata", {}).get("benchmark_phase") != "profiling":
+                    continue
+                if record.get("error") is not None:
+                    outcomes["failed"] += 1
+                    error = record["error"]
+                    kind = str(error.get("code") or error.get("type") or "unknown")
+                    outcomes["errors_by_kind"][kind] = (
+                        outcomes["errors_by_kind"].get(kind, 0) + 1
                     )
-                by_request[name][request_id] = float(value["value"])
+                    continue
+                outcomes["completed"] += 1
+                request_id = record.get("metadata", {}).get("x_request_id")
+                if not request_id:
+                    raise CampaignError(
+                        f"profiling record lacks x_request_id in {path}"
+                    )
+                request_id = str(request_id)
+                if request_id in request_ids:
+                    raise CampaignError(
+                        f"duplicate profiling record for {request_id} in {path}"
+                    )
+                request_ids.add(request_id)
+                metrics = record.get("metrics", {})
+                for name in metric_names:
+                    value = metrics.get(name)
+                    if not isinstance(value, dict) or value.get("value") is None:
+                        continue
+                    expected_unit = (
+                        "tokens" if name.endswith("sequence_length") else "ms"
+                    )
+                    if value.get("unit") != expected_unit:
+                        raise CampaignError(
+                            f"unexpected {name} unit in {path}: {value.get('unit')}"
+                        )
+                    by_request[name][request_id] = float(value["value"])
     return by_request, request_ids, outcomes
 
 
@@ -1076,6 +1103,73 @@ def parse_process_metrics(system_dir: Path) -> dict[str, Any]:
     }
 
 
+def parse_loadgen_metrics(
+    output_dir: Path, cpuset: str, measurement_seconds: int, concurrency: int
+) -> dict[str, Any]:
+    selected = expand_cpu_list(cpuset) if cpuset else set()
+    samples: list[tuple[int, int]] = []
+    current_total = current_idle = 0
+    saw_header = False
+    stat_path = output_dir / "system/loadgen_cpu_stat.txt"
+    if stat_path.exists():
+        with stat_path.open(encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                if line.startswith("--- "):
+                    if saw_header:
+                        samples.append((current_total, current_idle))
+                    saw_header = True
+                    current_total = current_idle = 0
+                    continue
+                match = re.match(r"cpu(\d+)\s+(.+)", line)
+                if not match or int(match.group(1)) not in selected:
+                    continue
+                values = [int(value) for value in match.group(2).split()]
+                current_total += sum(values)
+                current_idle += values[3] + (values[4] if len(values) > 4 else 0)
+        if saw_header:
+            samples.append((current_total, current_idle))
+    recent = samples[-(measurement_seconds + 1) :]
+    if len(recent) >= 2:
+        total_delta = recent[-1][0] - recent[0][0]
+        idle_delta = recent[-1][1] - recent[0][1]
+        cpu_fraction = 1.0 - idle_delta / total_delta if total_delta > 0 else 0.0
+    else:
+        cpu_fraction = 0.0
+
+    max_process_fds = max_http_sockets = max_processes = 0
+    counts_path = output_dir / "system/loadgen_counts.txt"
+    if counts_path.exists():
+        for line in counts_path.read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines():
+            values = dict(
+                re.findall(r"(processes|max_process_fds|http_sockets)=(\d+)", line)
+            )
+            max_processes = max(max_processes, int(values.get("processes", 0)))
+            max_process_fds = max(
+                max_process_fds, int(values.get("max_process_fds", 0))
+            )
+            max_http_sockets = max(max_http_sockets, int(values.get("http_sockets", 0)))
+
+    built_trajectories = 0
+    trajectory_pattern = re.compile(r"built (\d+) trajectories")
+    for log_path in (output_dir / "logs").glob("aiperf_*.log"):
+        for match in trajectory_pattern.finditer(
+            log_path.read_text(encoding="utf-8", errors="replace")
+        ):
+            built_trajectories = max(built_trajectories, int(match.group(1)))
+    return {
+        "cpu_fraction": cpu_fraction,
+        "max_processes": max_processes,
+        "max_process_fds": max_process_fds,
+        "max_http_sockets": max_http_sockets,
+        "built_trajectories": built_trajectories,
+        "trajectory_realization_fraction": (
+            built_trajectories / concurrency if concurrency else 0.0
+        ),
+    }
+
+
 def parse_leg_metrics(output_dir: Path) -> dict[str, Any]:
     profiles = sorted((output_dir / "aiperf").rglob("profile_export_aiperf.json"))
     record_paths = sorted((output_dir / "aiperf").rglob("profile_export.jsonl"))
@@ -1122,11 +1216,13 @@ def parse_leg_metrics(output_dir: Path) -> dict[str, Any]:
         versions = sorted(
             {str(shard.get("aiperf_version", "unknown")) for shard in shards}
         )
+        scenario_metadata = [shard.get("metadata", {}) for shard in shards]
     else:
         aiperf_completed = float(outcomes["completed"])
         aiperf_failures = float(outcomes["failed"])
         wall_seconds = float(config.get("benchmark_duration") or 0.0)
         versions = [str(config.get("aiperf_version", "unknown"))]
+        scenario_metadata = []
     if aiperf_completed != float(outcomes["completed"]):
         raise CampaignError(
             f"AIPerf summary completed {aiperf_completed:g} requests but records contain "
@@ -1157,17 +1253,18 @@ def parse_leg_metrics(output_dir: Path) -> dict[str, Any]:
     metric = {
         "shards": len(record_paths),
         "request_throughput_rps": completed / wall_seconds if wall_seconds else 0.0,
-        "output_throughput_tps": server_tokens["success_total_output_tokens"]
-        / wall_seconds
-        if wall_seconds
-        else 0.0,
+        "output_throughput_tps": (
+            server_tokens["success_total_output_tokens"] / wall_seconds
+            if wall_seconds
+            else 0.0
+        ),
         "completed_requests": completed,
         "failed_requests": failures,
         "aiperf_failed_requests": aiperf_failures,
         "server_failed_requests": server_failures,
-        "failed_request_fraction": failures / (completed + failures)
-        if completed + failures
-        else 0.0,
+        "failed_request_fraction": (
+            failures / (completed + failures) if completed + failures else 0.0
+        ),
         "total_input_tokens": server_tokens["total_input_tokens"],
         "total_output_tokens": server_tokens["total_output_tokens"],
         "completed_total_output_tokens": server_tokens["success_total_output_tokens"],
@@ -1194,7 +1291,23 @@ def parse_leg_metrics(output_dir: Path) -> dict[str, Any]:
         "aiperf_output_length_min": min(records["output_sequence_length"], default=0.0),
         "aiperf_output_length_max": max(records["output_sequence_length"], default=0.0),
         "aiperf_versions": versions,
+        "scenario_metadata": scenario_metadata,
+        "errors_by_kind": outcomes["errors_by_kind"],
     }
+    metric["loadgen"] = parse_loadgen_metrics(
+        output_dir,
+        str(config.get("loadgen_cpuset", "")),
+        int(config.get("benchmark_duration") or 0),
+        int(config.get("concurrency") or 0),
+    )
+    frontend_text = (output_dir / "logs/frontend.log").read_text(
+        encoding="utf-8", errors="replace"
+    )
+    metric["queue_admission_failures"] = len(
+        re.findall(
+            r"(?:queue|admission).*(?:full|reject|capacity)", frontend_text, re.I
+        )
+    )
     metric["process_metrics"] = parse_process_metrics(output_dir / "system")
     grpc_check = output_dir / "system/grpc_connection_check.json"
     metric["grpc_connection_check"] = (
@@ -1226,25 +1339,39 @@ def validate_leg_output(
         "model_name": served_model_name,
         "request_plane": manifest["transport"]["request_plane"],
         "event_plane": manifest["transport"]["event_plane"],
-        "endpoint_type": manifest["transport"]["endpoint_type"],
         "grpc_connections": leg["grpc_connections"],
+        "max_concurrent_requests": manifest["transport"]["max_concurrent_requests"],
         "aiperf_shards": leg["aiperf_shards"],
         "aiperf_export_level": manifest["tools"]["aiperf_export_level"],
-        "random_seed": manifest["tools"]["random_seed"],
-        "exact_input_token_id": manifest["fixture"]["exact_input_token_id"],
         "concurrency": leg["concurrency"],
-        "isl": leg["input_tokens"],
-        "osl": leg["output_tokens"],
     }
-    if leg["phase"] != "smoke":
+    if leg["phase"] == "smoke":
         expected_config.update(
             {
+                "endpoint_type": "completions",
+                "random_seed": manifest["workload"]["random_seed"],
+                "exact_input_token_id": manifest["smoke"]["exact_input_token_id"],
+                "isl": leg["input_tokens"],
+                "osl": leg["output_tokens"],
+            }
+        )
+    else:
+        workload = manifest["workload"]
+        expected_config.update(
+            {
+                "endpoint_type": workload["endpoint_type"],
+                "random_seed": workload["random_seed"],
+                "aiperf_scenario": workload["scenario"],
+                "aiperf_public_dataset": workload["public_dataset"],
+                "aiperf_max_context_length": workload["max_context_length"],
+                "aiperf_workers": manifest["tools"]["aiperf_workers"],
+                "aiperf_record_processors": manifest["tools"][
+                    "aiperf_record_processors"
+                ],
                 "benchmark_grace_period": manifest["timing"][
                     "measurement_grace_seconds"
                 ],
                 "request_timeout_seconds": manifest["tools"]["request_timeout_seconds"],
-                "warmup_grace_period": manifest["timing"]["warmup_grace_seconds"],
-                "aiperf_dataset_entries": manifest["tools"]["num_dataset_entries"],
                 "allow_aiperf_saturation_failures": manifest["tools"][
                     "allow_aiperf_saturation_failures"
                 ],
@@ -1285,6 +1412,16 @@ def validate_leg_output(
         raise CampaignError(
             f"AIPerf export version mismatch: {metrics['aiperf_versions']} != {[expected_version]}"
         )
+    if leg["phase"] != "smoke":
+        metadata = metrics["scenario_metadata"]
+        if not metadata or any(
+            entry.get("scenario") != manifest["workload"]["scenario"]
+            or entry.get("submission_valid") is not True
+            for entry in metadata
+        ):
+            raise CampaignError(
+                f"AgentX scenario submission was not valid in {output_dir}: {metadata}"
+            )
     if leg["arm"] == "sidecar":
         check = metrics["grpc_connection_check"]
         if not check or not check.get("valid"):
@@ -1293,7 +1430,7 @@ def validate_leg_output(
             raise CampaignError(
                 f"sidecar socket count does not match the locked leg in {output_dir}"
             )
-    if metrics["completed_requests"]:
+    if leg["phase"] == "smoke" and metrics["completed_requests"]:
         expected_input = float(leg["input_tokens"])
         expected_output = float(leg["output_tokens"])
         if (
@@ -1326,14 +1463,35 @@ def validate_leg_output(
             )
         if metrics["failed_requests"]:
             raise CampaignError("smoke request failed")
-    if leg["profile"]:
-        profile_artifacts = [
-            path
-            for path in (output_dir / "perf").glob("*cpu_flamegraph*")
-            if path.is_file() and path.stat().st_size > 0
-        ]
-        if not profile_artifacts:
-            raise CampaignError(f"CPU profile artifact is absent in {output_dir}")
+    if leg["phase"] == "qualification":
+        qualification = manifest["qualification"]
+        loadgen = metrics["loadgen"]
+        violations = {}
+        if loadgen["cpu_fraction"] > float(
+            qualification["maximum_loadgen_cpu_fraction"]
+        ):
+            violations["loadgen_cpu_fraction"] = loadgen["cpu_fraction"]
+        if loadgen["trajectory_realization_fraction"] < float(
+            qualification["minimum_trajectory_realization_fraction"]
+        ):
+            violations["trajectory_realization_fraction"] = loadgen[
+                "trajectory_realization_fraction"
+            ]
+        if loadgen["max_process_fds"] / int(config["open_file_limit"]) > float(
+            qualification["maximum_fd_fraction"]
+        ):
+            violations["max_process_fds"] = loadgen["max_process_fds"]
+        if loadgen["max_http_sockets"] / int(
+            manifest["tools"]["aiperf_http_connection_limit"]
+        ) > float(qualification["maximum_socket_fraction"]):
+            violations["max_http_sockets"] = loadgen["max_http_sockets"]
+        if (
+            qualification["reject_queue_admission_failures"]
+            and metrics["queue_admission_failures"]
+        ):
+            violations["queue_admission_failures"] = metrics["queue_admission_failures"]
+        if violations:
+            raise CampaignError(f"load-generator qualification failed: {violations}")
     return metrics
 
 
@@ -1387,6 +1545,15 @@ def execute_leg(
             f"leg {leg['id']} requires valid reusable main leg {reuse_from}"
         )
 
+    layout = CpuLayout.from_dict(environment["cpu_layout"])
+    busy_fraction = sample_busy_fraction(
+        layout, int(manifest["hardware"]["busy_sample_seconds"])
+    )
+    if busy_fraction > float(manifest["hardware"]["maximum_preflight_busy_fraction"]):
+        raise CampaignError(
+            f"pre-leg host busy fraction {busy_fraction:.3%} exceeds the locked limit"
+        )
+
     attempt_number = len(existing.get("attempts", [])) + 1 if existing else 1
     command = build_run_perf_command(
         leg,
@@ -1424,8 +1591,36 @@ def execute_leg(
         log.write(f"started_at={attempt['started_at']}\n")
         log.write(f"command={json.dumps(command)}\n")
         log.flush()
+        process_environment = os.environ.copy()
+        process_environment.update(manifest["transport"]["dynamo_env"])
+        process_environment.update(
+            {
+                "AIPERF_HTTP_CONNECTION_LIMIT": str(
+                    manifest["tools"]["aiperf_http_connection_limit"]
+                ),
+                "AIPERF_WORKER_MAX_WORKERS_CAP": str(
+                    manifest["tools"]["aiperf_workers"]
+                ),
+                "AIPERF_ZMQ_PULL_MAX_CONCURRENCY": str(
+                    manifest["tools"]["aiperf_zmq_pull_max_concurrency"]
+                ),
+                "AIPERF_DATASET_CONFIGURATION_TIMEOUT": str(
+                    manifest["tools"]["aiperf_dataset_configuration_timeout_seconds"]
+                ),
+                "AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT": str(
+                    manifest["tools"]["aiperf_profile_configure_timeout_seconds"]
+                ),
+                "AIPERF_RECORD_PROCESS_RECORDS_TIMEOUT": str(
+                    manifest["tools"]["aiperf_process_records_timeout_seconds"]
+                ),
+            }
+        )
         result = subprocess.run(
-            command, check=False, stdout=log, stderr=subprocess.STDOUT
+            command,
+            check=False,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            env=process_environment,
         )
     attempt["finished_at"] = utc_now()
     attempt["exit_code"] = result.returncode
@@ -1454,53 +1649,53 @@ def execute_leg(
     save_state(output_root, state)
 
 
-def derive_shard_decision(
+def derive_capacity_peak(
     manifest: dict[str, Any], output_root: Path, state: dict[str, Any]
 ) -> int:
-    candidates = manifest["loadgen_preflight"]["candidate_shards"]
-    results: dict[int, float] = {}
-    for shards in candidates:
-        entry = state["legs"].get(f"loadgen-preflight-shards-{shards}")
-        if not entry or entry.get("status") != "complete":
-            raise CampaignError(
-                "both load-generator preflight legs must complete first"
-            )
-        results[int(shards)] = float(entry["metrics"]["output_throughput_tps"])
-    baseline = results[int(candidates[0])]
-    if baseline <= 0:
-        raise CampaignError("single-shard preflight produced no output throughput")
-    improvement = results[int(candidates[1])] / baseline - 1.0
-    threshold = float(manifest["loadgen_preflight"]["improvement_threshold"])
-    selected = int(candidates[1]) if improvement > threshold else int(candidates[0])
+    throughput: dict[int, list[float]] = {}
+    for entry in state["legs"].values():
+        leg = entry.get("leg", {})
+        if (
+            entry.get("status") not in {"complete", "reused"}
+            or leg.get("phase") != "main"
+            or leg.get("arm") != "sidecar"
+        ):
+            continue
+        throughput.setdefault(int(leg["concurrency"]), []).append(
+            float(entry["metrics"]["output_throughput_tps"])
+        )
+    expected = {int(value) for value in manifest["main_matrix"]["concurrency"]}
+    if set(throughput) != expected or any(
+        len(values) != 2 for values in throughput.values()
+    ):
+        raise CampaignError(
+            "all two-replicate sidecar main points must complete before selecting capacity peak"
+        )
+    medians = {key: statistics.median(values) for key, values in throughput.items()}
+    selected = min(
+        (
+            concurrency
+            for concurrency, value in medians.items()
+            if value == max(medians.values())
+        )
+    )
     decision = {
-        "created_at": utc_now(),
-        "throughput_tps": {str(key): value for key, value in results.items()},
-        "improvement_fraction": improvement,
-        "threshold_fraction": threshold,
-        "selected_high_concurrency_shards": selected,
+        "rule": "highest sidecar paired-median output throughput; lower concurrency wins ties",
+        "sidecar_output_throughput_tps_median": {
+            str(key): medians[key] for key in sorted(medians)
+        },
+        "capacity_peak_concurrency": selected,
     }
-    decision_path = output_root / "decisions.json"
+    decision_path = output_root / "capacity-peak.json"
     if decision_path.exists():
         existing = json.loads(decision_path.read_text(encoding="utf-8"))
-        existing.pop("created_at", None)
-        comparable = dict(decision)
-        comparable.pop("created_at", None)
-        if canonical_json(existing) != canonical_json(comparable):
+        if canonical_json(existing) != canonical_json(decision):
             raise CampaignError(
-                "load-generator decision differs from the locked decision"
+                "capacity-peak decision differs from the locked decision"
             )
     else:
         atomic_write_json(decision_path, decision)
     return selected
-
-
-def load_shard_decision(output_root: Path) -> int:
-    path = output_root / "decisions.json"
-    if not path.exists():
-        raise CampaignError("run the preflight phase before the locked sweep")
-    return int(
-        json.loads(path.read_text(encoding="utf-8"))["selected_high_concurrency_shards"]
-    )
 
 
 def execute_phase(
@@ -1549,12 +1744,13 @@ def run_campaign(args: argparse.Namespace) -> None:
     )
     manifest_sha256 = lock_manifest(output_root)
     state = load_state(output_root)
+    core_legs = build_resolved_plan(manifest, 1)
+    lock_resolved_plan(output_root, core_legs, "core-plan")
 
     if args.phase in {"smoke", "all"}:
-        provisional = build_resolved_plan(manifest, 1)
         execute_phase(
             "smoke",
-            provisional,
+            core_legs,
             manifest,
             manifest_sha256,
             environment,
@@ -1562,37 +1758,24 @@ def run_campaign(args: argparse.Namespace) -> None:
             state,
             args.retry_failed,
         )
-    if args.phase in {"preflight", "all"}:
-        provisional = build_resolved_plan(manifest, 1)
+    if args.phase in {"qualification", "all"}:
         execute_phase(
-            "preflight",
-            provisional,
+            "qualification",
+            core_legs,
             manifest,
             manifest_sha256,
             environment,
             output_root,
             state,
             args.retry_failed,
-        )
-        selected_shards = derive_shard_decision(manifest, output_root, state)
-    else:
-        selected_shards = (
-            load_shard_decision(output_root) if args.phase not in {"smoke"} else 1
         )
 
-    if args.phase == "smoke":
+    if args.phase in {"smoke", "qualification"}:
         return
-    legs = build_resolved_plan(manifest, selected_shards)
-    lock_resolved_plan(output_root, legs)
-    phases = (
-        ["main", "connections", "profiles"] if args.phase == "all" else [args.phase]
-    )
-    for phase in phases:
-        if phase == "preflight":
-            continue
+    if args.phase in {"main", "all"}:
         execute_phase(
-            phase,
-            legs,
+            "main",
+            core_legs,
             manifest,
             manifest_sha256,
             environment,
@@ -1600,6 +1783,21 @@ def run_campaign(args: argparse.Namespace) -> None:
             state,
             args.retry_failed,
         )
+    if args.phase == "main":
+        return
+    capacity_peak = derive_capacity_peak(manifest, output_root, state)
+    legs = append_connection_plan(manifest, core_legs, capacity_peak)
+    lock_resolved_plan(output_root, legs)
+    execute_phase(
+        "connections",
+        legs,
+        manifest,
+        manifest_sha256,
+        environment,
+        output_root,
+        state,
+        args.retry_failed,
+    )
     if args.phase == "all":
         analyze_campaign(output_root)
 
@@ -1903,13 +2101,14 @@ def analyze_campaign(output_root: Path) -> None:
         results_dir / "connection-diagnostic.csv", connection_rows, connection_fields
     )
     diagnostic_summary: list[dict[str, Any]] = []
-    for anchor in manifest["connection_diagnostic"]["anchors"]:
+    diagnostic = manifest["connection_diagnostic"]
+    for anchor_concurrency in sorted(
+        {int(row["concurrency"]) for row in connection_rows}
+    ):
         anchor_rows = [
             row
             for row in connection_rows
-            if int(row["input_tokens"]) == int(anchor["input_tokens"])
-            and int(row["output_tokens"]) == int(anchor["output_tokens"])
-            and int(row["concurrency"]) == int(anchor["concurrency"])
+            if int(row["concurrency"]) == anchor_concurrency
         ]
         rows_8 = [row for row in anchor_rows if int(row["grpc_connections"]) == 8]
         rows_16 = [row for row in anchor_rows if int(row["grpc_connections"]) == 16]
@@ -1923,13 +2122,14 @@ def analyze_campaign(output_root: Path) -> None:
         failure_reduction = failures_8 - failures_16
         insufficient = (
             throughput_improvement
-            > float(flags["pool_throughput_improvement_fraction"])
+            > float(diagnostic["insufficient_throughput_improvement_fraction"])
             or failure_reduction
-            > float(flags["pool_failure_reduction_percentage_points"]) / 100.0
+            > float(diagnostic["insufficient_failure_reduction_percentage_points"])
+            / 100.0
         )
         diagnostic_summary.append(
             {
-                **anchor,
+                "concurrency": anchor_concurrency,
                 "throughput_improvement_fraction_16_vs_8": throughput_improvement,
                 "failure_reduction_fraction_16_vs_8": failure_reduction,
                 "eight_connections_insufficient": insufficient,
@@ -1963,8 +2163,8 @@ def analyze_campaign(output_root: Path) -> None:
         "## Completion",
         "",
         f"- Main legs: {complete_main}/{expected_main}",
-        f"- Matched pairs: {len(paired_rows)}/56",
-        f"- Paired-median points: {len(paired_medians)}/28",
+        f"- Matched pairs: {len(paired_rows)}/14",
+        f"- Paired-median points: {len(paired_medians)}/7",
         f"- Flagged points: {len(flagged_points)}",
         f"- Eight-connection pool insufficient: {'yes' if pool_insufficient else 'no'}",
         "",
@@ -1973,8 +2173,7 @@ def analyze_campaign(output_root: Path) -> None:
     ]
     if flagged_points:
         report_lines.extend(
-            f"- {row['input_tokens']}×{row['output_tokens']}/c{row['concurrency']}: {row['flags']}"
-            for row in flagged_points
+            f"- AgentX/c{row['concurrency']}: {row['flags']}" for row in flagged_points
         )
     else:
         report_lines.append("- None.")
@@ -1983,7 +2182,7 @@ def analyze_campaign(output_root: Path) -> None:
             "",
             "## Interpretation boundary",
             "",
-            "These results isolate Dynamo request-plane plus native vLLM gRPC sidecar overhead against the same CPU Mocker scheduler. They do not measure vLLM EngineCore, model execution, GPU kernels, KV transfer, real-engine startup, or OpenEngine.",
+            "These results isolate Dynamo request-plane plus native vLLM gRPC sidecar overhead against the same CPU Mocker scheduler under the pinned AgentX trace shape. They do not measure vLLM EngineCore, model execution, GPU kernels, model weights, real-engine startup, or official AgentX cache performance because prefix caching is disabled.",
             "",
             "Individual runs are in `individual.csv`; matched comparisons are in `paired.csv`; point-level paired medians are in `paired-medians.csv`; connection-pool diagnostics are in `connection-diagnostic.csv` and `connection-diagnostic.json`.",
         ]
@@ -1995,8 +2194,12 @@ def analyze_campaign(output_root: Path) -> None:
 
 def plan_campaign(args: argparse.Namespace) -> None:
     manifest = load_manifest()
-    legs = build_resolved_plan(manifest, args.high_concurrency_shards)
-    value = {"schema_version": 1, "legs": legs}
+    legs = build_resolved_plan(manifest, 1)
+    value = {
+        "schema_version": 1,
+        "legs": legs,
+        "deferred_connection_anchor": "capacity_peak selected from completed sidecar paired medians",
+    }
     if args.output:
         atomic_write_json(args.output.expanduser().resolve(), value)
     else:
@@ -2011,7 +2214,6 @@ def build_parser() -> argparse.ArgumentParser:
     plan = subparsers.add_parser(
         "plan", help="render the deterministic resolved plan without running it"
     )
-    plan.add_argument("--high-concurrency-shards", type=int, choices=[1, 4], default=1)
     plan.add_argument("--output", type=Path)
     plan.set_defaults(func=plan_campaign)
 
@@ -2019,7 +2221,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--output-root", type=Path, required=True)
     run.add_argument(
         "--phase",
-        choices=["smoke", "preflight", "main", "connections", "profiles", "all"],
+        choices=["smoke", "qualification", "main", "connections", "all"],
         default="all",
     )
     run.add_argument("--vllm-sidecar-bin")

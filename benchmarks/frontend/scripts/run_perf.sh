@@ -27,7 +27,7 @@ REPO_ROOT="${SCRIPT_DIR}/../../.."
 # Raise file descriptor limit — high concurrency runs open many sockets
 # (aiperf connections + frontend + mocker workers + /proc polling + captures).
 # The default 1024 is insufficient at concurrency >= 100.
-ulimit -n 65536 2>/dev/null || ulimit -n 8192 2>/dev/null || true
+ulimit -n 1048576 2>/dev/null || ulimit -n 262144 2>/dev/null || ulimit -n 65536 2>/dev/null || true
 
 # When running under sudo, preserve the invoking user's environment:
 # - HF cache (so models downloaded as the regular user are visible)
@@ -76,6 +76,11 @@ DYNAMO_NAMESPACE="${DYNAMO_NAMESPACE:-dynamo}"
 AIPERF_SHARDS="${AIPERF_SHARDS:-1}"
 AIPERF_EXPORT_LEVEL="${AIPERF_EXPORT_LEVEL:-summary}"
 AIPERF_DATASET_ENTRIES="${AIPERF_DATASET_ENTRIES:-12800}"
+AIPERF_SCENARIO="${AIPERF_SCENARIO:-}"
+AIPERF_PUBLIC_DATASET="${AIPERF_PUBLIC_DATASET:-}"
+AIPERF_MAX_CONTEXT_LENGTH="${AIPERF_MAX_CONTEXT_LENGTH:-}"
+AIPERF_WORKERS="${AIPERF_WORKERS:-}"
+AIPERF_RECORD_PROCESSORS="${AIPERF_RECORD_PROCESSORS:-}"
 REQUIRED_AIPERF_VERSION="${REQUIRED_AIPERF_VERSION:-}"
 RANDOM_SEED="${RANDOM_SEED:-100}"
 EXACT_INPUT_TOKEN_ID="${EXACT_INPUT_TOKEN_ID:-}"
@@ -85,6 +90,7 @@ LOADGEN_CPUSET="${LOADGEN_CPUSET:-}"
 INFRA_CPUSET="${INFRA_CPUSET:-}"
 VLLM_MOCKER_SERVER_BIN="${VLLM_MOCKER_SERVER_BIN:-}"
 VLLM_SIDECAR_BIN="${VLLM_SIDECAR_BIN:-}"
+MAX_CONCURRENT_REQUESTS="${MAX_CONCURRENT_REQUESTS:-8192}"
 PROFILE_TARGET="${PROFILE_TARGET:-frontend}"
 REQUIRE_MANAGED_INFRA=false
 ALLOW_AIPERF_SATURATION_FAILURES=false
@@ -140,6 +146,11 @@ while [[ $# -gt 0 ]]; do
         --aiperf-shards)        AIPERF_SHARDS="$2"; shift 2 ;;
         --aiperf-export-level)  AIPERF_EXPORT_LEVEL="$2"; shift 2 ;;
         --aiperf-dataset-entries) AIPERF_DATASET_ENTRIES="$2"; shift 2 ;;
+        --aiperf-scenario)      AIPERF_SCENARIO="$2"; shift 2 ;;
+        --aiperf-public-dataset) AIPERF_PUBLIC_DATASET="$2"; shift 2 ;;
+        --aiperf-max-context-length) AIPERF_MAX_CONTEXT_LENGTH="$2"; shift 2 ;;
+        --aiperf-workers)       AIPERF_WORKERS="$2"; shift 2 ;;
+        --aiperf-record-processors) AIPERF_RECORD_PROCESSORS="$2"; shift 2 ;;
         --require-aiperf-version) REQUIRED_AIPERF_VERSION="$2"; shift 2 ;;
         --random-seed)          RANDOM_SEED="$2"; shift 2 ;;
         --exact-input-token-id) EXACT_INPUT_TOKEN_ID="$2"; shift 2 ;;
@@ -149,6 +160,7 @@ while [[ $# -gt 0 ]]; do
         --infra-cpuset)         INFRA_CPUSET="$2"; shift 2 ;;
         --vllm-mocker-server-bin) VLLM_MOCKER_SERVER_BIN="$2"; shift 2 ;;
         --vllm-sidecar-bin)     VLLM_SIDECAR_BIN="$2"; shift 2 ;;
+        --max-concurrent-requests) MAX_CONCURRENT_REQUESTS="$2"; shift 2 ;;
         --profile-target)       PROFILE_TARGET="$2"; shift 2 ;;
         --require-managed-infra) REQUIRE_MANAGED_INFRA=true; shift ;;
         --allow-aiperf-saturation-failures) ALLOW_AIPERF_SATURATION_FAILURES=true; shift ;;
@@ -201,6 +213,14 @@ Service Options:
   --aiperf-export-level N   AIPerf summary|records|raw export level
   --aiperf-dataset-entries N
                             Synthetic dataset entries to materialize (default: 12800)
+  --aiperf-scenario NAME    AIPerf locked scenario (for example inferencex-agentx-mvp)
+  --aiperf-public-dataset NAME
+                            AIPerf public dataset used by a scenario
+  --aiperf-max-context-length N
+                            Maximum prompt plus output context accepted from a trace
+  --aiperf-workers N        Explicit AIPerf request-worker count
+  --aiperf-record-processors N
+                            Explicit AIPerf record-processor count, identical across arms
   --allow-aiperf-saturation-failures
                             Accept complete timeout/HTTP 500/503 records exports when AIPerf exits nonzero
   --require-aiperf-version V
@@ -214,6 +234,8 @@ Service Options:
   --vllm-mocker-server-bin PATH
                             Built dynamo-vllm-mocker-server executable
   --vllm-sidecar-bin PATH   Built dynamo-vllm-sidecar executable
+  --max-concurrent-requests N
+                            Mocker admission ceiling (default: 8192)
   --profile-target TARGET   frontend|backend|all process set for profiling
   --require-managed-infra   Reject pre-existing etcd or NATS processes
 
@@ -256,13 +278,28 @@ case "$AIPERF_EXPORT_LEVEL" in
     summary|records|raw) ;;
     *) echo "ERROR: unsupported --aiperf-export-level '$AIPERF_EXPORT_LEVEL'"; exit 1 ;;
 esac
-for _positive_name in GRPC_CONNECTIONS GRPC_PORT AIPERF_SHARDS AIPERF_DATASET_ENTRIES; do
+for _positive_name in GRPC_CONNECTIONS GRPC_PORT AIPERF_SHARDS AIPERF_DATASET_ENTRIES MAX_CONCURRENT_REQUESTS; do
     _positive_value="${!_positive_name}"
     if [[ ! "$_positive_value" =~ ^[1-9][0-9]*$ ]]; then
         echo "ERROR: $_positive_name must be a positive integer, got '$_positive_value'"
         exit 1
     fi
 done
+for _optional_positive_name in AIPERF_MAX_CONTEXT_LENGTH AIPERF_WORKERS AIPERF_RECORD_PROCESSORS; do
+    _optional_positive_value="${!_optional_positive_name}"
+    if [[ -n "$_optional_positive_value" && ! "$_optional_positive_value" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: $_optional_positive_name must be a positive integer, got '$_optional_positive_value'"
+        exit 1
+    fi
+done
+if [[ -n "$AIPERF_SCENARIO" && -z "$AIPERF_PUBLIC_DATASET" ]]; then
+    echo "ERROR: --aiperf-scenario requires --aiperf-public-dataset"
+    exit 1
+fi
+if [[ -n "$AIPERF_SCENARIO" && ( -n "$REQUEST_RATE" || "$AIPERF_SHARDS" -ne 1 ) ]]; then
+    echo "ERROR: scenario workloads forbid request-rate control and AIPerf process sharding"
+    exit 1
+fi
 for _grace_name in BENCHMARK_GRACE_PERIOD REQUEST_TIMEOUT_SECONDS WARMUP_GRACE_PERIOD; do
     _grace_value="${!_grace_name}"
     if [[ -n "$_grace_value" && ! "$_grace_value" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
@@ -308,15 +345,9 @@ INFRA_CPU_PREFIX=()
 [[ -n "$LOADGEN_CPUSET" ]] && LOADGEN_CPU_PREFIX=(taskset --cpu-list "$LOADGEN_CPUSET")
 [[ -n "$INFRA_CPUSET" ]] && INFRA_CPU_PREFIX=(taskset --cpu-list "$INFRA_CPUSET")
 
-# AIPerf 0.10.0 can strand the final direct-Mocker timeout record when multiple
-# processors drain that phase, while sidecar saturation can emit hundreds of
-# thousands of immediate 5xx records and needs parallel draining. Exact boundary
-# validation covers these topology-specific settings; request workers retain the
-# full load-generator CPU set in both cases.
-AIPERF_RECORD_PROCESSOR_BUDGET=1
-if [[ "$BACKEND_MODE" == "vllm-sidecar-mocker" ]]; then
-    AIPERF_RECORD_PROCESSOR_BUDGET=16
-fi
+# Keep record processing identical across arms. A scenario may set this explicitly
+# for a high-rate run; otherwise retain the conservative historical default.
+AIPERF_RECORD_PROCESSOR_BUDGET="${AIPERF_RECORD_PROCESSORS:-1}"
 
 # Default model-name to model if not set
 [[ -z "$MODEL_NAME" ]] && MODEL_NAME="$MODEL"
@@ -640,7 +671,7 @@ else
     VLLM_SERVER_ARGS=(
         --listen "127.0.0.1:$GRPC_PORT"
         --model "$MODEL_NAME"
-        --max-concurrent-requests 8192
+        --max-concurrent-requests "$MAX_CONCURRENT_REQUESTS"
     )
     [[ -n "$MOCKER_CONFIG" ]] && VLLM_SERVER_ARGS+=(--extra-engine-args "$MOCKER_CONFIG")
     "${BACKEND_CPU_PREFIX[@]}" "$VLLM_MOCKER_SERVER_BIN" "${VLLM_SERVER_ARGS[@]}" \
@@ -1006,6 +1037,7 @@ CAPTURE_PIDS+=($!)
 echo ""
 echo "--- Running aiperf load ---"
 echo "  concurrency=$CONCURRENCY  requests=${NUM_REQUESTS:-auto}  isl=$ISL  osl=$OSL"
+[[ -n "$AIPERF_SCENARIO" ]] && echo "  scenario=$AIPERF_SCENARIO dataset=$AIPERF_PUBLIC_DATASET"
 [[ -n "$BENCHMARK_DURATION" ]] && echo "  benchmark-duration=${BENCHMARK_DURATION}s"
 [[ -n "$REQUEST_RATE" ]] && echo "  request-rate=${REQUEST_RATE} req/s"
 
@@ -1034,7 +1066,12 @@ if [[ ${#_LOAD_ARGS[@]} -eq 0 ]]; then
 fi
 
 _WARMUP_ARGS=()
-if [[ -n "$WARMUP_DURATION" ]]; then
+if [[ -n "$AIPERF_SCENARIO" ]]; then
+    if [[ -n "$WARMUP_DURATION$WARMUP_COUNT$WARMUP_GRACE_PERIOD" ]]; then
+        echo "ERROR: scenario workloads own warmup and cannot use explicit warmup flags"
+        exit 1
+    fi
+elif [[ -n "$WARMUP_DURATION" ]]; then
     _WARMUP_ARGS+=(--warmup-duration "$WARMUP_DURATION")
 elif [[ -n "$WARMUP_COUNT" ]]; then
     if (( WARMUP_COUNT % AIPERF_SHARDS != 0 )); then
@@ -1117,6 +1154,31 @@ for _AIPERF_MODEL in "${_AIPERF_MODELS[@]}"; do
         _SHARD_RECORD_PROCESSORS=$((AIPERF_RECORD_PROCESSOR_BUDGET / AIPERF_SHARDS))
         [[ "$_SHARD_RECORD_PROCESSORS" -lt 1 ]] && _SHARD_RECORD_PROCESSORS=1
         _SHARD_LABEL="${_AIPERF_MODEL//\//_}_shard_${_shard}"
+        _AIPERF_WORKLOAD_ARGS=()
+        if [[ -n "$AIPERF_SCENARIO" ]]; then
+            _AIPERF_WORKLOAD_ARGS+=(
+                --scenario "$AIPERF_SCENARIO"
+                --public-dataset "$AIPERF_PUBLIC_DATASET"
+                --max-context-length "$AIPERF_MAX_CONTEXT_LENGTH"
+                --use-server-token-count
+            )
+        else
+            _AIPERF_WORKLOAD_ARGS+=(
+                --synthetic-input-tokens-mean "$ISL"
+                --synthetic-input-tokens-stddev 0
+                --output-tokens-mean "$OSL"
+                --output-tokens-stddev 0
+                --extra-inputs max_tokens:"$OSL"
+                --extra-inputs min_tokens:"$OSL"
+                --extra-inputs ignore_eos:true
+                --extra-inputs repetition_penalty:1.0
+                --extra-inputs temperature:0.0
+                "${_EXACT_PROMPT_ARGS[@]}"
+                --num-dataset-entries "$AIPERF_DATASET_ENTRIES"
+            )
+        fi
+        _AIPERF_RUNTIME_ARGS=()
+        [[ -n "$AIPERF_WORKERS" ]] && _AIPERF_RUNTIME_ARGS+=(--workers-max "$AIPERF_WORKERS")
         "${LOADGEN_CPU_PREFIX[@]}" "${AIPERF_ENV[@]}" aiperf profile --artifact-dir "$_SHARD_ARTIFACT_DIR" \
             --model "$_AIPERF_MODEL" \
             "${_AIPERF_TOK_ARGS[@]}" \
@@ -1125,22 +1187,13 @@ for _AIPERF_MODEL in "${_AIPERF_MODELS[@]}"; do
             --streaming \
             --url "http://127.0.0.1:$FRONTEND_PORT" \
             "${_REQUEST_TIMEOUT_ARGS[@]}" \
-            --synthetic-input-tokens-mean "$ISL" \
-            --synthetic-input-tokens-stddev 0 \
-            --output-tokens-mean "$OSL" \
-            --output-tokens-stddev 0 \
-            --extra-inputs max_tokens:"$OSL" \
-            --extra-inputs min_tokens:"$OSL" \
-            --extra-inputs ignore_eos:true \
-            --extra-inputs repetition_penalty:1.0 \
-            --extra-inputs temperature:0.0 \
-            "${_EXACT_PROMPT_ARGS[@]}" \
+            "${_AIPERF_WORKLOAD_ARGS[@]}" \
             --concurrency "$_SHARD_CONCURRENCY" \
             "${_SHARD_LOAD_ARGS[@]}" \
             "${_WARMUP_ARGS[@]}" \
-            --num-dataset-entries "$AIPERF_DATASET_ENTRIES" \
             --random-seed "$RANDOM_SEED" \
             --record-processors "$_SHARD_RECORD_PROCESSORS" \
+            "${_AIPERF_RUNTIME_ARGS[@]}" \
             --export-level "$AIPERF_EXPORT_LEVEL" \
             --ui simple > "$OUTPUT_DIR/logs/aiperf_${_SHARD_LABEL}.log" 2>&1 &
         AIPERF_PIDS+=("$!")
@@ -1148,12 +1201,55 @@ for _AIPERF_MODEL in "${_AIPERF_MODELS[@]}"; do
     done
 done
 
+AIPERF_MONITOR_PID=""
+(
+    while true; do
+        _any_live=false
+        for _root_pid in "${AIPERF_PIDS[@]}"; do
+            if kill -0 "$_root_pid" 2>/dev/null; then
+                _any_live=true
+                break
+            fi
+        done
+        [[ "$_any_live" == true ]] || break
+        _monitor_ts=$(date -Iseconds)
+        echo "--- $_monitor_ts ---" >> "$OUTPUT_DIR/system/loadgen_cpu_stat.txt"
+        cat /proc/stat >> "$OUTPUT_DIR/system/loadgen_cpu_stat.txt"
+        _pending_pids=("${AIPERF_PIDS[@]}")
+        _all_loadgen_pids=()
+        _pid_index=0
+        while [[ "$_pid_index" -lt "${#_pending_pids[@]}" ]]; do
+            _pid_cursor="${_pending_pids[$_pid_index]}"
+            _pid_index=$((_pid_index + 1))
+            [[ -d "/proc/$_pid_cursor" ]] || continue
+            _all_loadgen_pids+=("$_pid_cursor")
+            while read -r _child_pid; do
+                [[ -n "$_child_pid" ]] && _pending_pids+=("$_child_pid")
+            done < <(pgrep -P "$_pid_cursor" 2>/dev/null || true)
+        done
+        _max_fds=0
+        _total_fds=0
+        for _loadgen_pid in "${_all_loadgen_pids[@]}"; do
+            _loadgen_fd_entries=("/proc/$_loadgen_pid/fd/"*)
+            _loadgen_fds=${#_loadgen_fd_entries[@]}
+            _total_fds=$((_total_fds + _loadgen_fds))
+            [[ "$_loadgen_fds" -gt "$_max_fds" ]] && _max_fds="$_loadgen_fds"
+        done
+        _http_sockets=$(ss -Hnt state established "( dport = :$FRONTEND_PORT )" 2>/dev/null | wc -l)
+        echo "$_monitor_ts processes=${#_all_loadgen_pids[@]} total_fds=$_total_fds max_process_fds=$_max_fds http_sockets=$_http_sockets" \
+            >> "$OUTPUT_DIR/system/loadgen_counts.txt"
+        sleep 1
+    done
+) &
+AIPERF_MONITOR_PID=$!
+
 for _aiperf_idx in "${!AIPERF_PIDS[@]}"; do
     if ! wait "${AIPERF_PIDS[$_aiperf_idx]}"; then
         echo "WARNING: aiperf failed for ${AIPERF_LABELS[$_aiperf_idx]}"
         AIPERF_FAILED=true
     fi
 done
+wait "$AIPERF_MONITOR_PID" 2>/dev/null || true
 
 AIPERF_SATURATION_FAILURES_ACCEPTED=false
 if [[ "$AIPERF_FAILED" == true && "$ALLOW_AIPERF_SATURATION_FAILURES" == true ]]; then
@@ -1375,6 +1471,7 @@ cat > "$OUTPUT_DIR/config.json" <<EOF
   "backend_pids": $(printf '%s\n' "${BACKEND_PIDS[@]}" | jq -R 'tonumber' | jq -s .),
   "grpc_connections": $GRPC_CONNECTIONS,
   "grpc_port": $GRPC_PORT,
+  "max_concurrent_requests": $MAX_CONCURRENT_REQUESTS,
   "mocker_config": "$MOCKER_CONFIG",
   "mocker_config_sha256": "$MOCKER_CONFIG_SHA256",
   "vllm_mocker_server": "$VLLM_MOCKER_SERVER_BIN",
@@ -1400,6 +1497,12 @@ cat > "$OUTPUT_DIR/config.json" <<EOF
   "exact_input_token_id": ${EXACT_INPUT_TOKEN_ID:-null},
   "warmup_grace_period": ${WARMUP_GRACE_PERIOD:-null},
   "aiperf_dataset_entries": $AIPERF_DATASET_ENTRIES,
+  "aiperf_scenario": "${AIPERF_SCENARIO}",
+  "aiperf_public_dataset": "${AIPERF_PUBLIC_DATASET}",
+  "aiperf_max_context_length": ${AIPERF_MAX_CONTEXT_LENGTH:-null},
+  "aiperf_workers": ${AIPERF_WORKERS:-null},
+  "aiperf_record_processors": ${AIPERF_RECORD_PROCESSORS:-null},
+  "open_file_limit": $(ulimit -n),
   "aiperf_shards": $AIPERF_SHARDS,
   "aiperf_export_level": "$AIPERF_EXPORT_LEVEL",
   "aiperf_failed": $AIPERF_FAILED,

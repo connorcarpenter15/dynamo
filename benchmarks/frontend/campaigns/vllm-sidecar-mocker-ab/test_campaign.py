@@ -114,14 +114,14 @@ class CampaignDryRunTest(unittest.TestCase):
             infra="40-47",
             physical_cores=48,
         )
-        legs = campaign.build_resolved_plan(manifest, selected_shards=4)
+        legs = campaign.build_resolved_plan(manifest, selected_shards=1)
         main = [leg for leg in legs if leg["phase"] == "main"]
-        self.assertEqual(len(main), 112)
+        self.assertEqual(len(main), 28)
         grouped: dict[str, list[dict]] = {}
         for leg in main:
             grouped.setdefault(leg["metadata"]["point_key"], []).append(leg)
         expected_crossover = manifest["main_matrix"]["crossover"]
-        self.assertEqual(len(grouped), 28)
+        self.assertEqual(len(grouped), 7)
         self.assertTrue(
             all(
                 [leg["arm"] for leg in point] == expected_crossover
@@ -136,7 +136,8 @@ class CampaignDryRunTest(unittest.TestCase):
         self.assertEqual(mocker_config["worker_type"], "aggregated")
         self.assertEqual(mocker_config["block_size"], 64)
         self.assertFalse(mocker_config["enable_prefix_caching"])
-        self.assertEqual(mocker_config["max_num_seqs"], 8192)
+        self.assertEqual(mocker_config["max_num_seqs"], 524288)
+        self.assertEqual(manifest["transport"]["max_concurrent_requests"], 524288)
         self.assertGreaterEqual(mocker_config["num_gpu_blocks"], 4_194_304)
         model_path = campaign.REPO_ROOT / manifest["fixture"]["model"]
         tokenizer = json.loads(
@@ -150,9 +151,7 @@ class CampaignDryRunTest(unittest.TestCase):
         model_config = json.loads(
             (model_path / "config.json").read_text(encoding="utf-8")
         )
-        required_context = max(manifest["main_matrix"]["input_tokens"]) + max(
-            manifest["main_matrix"]["output_tokens"]
-        )
+        required_context = manifest["workload"]["max_context_length"]
         self.assertGreaterEqual(
             model_config["max_position_embeddings"], required_context
         )
@@ -203,16 +202,17 @@ class CampaignDryRunTest(unittest.TestCase):
                 "--loadgen-cpuset",
                 "--infra-cpuset",
                 "--concurrency",
-                "--isl",
-                "--osl",
                 "--aiperf-shards",
                 "--require-aiperf-version",
                 "--random-seed",
-                "--exact-input-token-id",
-                "--warmup-grace-period",
                 "--benchmark-grace-period",
                 "--request-timeout-seconds",
-                "--aiperf-dataset-entries",
+                "--aiperf-scenario",
+                "--aiperf-public-dataset",
+                "--aiperf-max-context-length",
+                "--aiperf-workers",
+                "--aiperf-record-processors",
+                "--max-concurrent-requests",
             ]:
                 self.assertEqual(
                     campaign.flag_value(direct, flag),
@@ -220,18 +220,18 @@ class CampaignDryRunTest(unittest.TestCase):
                     flag,
                 )
             self.assertEqual(
-                campaign.flag_value(direct, "--exact-input-token-id"),
-                str(manifest["fixture"]["exact_input_token_id"]),
-            )
-            self.assertEqual(campaign.flag_value(direct, "--warmup-grace-period"), "15")
-            self.assertEqual(
-                campaign.flag_value(direct, "--benchmark-grace-period"), "15"
+                campaign.flag_value(direct, "--benchmark-grace-period"), "300"
             )
             self.assertEqual(
-                campaign.flag_value(direct, "--request-timeout-seconds"), "15"
+                campaign.flag_value(direct, "--request-timeout-seconds"), "300"
             )
             self.assertEqual(
-                campaign.flag_value(direct, "--aiperf-dataset-entries"), "1"
+                campaign.flag_value(direct, "--aiperf-scenario"),
+                "inferencex-agentx-mvp",
+            )
+            self.assertEqual(
+                campaign.flag_value(direct, "--aiperf-public-dataset"),
+                "semianalysis_cc_traces_weka_062126_256k",
             )
             self.assertNotEqual(
                 campaign.flag_value(direct, "--namespace"),
