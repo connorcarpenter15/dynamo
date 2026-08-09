@@ -1120,6 +1120,12 @@ if [[ -d "$MODEL" ]]; then
 else
     AIPERF_ENV=(env HF_HUB_OFFLINE=1)
 fi
+_AIPERF_DATASET_MMAP_CACHE_DIR=${AIPERF_DATASET_MMAP_CACHE_DIR:-${XDG_CACHE_HOME:-${TMPDIR:-/tmp}}/aiperf/dataset_mmap}
+_AIPERF_DATASET_MMAP_BASE_PATH=${AIPERF_DATASET_MMAP_BASE_PATH:-${TMPDIR:-/tmp}/aiperf_mmap}
+AIPERF_ENV+=(
+    AIPERF_DATASET_MMAP_CACHE_DIR="$_AIPERF_DATASET_MMAP_CACHE_DIR"
+    AIPERF_DATASET_MMAP_BASE_PATH="$_AIPERF_DATASET_MMAP_BASE_PATH"
+)
 for _AIPERF_MODEL in "${_AIPERF_MODELS[@]}"; do
     if [[ ${#_AIPERF_MODELS[@]} -gt 1 ]]; then
         AIPERF_ARTIFACT_DIR="$OUTPUT_DIR/aiperf/${_AIPERF_MODEL}"
@@ -1502,6 +1508,8 @@ cat > "$OUTPUT_DIR/config.json" <<EOF
   "aiperf_max_context_length": ${AIPERF_MAX_CONTEXT_LENGTH:-null},
   "aiperf_workers": ${AIPERF_WORKERS:-null},
   "aiperf_record_processors": ${AIPERF_RECORD_PROCESSORS:-null},
+  "aiperf_dataset_mmap_cache_dir": "$_AIPERF_DATASET_MMAP_CACHE_DIR",
+  "aiperf_dataset_mmap_base_path": "$_AIPERF_DATASET_MMAP_BASE_PATH",
   "open_file_limit": $(ulimit -n),
   "aiperf_shards": $AIPERF_SHARDS,
   "aiperf_export_level": "$AIPERF_EXPORT_LEVEL",
