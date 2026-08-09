@@ -190,6 +190,9 @@ class CampaignDryRunTest(unittest.TestCase):
             self.assertNotIn("--request-rate", sidecar)
             self.assertIn("--allow-aiperf-saturation-failures", direct)
             self.assertIn("--allow-aiperf-saturation-failures", sidecar)
+            self.assertIn("--aiperf-burst-phase-starts", direct)
+            self.assertIn("--aiperf-burst-phase-starts", sidecar)
+            self.assertTrue(manifest["workload"]["burst_phase_starts"])
             self.assertEqual(
                 campaign.flag_value(direct, "--model"),
                 campaign.flag_value(direct, "--model-name"),

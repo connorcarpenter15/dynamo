@@ -10,7 +10,7 @@ This campaign compares the direct Python vLLM Mocker LiveEngine boundary with `d
 ## Locked workload
 
 - AIPerf 0.12.0 at the exact commit in `manifest.json`.
-- Scenario `inferencex-agentx-mvp` with `semianalysis_cc_traces_weka_062126_256k`, chat streaming, server token counts, a 262,144-token context limit, and seed `20260809`.
+- Scenario `inferencex-agentx-mvp` with `semianalysis_cc_traces_weka_062126_256k`, chat streaming, server token counts, a 262,144-token context limit, seed `20260809`, and throughput-oriented burst phase starts. Trace selection and inter-turn timing remain AgentX-faithful; only the multi-day recorded warmup/profiling boundary ramps are collapsed.
 - Live trajectory-tree concurrency `{1024,4096,8192,16384,32768,65536,131072}`.
 - Four 900-second legs per point in crossover order `direct, sidecar, sidecar, direct`.
 - One 131,072-concurrency qualification leg before measurement. It rejects load-generator CPU, trajectory realization, FD, socket, or admission-queue contamination.

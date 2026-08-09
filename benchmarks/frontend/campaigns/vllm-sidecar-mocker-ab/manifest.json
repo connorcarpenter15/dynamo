@@ -42,6 +42,7 @@
     "trajectory_start_max_ratio": 1.0,
     "cache_bust": "first_turn_prefix",
     "system_idle_gap_cap_seconds": 10.0,
+    "burst_phase_starts": true,
     "ignore_eos": true
   },
   "tools": {

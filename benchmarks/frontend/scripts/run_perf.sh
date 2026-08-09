@@ -81,6 +81,7 @@ AIPERF_PUBLIC_DATASET="${AIPERF_PUBLIC_DATASET:-}"
 AIPERF_MAX_CONTEXT_LENGTH="${AIPERF_MAX_CONTEXT_LENGTH:-}"
 AIPERF_WORKERS="${AIPERF_WORKERS:-}"
 AIPERF_RECORD_PROCESSORS="${AIPERF_RECORD_PROCESSORS:-}"
+AIPERF_BURST_PHASE_STARTS=false
 REQUIRED_AIPERF_VERSION="${REQUIRED_AIPERF_VERSION:-}"
 RANDOM_SEED="${RANDOM_SEED:-100}"
 EXACT_INPUT_TOKEN_ID="${EXACT_INPUT_TOKEN_ID:-}"
@@ -151,6 +152,7 @@ while [[ $# -gt 0 ]]; do
         --aiperf-max-context-length) AIPERF_MAX_CONTEXT_LENGTH="$2"; shift 2 ;;
         --aiperf-workers)       AIPERF_WORKERS="$2"; shift 2 ;;
         --aiperf-record-processors) AIPERF_RECORD_PROCESSORS="$2"; shift 2 ;;
+        --aiperf-burst-phase-starts) AIPERF_BURST_PHASE_STARTS=true; shift ;;
         --require-aiperf-version) REQUIRED_AIPERF_VERSION="$2"; shift 2 ;;
         --random-seed)          RANDOM_SEED="$2"; shift 2 ;;
         --exact-input-token-id) EXACT_INPUT_TOKEN_ID="$2"; shift 2 ;;
@@ -221,6 +223,8 @@ Service Options:
   --aiperf-workers N        Explicit AIPerf request-worker count
   --aiperf-record-processors N
                             Explicit AIPerf record-processor count, identical across arms
+  --aiperf-burst-phase-starts
+                            Synchronize AgentX warmup/profiling phase starts for throughput runs
   --allow-aiperf-saturation-failures
                             Accept complete timeout/HTTP 500/503 records exports when AIPerf exits nonzero
   --require-aiperf-version V
@@ -1168,6 +1172,7 @@ for _AIPERF_MODEL in "${_AIPERF_MODELS[@]}"; do
                 --max-context-length "$AIPERF_MAX_CONTEXT_LENGTH"
                 --use-server-token-count
             )
+            [[ "$AIPERF_BURST_PHASE_STARTS" == true ]] && _AIPERF_WORKLOAD_ARGS+=(--burst-phase-starts)
         else
             _AIPERF_WORKLOAD_ARGS+=(
                 --synthetic-input-tokens-mean "$ISL"
@@ -1508,6 +1513,7 @@ cat > "$OUTPUT_DIR/config.json" <<EOF
   "aiperf_max_context_length": ${AIPERF_MAX_CONTEXT_LENGTH:-null},
   "aiperf_workers": ${AIPERF_WORKERS:-null},
   "aiperf_record_processors": ${AIPERF_RECORD_PROCESSORS:-null},
+  "aiperf_burst_phase_starts": $AIPERF_BURST_PHASE_STARTS,
   "aiperf_dataset_mmap_cache_dir": "$_AIPERF_DATASET_MMAP_CACHE_DIR",
   "aiperf_dataset_mmap_base_path": "$_AIPERF_DATASET_MMAP_BASE_PATH",
   "open_file_limit": $(ulimit -n),

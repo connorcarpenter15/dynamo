@@ -587,6 +587,8 @@ def build_run_perf_command(
                 "--allow-aiperf-saturation-failures",
             ]
         )
+        if workload["burst_phase_starts"]:
+            command.append("--aiperf-burst-phase-starts")
     command.extend(["--skip-nsys", "--skip-perf", "--skip-bpf", "--skip-flamegraph"])
     return command
 
