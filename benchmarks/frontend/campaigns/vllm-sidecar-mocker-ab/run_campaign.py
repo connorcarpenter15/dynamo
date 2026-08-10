@@ -1959,6 +1959,16 @@ def analyze_campaign(output_root: Path) -> None:
     state = load_state(output_root)
     results_dir = output_root / "results"
     results_dir.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(
+        results_dir / "analysis-provenance.json",
+        {
+            "created_at": utc_now(),
+            "dynamo_commit": run_text(
+                ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"]
+            ),
+            "run_campaign_sha256": sha256_file(Path(__file__)),
+        },
+    )
     individual_rows: list[dict[str, Any]] = []
     for leg in legs:
         entry = state["legs"].get(leg["id"], {})
