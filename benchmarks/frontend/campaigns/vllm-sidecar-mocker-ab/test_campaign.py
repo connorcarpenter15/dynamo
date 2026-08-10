@@ -13,6 +13,49 @@ import run_campaign as campaign
 
 
 class CampaignDryRunTest(unittest.TestCase):
+    def test_analysis_marks_zero_completion_campaign_incomparable(self) -> None:
+        manifest = campaign.load_manifest()
+        core_legs = campaign.build_resolved_plan(manifest, selected_shards=1)
+        legs = campaign.append_connection_plan(manifest, core_legs, capacity_peak=1024)
+        state = {"schema_version": 1, "legs": {}}
+        for leg in legs:
+            if leg["phase"] not in {"main", "connections"}:
+                continue
+            state["legs"][leg["id"]] = {
+                "status": "reused" if leg["metadata"].get("reuse_from") else "complete",
+                "output_dir": "/tmp/zero-completion",
+                "metrics": {
+                    "completed_requests": 0,
+                    "failed_requests": 1,
+                    "failed_request_fraction": 1,
+                },
+            }
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            (output / "manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
+            (output / "resolved-plan.json").write_text(
+                json.dumps({"schema_version": 1, "legs": legs}), encoding="utf-8"
+            )
+            (output / "state.json").write_text(json.dumps(state), encoding="utf-8")
+            campaign.analyze_campaign(output)
+            report = (output / "results/report.md").read_text(encoding="utf-8")
+            diagnostics = json.loads(
+                (output / "results/connection-diagnostic.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+        self.assertIn("Matched pairs: 6/6", report)
+        self.assertIn("Performance-comparable pairs: 0/6", report)
+        self.assertIn("Paired-median points: 3/3", report)
+        self.assertIn("Eight-connection pool sufficiency: indeterminate", report)
+        self.assertTrue(diagnostics)
+        self.assertTrue(all(not row["performance_comparable"] for row in diagnostics))
+        self.assertTrue(
+            all(row["eight_connections_insufficient"] is None for row in diagnostics)
+        )
+
     def test_timeout_only_records_preserve_an_all_failure_leg(self) -> None:
         """Regression: genuine saturation remains analyzable without a summary export."""
         with tempfile.TemporaryDirectory() as temporary:
@@ -53,9 +96,7 @@ class CampaignDryRunTest(unittest.TestCase):
         self.assertEqual(metrics["failed_requests"], 1)
         self.assertEqual(metrics["failed_request_fraction"], 1)
         self.assertEqual(metrics["output_throughput_tps"], 0)
-        self.assertEqual(
-            submission_status, "unavailable_all_failure_saturation"
-        )
+        self.assertEqual(submission_status, "unavailable_all_failure_saturation")
         metrics["completed_requests"] = 1
         with self.assertRaisesRegex(
             campaign.CampaignError, "scenario submission metadata is absent"

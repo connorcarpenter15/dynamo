@@ -1336,9 +1336,7 @@ def agentx_submission_status(
             or entry.get("submission_valid") is not True
             for entry in metadata
         ):
-            raise CampaignError(
-                f"AgentX scenario submission was not valid: {metadata}"
-            )
+            raise CampaignError(f"AgentX scenario submission was not valid: {metadata}")
         return "valid"
     if (
         accepted_saturation
@@ -2067,6 +2065,12 @@ def analyze_campaign(output_root: Path) -> None:
             "sidecar_leg_id": sidecar["leg_id"],
             "direct_failed_request_fraction": direct["failed_request_fraction"],
             "sidecar_failed_request_fraction": sidecar["failed_request_fraction"],
+            "direct_completed_requests": direct["completed_requests"],
+            "sidecar_completed_requests": sidecar["completed_requests"],
+            "performance_comparable": bool(
+                float(direct["completed_requests"]) > 0
+                and float(sidecar["completed_requests"]) > 0
+            ),
         }
         for metric_name, ratio_name in comparison_metrics.items():
             direct_value = float(direct[metric_name])
@@ -2155,14 +2159,24 @@ def analyze_campaign(output_root: Path) -> None:
         throughput_16 = median(rows_16, "output_throughput_tps")
         failures_8 = median(rows_8, "failed_request_fraction")
         failures_16 = median(rows_16, "failed_request_fraction")
-        throughput_improvement = ratio(throughput_16, throughput_8) - 1.0
+        comparable = bool(
+            median(rows_8, "completed_requests") > 0
+            and median(rows_16, "completed_requests") > 0
+        )
+        throughput_improvement = (
+            ratio(throughput_16, throughput_8) - 1.0 if comparable else math.nan
+        )
         failure_reduction = failures_8 - failures_16
         insufficient = (
-            throughput_improvement
-            > float(diagnostic["insufficient_throughput_improvement_fraction"])
-            or failure_reduction
-            > float(diagnostic["insufficient_failure_reduction_percentage_points"])
-            / 100.0
+            (
+                throughput_improvement
+                > float(diagnostic["insufficient_throughput_improvement_fraction"])
+                or failure_reduction
+                > float(diagnostic["insufficient_failure_reduction_percentage_points"])
+                / 100.0
+            )
+            if comparable
+            else None
         )
         diagnostic_summary.append(
             {
@@ -2170,6 +2184,7 @@ def analyze_campaign(output_root: Path) -> None:
                 "throughput_improvement_fraction_16_vs_8": throughput_improvement,
                 "failure_reduction_fraction_16_vs_8": failure_reduction,
                 "eight_connections_insufficient": insufficient,
+                "performance_comparable": comparable,
             }
         )
     atomic_write_json(results_dir / "connection-diagnostic.json", diagnostic_summary)
@@ -2191,19 +2206,53 @@ def analyze_campaign(output_root: Path) -> None:
 
     complete_main = len(main_rows)
     expected_main = len([leg for leg in legs if leg["phase"] == "main"])
-    pool_insufficient = any(
-        row["eight_connections_insufficient"] for row in diagnostic_summary
+    pool_decisions = [
+        row["eight_connections_insufficient"]
+        for row in diagnostic_summary
+        if row["eight_connections_insufficient"] is not None
+    ]
+    pool_status = (
+        "insufficient"
+        if any(pool_decisions)
+        else "sufficient"
+        if pool_decisions
+        else "indeterminate (no completed requests)"
     )
+    expected_pairs = len(
+        {
+            (
+                int(leg["input_tokens"]),
+                int(leg["output_tokens"]),
+                int(leg["concurrency"]),
+                int(leg["metadata"]["pair_index"]),
+            )
+            for leg in legs
+            if leg["phase"] == "main"
+        }
+    )
+    expected_points = len(
+        {
+            (
+                int(leg["input_tokens"]),
+                int(leg["output_tokens"]),
+                int(leg["concurrency"]),
+            )
+            for leg in legs
+            if leg["phase"] == "main"
+        }
+    )
+    comparable_pairs = sum(bool(row["performance_comparable"]) for row in paired_rows)
     report_lines = [
         "# CPU-Only vLLM Sidecar A/B Campaign",
         "",
         "## Completion",
         "",
         f"- Main legs: {complete_main}/{expected_main}",
-        f"- Matched pairs: {len(paired_rows)}/14",
-        f"- Paired-median points: {len(paired_medians)}/7",
+        f"- Matched pairs: {len(paired_rows)}/{expected_pairs}",
+        f"- Performance-comparable pairs: {comparable_pairs}/{expected_pairs}",
+        f"- Paired-median points: {len(paired_medians)}/{expected_points}",
         f"- Flagged points: {len(flagged_points)}",
-        f"- Eight-connection pool insufficient: {'yes' if pool_insufficient else 'no'}",
+        f"- Eight-connection pool sufficiency: {pool_status}",
         "",
         "## Flagged points",
         "",
