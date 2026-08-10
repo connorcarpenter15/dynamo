@@ -50,7 +50,7 @@
     "aiperf_version": "0.12.0",
     "aiperf_commit": "8f64c88eef3a5e28f89f4f1e3b9afa6cfb3e295a",
     "aiperf_export_level": "records",
-    "aiperf_workers": 64,
+    "aiperf_workers": 48,
     "aiperf_record_processors": 16,
     "aiperf_loopback_targets": 8,
     "aiperf_http_connection_limit": 8192,
