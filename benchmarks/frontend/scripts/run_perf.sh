@@ -83,6 +83,7 @@ AIPERF_WORKERS="${AIPERF_WORKERS:-}"
 AIPERF_RECORD_PROCESSORS="${AIPERF_RECORD_PROCESSORS:-}"
 AIPERF_LOOPBACK_TARGETS="${AIPERF_LOOPBACK_TARGETS:-1}"
 AIPERF_BURST_PHASE_STARTS=false
+AIPERF_ALLOW_AGENTIC_WARMUP_FAILURES=false
 AIPERF_CONCURRENCY_RAMP_DURATION="${AIPERF_CONCURRENCY_RAMP_DURATION:-}"
 REQUIRED_AIPERF_VERSION="${REQUIRED_AIPERF_VERSION:-}"
 RANDOM_SEED="${RANDOM_SEED:-100}"
@@ -156,6 +157,7 @@ while [[ $# -gt 0 ]]; do
         --aiperf-record-processors) AIPERF_RECORD_PROCESSORS="$2"; shift 2 ;;
         --aiperf-loopback-targets) AIPERF_LOOPBACK_TARGETS="$2"; shift 2 ;;
         --aiperf-burst-phase-starts) AIPERF_BURST_PHASE_STARTS=true; shift ;;
+        --aiperf-allow-agentic-warmup-failures) AIPERF_ALLOW_AGENTIC_WARMUP_FAILURES=true; shift ;;
         --aiperf-concurrency-ramp-duration) AIPERF_CONCURRENCY_RAMP_DURATION="$2"; shift 2 ;;
         --require-aiperf-version) REQUIRED_AIPERF_VERSION="$2"; shift 2 ;;
         --random-seed)          RANDOM_SEED="$2"; shift 2 ;;
@@ -231,6 +233,8 @@ Service Options:
                             Round-robin over 127.0.0.1..N to expand local TCP tuple space
   --aiperf-burst-phase-starts
                             Synchronize AgentX warmup/profiling phase starts for throughput runs
+  --aiperf-allow-agentic-warmup-failures
+                            Preserve terminal warmup failures and continue into AgentX profiling
   --aiperf-concurrency-ramp-duration N
                             Ramp warmup/profiling session concurrency over N seconds
   --allow-aiperf-saturation-failures
@@ -1208,6 +1212,7 @@ for _AIPERF_MODEL in "${_AIPERF_MODELS[@]}"; do
         fi
         _AIPERF_RUNTIME_ARGS=()
         [[ -n "$AIPERF_WORKERS" ]] && _AIPERF_RUNTIME_ARGS+=(--workers-max "$AIPERF_WORKERS")
+        [[ "$AIPERF_ALLOW_AGENTIC_WARMUP_FAILURES" == true ]] && _AIPERF_RUNTIME_ARGS+=(--allow-agentic-warmup-failures)
         [[ -n "$AIPERF_CONCURRENCY_RAMP_DURATION" ]] && _AIPERF_RUNTIME_ARGS+=(--concurrency-ramp-duration "$AIPERF_CONCURRENCY_RAMP_DURATION")
         "${LOADGEN_CPU_PREFIX[@]}" "${AIPERF_ENV[@]}" aiperf profile --artifact-dir "$_SHARD_ARTIFACT_DIR" \
             --model "$_AIPERF_MODEL" \
@@ -1534,6 +1539,7 @@ cat > "$OUTPUT_DIR/config.json" <<EOF
   "aiperf_record_processors": ${AIPERF_RECORD_PROCESSORS:-null},
   "aiperf_loopback_targets": $AIPERF_LOOPBACK_TARGETS,
   "aiperf_burst_phase_starts": $AIPERF_BURST_PHASE_STARTS,
+  "aiperf_allow_agentic_warmup_failures": $AIPERF_ALLOW_AGENTIC_WARMUP_FAILURES,
   "aiperf_concurrency_ramp_duration": ${AIPERF_CONCURRENCY_RAMP_DURATION:-null},
   "aiperf_dataset_mmap_cache_dir": "$_AIPERF_DATASET_MMAP_CACHE_DIR",
   "aiperf_dataset_mmap_base_path": "$_AIPERF_DATASET_MMAP_BASE_PATH",

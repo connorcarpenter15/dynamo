@@ -48,7 +48,7 @@
   },
   "tools": {
     "aiperf_version": "0.12.0",
-    "aiperf_commit": "8f64c88eef3a5e28f89f4f1e3b9afa6cfb3e295a",
+    "aiperf_commit": "5f3d9be1c00de454b7ae989f326dd6cb84d02372",
     "aiperf_export_level": "records",
     "aiperf_workers": 48,
     "aiperf_record_processors": 16,
@@ -59,7 +59,8 @@
     "aiperf_profile_configure_timeout_seconds": 1800,
     "aiperf_process_records_timeout_seconds": 1800,
     "request_timeout_seconds": 300,
-    "allow_aiperf_saturation_failures": true
+    "allow_aiperf_saturation_failures": true,
+    "allow_agentic_warmup_failures": true
   },
   "transport": {
     "request_plane": "tcp",

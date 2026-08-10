@@ -591,6 +591,8 @@ def build_run_perf_command(
                 "--allow-aiperf-saturation-failures",
             ]
         )
+        if manifest["tools"]["allow_agentic_warmup_failures"]:
+            command.append("--aiperf-allow-agentic-warmup-failures")
         if workload["burst_phase_starts"]:
             command.append("--aiperf-burst-phase-starts")
     command.extend(["--skip-nsys", "--skip-perf", "--skip-bpf", "--skip-flamegraph"])
@@ -1383,6 +1385,9 @@ def validate_leg_output(
                 "request_timeout_seconds": manifest["tools"]["request_timeout_seconds"],
                 "allow_aiperf_saturation_failures": manifest["tools"][
                     "allow_aiperf_saturation_failures"
+                ],
+                "aiperf_allow_agentic_warmup_failures": manifest["tools"][
+                    "allow_agentic_warmup_failures"
                 ],
             }
         )
