@@ -963,6 +963,19 @@ fi
 echo "  [system] /proc stats, thread/fd count, ss"
 (
     [[ -n "$INFRA_CPUSET" ]] && taskset --pid --cpu-list "$INFRA_CPUSET" "$BASHPID" >/dev/null
+    summarize_socket_queues() {
+        local _timestamp="$1"
+        local _plane="$2"
+        local _filter="${3:-}"
+        if [[ -n "$_filter" ]]; then
+            ss -Hnt "$_filter"
+        else
+            ss -Hnt
+        fi 2>/dev/null | awk -v ts="$_timestamp" -v plane="$_plane" '
+            { sockets += 1; recv_sum += $2; send_sum += $3; if ($2 > recv_max) recv_max = $2; if ($3 > send_max) send_max = $3 }
+            END { printf "%s plane=%s sockets=%d recv_q_sum=%d recv_q_max=%d send_q_sum=%d send_q_max=%d\n", ts, plane, sockets, recv_sum, recv_max, send_sum, send_max }
+        '
+    }
     INTERVAL=1
     for _i in $(seq 1 "$CAPTURE_DURATION"); do
         TS=$(date -Iseconds)
@@ -995,9 +1008,13 @@ echo "  [system] /proc stats, thread/fd count, ss"
             fi
         done
 
-        # Socket stats
-        echo "--- $TS ---" >> "$OUTPUT_DIR/system/ss_stats.txt"
-        ss -tin >> "$OUTPUT_DIR/system/ss_stats.txt" 2>/dev/null || true
+        # Bounded socket queue summaries. Recording `ss -tin` verbatim grows with
+        # concurrency and can create multi-gigabyte telemetry files during long runs.
+        summarize_socket_queues "$TS" all_tcp >> "$OUTPUT_DIR/system/ss_stats.txt" || true
+        summarize_socket_queues "$TS" frontend_http "( sport = :$FRONTEND_PORT or dport = :$FRONTEND_PORT )" >> "$OUTPUT_DIR/system/ss_stats.txt" || true
+        if [[ "$BACKEND_MODE" == "vllm-sidecar-mocker" ]]; then
+            summarize_socket_queues "$TS" vllm_grpc "( sport = :$GRPC_PORT or dport = :$GRPC_PORT )" >> "$OUTPUT_DIR/system/ss_stats.txt" || true
+        fi
 
         sleep "$INTERVAL"
     done
