@@ -1318,6 +1318,10 @@ if [[ "$AIPERF_FAILED" == true && "$ALLOW_AIPERF_SATURATION_FAILURES" == true ]]
               and all($records[];
                 .error == null
                 or .error.type == "TimeoutError"
+                or (
+                    .error.type == "ClientOSError"
+                    and ((.error.cause_chain // []) | index("TimeoutError")) != null
+                )
                 or .error.code == 500
                 or .error.code == 503)
         ' "$_record_export" >/dev/null; then
@@ -1326,6 +1330,10 @@ if [[ "$AIPERF_FAILED" == true && "$ALLOW_AIPERF_SATURATION_FAILURES" == true ]]
         if jq -s -e '
             any(.[] | select(.metadata.benchmark_phase == "profiling");
                 .error.type? == "TimeoutError"
+                or (
+                    .error.type? == "ClientOSError"
+                    and ((.error.cause_chain // []) | index("TimeoutError")) != null
+                )
                 or .error.code? == 500
                 or .error.code? == 503)
         ' "$_record_export" >/dev/null; then
@@ -1334,7 +1342,7 @@ if [[ "$AIPERF_FAILED" == true && "$ALLOW_AIPERF_SATURATION_FAILURES" == true ]]
     done
     if [[ "$_SATURATION_EXPORTS_VALID" == true && "$_SAW_SATURATION_FAILURE" == true ]]; then
         AIPERF_SATURATION_FAILURES_ACCEPTED=true
-        echo "  Accepted complete timeout/HTTP 500/503 saturation records exports"
+        echo "  Accepted complete timeout/connection-timeout/HTTP 500/503 saturation records exports"
     fi
 fi
 
