@@ -1325,6 +1325,30 @@ def parse_leg_metrics(output_dir: Path) -> dict[str, Any]:
     return metric
 
 
+def agentx_submission_status(
+    metrics: dict[str, Any], expected_scenario: str, accepted_saturation: bool
+) -> str:
+    """Validate AgentX metadata, narrowly preserving an all-failure saturation leg."""
+    metadata = metrics["scenario_metadata"]
+    if metadata:
+        if any(
+            entry.get("scenario") != expected_scenario
+            or entry.get("submission_valid") is not True
+            for entry in metadata
+        ):
+            raise CampaignError(
+                f"AgentX scenario submission was not valid: {metadata}"
+            )
+        return "valid"
+    if (
+        accepted_saturation
+        and metrics["completed_requests"] == 0
+        and metrics["failed_requests"] > 0
+    ):
+        return "unavailable_all_failure_saturation"
+    raise CampaignError(f"AgentX scenario submission metadata is absent: {metadata}")
+
+
 def validate_leg_output(
     output_dir: Path, leg: dict[str, Any], manifest: dict[str, Any]
 ) -> dict[str, Any]:
@@ -1427,15 +1451,11 @@ def validate_leg_output(
             f"AIPerf export version mismatch: {metrics['aiperf_versions']} != {[expected_version]}"
         )
     if leg["phase"] != "smoke":
-        metadata = metrics["scenario_metadata"]
-        if not metadata or any(
-            entry.get("scenario") != manifest["workload"]["scenario"]
-            or entry.get("submission_valid") is not True
-            for entry in metadata
-        ):
-            raise CampaignError(
-                f"AgentX scenario submission was not valid in {output_dir}: {metadata}"
-            )
+        metrics["scenario_submission_status"] = agentx_submission_status(
+            metrics,
+            manifest["workload"]["scenario"],
+            accepted_saturation,
+        )
     if leg["arm"] == "sidecar":
         check = metrics["grpc_connection_check"]
         if not check or not check.get("valid"):

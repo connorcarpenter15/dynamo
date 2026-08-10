@@ -13,6 +13,7 @@ This campaign compares the direct Python vLLM Mocker LiveEngine boundary with `d
 - Scenario `inferencex-agentx-mvp` with `semianalysis_cc_traces_weka_062126_256k`, chat streaming, server token counts, a 262,144-token context limit, seed `20260809`, throughput-oriented phase starts, and a 60-second session-concurrency ramp in both warmup and profiling. Trace selection and inter-turn timing remain AgentX-faithful; only the multi-day recorded phase-boundary ramps are replaced by this fixed ramp so high concurrency does not become a synchronized TCP connection storm.
 - Forty-eight AIPerf workers and 16 record processors share 64 dedicated load-generator cores, reserving scheduler headroom for AIPerf's controller and export services.
 - The campaign opts into preserving terminal AgentX warmup transport failures and continuing into profiling. AIPerf still exports those failures; this is safe for this CPU request-plane comparison because Mocker prefix caching is disabled, and it prevents genuine high-concurrency saturation during warmup from cancelling the measurement phase.
+- If accepted saturation leaves zero successful profiling responses, AIPerf omits the aggregate scenario metadata. Only that exact all-failure case is retained with `scenario_submission_status=unavailable_all_failure_saturation`; emitted invalid metadata and partial-success runs without metadata still fail closed.
 - Socket telemetry records one-second aggregate connection counts and receive/send queue sums and maxima for all TCP, frontend HTTP, and sidecar gRPC traffic. It does not persist per-socket `ss` dumps whose artifact size and I/O scale with concurrency.
 - Live trajectory-tree concurrency `{1024,4096,8192}`.
 - Four 900-second legs per point in crossover order `direct, sidecar, sidecar, direct`.
@@ -21,7 +22,7 @@ This campaign compares the direct Python vLLM Mocker LiveEngine boundary with `d
 - The Dynamo TCP request timeout is 300 seconds in both arms, matching AIPerf's request timeout so a queued burst request does not trip the runtime's five-second default and temporarily remove the only backend worker.
 - Sidecar pool sweep `{8,16,32,64,128}` ascending and descending at concurrency 8,192 and the measured sidecar capacity peak. Valid eight-connection main legs are reused.
 
-The Mocker scheduler is shared between arms: DP1 aggregated vLLM mode, speedup zero, block size 64, prefix caching disabled, 524,288 sequences, 67,108,864 batch tokens, and 4,194,304 simulated KV blocks. Prefix caching is intentionally disabled so this remains a request-boundary comparison, not a cache benchmark.
+The Mocker scheduler is shared between arms: DP1 aggregated vLLM mode, speedup zero, block size 64, prefix caching disabled, 524,288 sequences, a 2,147,483,648-token batch budget, and 67,108,864 simulated KV blocks. Prefix caching is intentionally disabled so this remains a request-boundary comparison, not a cache benchmark.
 
 ## Host requirements
 

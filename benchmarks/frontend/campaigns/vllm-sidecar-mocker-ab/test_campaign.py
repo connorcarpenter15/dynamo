@@ -46,10 +46,23 @@ class CampaignDryRunTest(unittest.TestCase):
                 encoding="utf-8",
             )
             metrics = campaign.parse_leg_metrics(output)
+            submission_status = campaign.agentx_submission_status(
+                metrics, "inferencex-agentx-mvp", accepted_saturation=True
+            )
         self.assertEqual(metrics["completed_requests"], 0)
         self.assertEqual(metrics["failed_requests"], 1)
         self.assertEqual(metrics["failed_request_fraction"], 1)
         self.assertEqual(metrics["output_throughput_tps"], 0)
+        self.assertEqual(
+            submission_status, "unavailable_all_failure_saturation"
+        )
+        metrics["completed_requests"] = 1
+        with self.assertRaisesRegex(
+            campaign.CampaignError, "scenario submission metadata is absent"
+        ):
+            campaign.agentx_submission_status(
+                metrics, "inferencex-agentx-mvp", accepted_saturation=True
+            )
 
     def test_frontend_tokens_are_correlated_to_profiling_request_ids(self) -> None:
         """Regression: tokenizer-added tokens must not replace server token totals."""
