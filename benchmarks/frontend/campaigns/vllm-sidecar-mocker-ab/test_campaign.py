@@ -149,7 +149,16 @@ class CampaignDryRunTest(unittest.TestCase):
         self.assertEqual(
             manifest["transport"]["dynamo_env"]["DYN_TCP_REQUEST_TIMEOUT"], "300"
         )
-        self.assertGreaterEqual(mocker_config["num_gpu_blocks"], 4_194_304)
+        required_context = manifest["workload"]["max_context_length"]
+        maximum_concurrency = max(manifest["main_matrix"]["concurrency"])
+        required_tokens = maximum_concurrency * required_context
+        required_blocks = (
+            required_tokens + mocker_config["block_size"] - 1
+        ) // mocker_config["block_size"]
+        self.assertGreaterEqual(mocker_config["num_gpu_blocks"], required_blocks)
+        self.assertGreaterEqual(
+            mocker_config["max_num_batched_tokens"], required_tokens
+        )
         model_path = campaign.REPO_ROOT / manifest["fixture"]["model"]
         tokenizer = json.loads(
             (model_path / "tokenizer.json").read_text(encoding="utf-8")
@@ -162,7 +171,6 @@ class CampaignDryRunTest(unittest.TestCase):
         model_config = json.loads(
             (model_path / "config.json").read_text(encoding="utf-8")
         )
-        required_context = manifest["workload"]["max_context_length"]
         self.assertGreaterEqual(
             model_config["max_position_embeddings"], required_context
         )
