@@ -678,9 +678,9 @@ fn discover_kv_event_sources(
             config.endpoint
         )));
     }
-    let base_port = endpoint.port().ok_or_else(|| {
+    let base_port = endpoint.port().filter(|port| *port != 0).ok_or_else(|| {
         client::protocol_error(format!(
-            "SGLang KV-event endpoint `{}` is missing a port",
+            "SGLang KV-event endpoint `{}` must use a port in 1..=65535",
             config.endpoint
         ))
     })?;
@@ -1006,6 +1006,13 @@ mod tests {
                     "kv_events_config": "{not-json",
                 }),
                 "invalid SGLang kv_events_config",
+            ),
+            (
+                json!({
+                    "page_size": 64,
+                    "kv_events_config": r#"{"publisher":"zmq","endpoint":"tcp://*:0"}"#,
+                }),
+                "port in 1..=65535",
             ),
             (
                 json!({
