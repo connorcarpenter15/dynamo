@@ -31,6 +31,18 @@ impl<'de> Deserialize<'de> for RawKvEvent {
 
 struct RawKvEventVisitor;
 
+#[derive(Debug, Deserialize)]
+struct SglangBlockStoredMetadata {
+    cache_salt: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum BlockStoredProducerField {
+    LoraName(String),
+    SglangMetadata(SglangBlockStoredMetadata),
+}
+
 impl<'de> Visitor<'de> for RawKvEventVisitor {
     type Value = RawKvEvent;
 
@@ -188,7 +200,19 @@ impl<'de> Visitor<'de> for RawKvEventVisitor {
                 // Position 5 was lora_id in older formats; consume and discard for compat.
                 let _lora_id: Option<u64> = seq.next_element()?.unwrap_or(None);
                 let medium: Option<String> = normalize_medium(seq.next_element()?.unwrap_or(None));
-                let lora_name: Option<String> = seq.next_element()?.unwrap_or(None);
+                // vLLM uses position 7 for lora_name. SGLang's
+                // BlockStoredWithMetadata uses the same extension position for
+                // a map containing cache_salt.
+                let producer_field: Option<BlockStoredProducerField> =
+                    seq.next_element()?.unwrap_or(None);
+                let (lora_name, cache_namespace) = match producer_field {
+                    Some(BlockStoredProducerField::LoraName(name)) => (Some(name), None),
+                    Some(BlockStoredProducerField::SglangMetadata(metadata)) => (
+                        None,
+                        Some(metadata.cache_salt).filter(|salt| !salt.is_empty()),
+                    ),
+                    None => (None, None),
+                };
                 let extra_keys: Option<Vec<Option<Vec<ExtraKeyItem>>>> =
                     seq.next_element()?.unwrap_or(None);
                 let mut block_mm_infos: Option<Vec<Option<BlockExtraInfo>>> = None;
@@ -210,8 +234,9 @@ impl<'de> Visitor<'de> for RawKvEventVisitor {
 
                 while seq.next_element::<IgnoredAny>()?.is_some() {}
 
-                let cache_namespace =
-                    extra_keys_to_cache_namespace(extra_keys.as_deref(), lora_name.as_deref());
+                let cache_namespace = cache_namespace.or_else(|| {
+                    extra_keys_to_cache_namespace(extra_keys.as_deref(), lora_name.as_deref())
+                });
                 let block_mm_infos =
                     block_mm_infos.or_else(|| extra_keys_to_block_mm_infos(extra_keys));
                 let (raw_token_ids, is_eagle) = normalize_token_ids(token_ids);

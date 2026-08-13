@@ -22,6 +22,11 @@ enum TestEventKind {
     BlockRemoved,
 }
 
+#[derive(Serialize)]
+struct SglangBlockStoredMetadataFixture {
+    cache_salt: String,
+}
+
 #[test]
 fn test_deserialize_bigram_block_stored_sequence() {
     let raw_event = (
@@ -50,6 +55,59 @@ fn test_deserialize_bigram_block_stored_sequence() {
         }
         other => panic!("expected BlockStored, got {other:?}"),
     }
+}
+
+#[test]
+fn test_deserialize_sglang_positional_cache_salt_preserves_vllm_lora_slot() {
+    let sglang = to_vec_named(&(
+        "BlockStored",
+        vec![BlockHashValue::Unsigned(11)],
+        Option::<BlockHashValue>::None,
+        vec![10u32, 11],
+        2usize,
+        Option::<u64>::None,
+        Option::<String>::None,
+        SglangBlockStoredMetadataFixture {
+            cache_salt: "tenant-a".to_string(),
+        },
+    ))
+    .unwrap();
+    let vllm = to_vec(&(
+        "BlockStored",
+        vec![BlockHashValue::Unsigned(11)],
+        Option::<BlockHashValue>::None,
+        vec![10u32, 11],
+        2usize,
+        Option::<u64>::None,
+        Option::<String>::None,
+        "adapter-a",
+    ))
+    .unwrap();
+
+    let sglang: RawKvEvent = from_slice(&sglang).unwrap();
+    let vllm: RawKvEvent = from_slice(&vllm).unwrap();
+
+    let RawKvEvent::BlockStored {
+        cache_namespace,
+        lora_name,
+        ..
+    } = sglang
+    else {
+        panic!("expected SGLang BlockStored");
+    };
+    assert_eq!(cache_namespace.as_deref(), Some("tenant-a"));
+    assert!(lora_name.is_none());
+
+    let RawKvEvent::BlockStored {
+        cache_namespace,
+        lora_name,
+        ..
+    } = vllm
+    else {
+        panic!("expected vLLM BlockStored");
+    };
+    assert!(cache_namespace.is_none());
+    assert_eq!(lora_name.as_deref(), Some("adapter-a"));
 }
 
 #[derive(Serialize)]

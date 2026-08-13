@@ -73,8 +73,9 @@ vLLM's `BlockStored` tuple includes the vLLM-compatible fixed prefix before
 the metadata tail, so `group_idx` and cache metadata are parsed from tail
 positions.
 
-SGLang currently emits a shorter positional `BlockStored` shape ending at
-`lora_id`, and does not emit cache-group metadata. That parses correctly
-because the tuple terminates early. If SGLang later adds positional metadata,
-it must either include the vLLM-compatible placeholder fields before the tail
-or use map/object events with named fields.
+SGLang emits a shorter positional `BlockStored` shape. Unsalted events end at
+`lora_id`; `BlockStoredWithMetadata` appends a map containing `cache_salt` in
+position 7. The parser distinguishes that map from vLLM's string `lora_name`
+at the same position. If SGLang adds other positional metadata, it must either
+extend that map, include the vLLM-compatible placeholder fields before the
+tail, or use map/object events with named fields.
