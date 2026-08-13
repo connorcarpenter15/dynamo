@@ -41,6 +41,7 @@ while [[ $# -gt 0 ]]; do
             echo "  DYN_SYSTEM_PORT         Dynamo sidecar system port (default: 8081)"
             echo "  SGLANG_HTTP_PORT        SGLang HTTP port (default: 30000)"
             echo "  SGLANG_GRPC_PORT        SGLang gRPC port (default: 30001)"
+            echo "  SGLANG_KV_EVENT_PORT    SGLang ZMQ KV-event port (default: 5557)"
             echo "  MAX_MODEL_LEN           Maximum model length (default: 4096)"
             echo "  MAX_CONCURRENT_SEQS     Maximum concurrent sequences (default: 2)"
             exit 0
@@ -58,6 +59,7 @@ SGLANG_PYTHON="${SGLANG_PYTHON:-python3}"
 SGLANG_HOST="127.0.0.1"
 SGLANG_HTTP_PORT="${SGLANG_HTTP_PORT:-30000}"
 SGLANG_GRPC_PORT="${SGLANG_GRPC_PORT:-30001}"
+SGLANG_KV_EVENT_PORT="${SGLANG_KV_EVENT_PORT:-5557}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
 MAX_CONCURRENT_SEQS="${MAX_CONCURRENT_SEQS:-2}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
@@ -67,9 +69,10 @@ GPU_MEM_ARGS=$(build_sglang_gpu_mem_args)
 
 print_launch_banner "Launching SGLang Native-gRPC Sidecar (1 GPU)" "$MODEL" "$HTTP_PORT" \
     "SGLang HTTP: http://${SGLANG_HOST}:${SGLANG_HTTP_PORT}" \
-    "SGLang gRPC: ${SGLANG_HOST}:${SGLANG_GRPC_PORT}"
+    "SGLang gRPC: ${SGLANG_HOST}:${SGLANG_GRPC_PORT}" \
+    "KV events:   tcp://${SGLANG_HOST}:${SGLANG_KV_EVENT_PORT}"
 
-python3 -m dynamo.frontend &
+python3 -m dynamo.frontend --router-mode kv &
 
 # --grpc-port enables the native Rust gRPC server alongside SGLang's HTTP API.
 # shellcheck disable=SC2086 # GPU_MEM_ARGS intentionally expands into multiple flags.
@@ -79,6 +82,7 @@ CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" \
     --host "$SGLANG_HOST" \
     --port "$SGLANG_HTTP_PORT" \
     --grpc-port "$SGLANG_GRPC_PORT" \
+    --kv-events-config "{\"publisher\":\"zmq\",\"endpoint\":\"tcp://*:${SGLANG_KV_EVENT_PORT}\",\"topic\":\"\"}" \
     --context-length "$MAX_MODEL_LEN" \
     --max-running-requests "$MAX_CONCURRENT_SEQS" \
     $GPU_MEM_ARGS \

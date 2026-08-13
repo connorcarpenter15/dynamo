@@ -39,6 +39,9 @@ spec:
         containers:
         - name: main
           image: nvcr.io/nvidia/ai-dynamo/dynamo-frontend:1.3.0
+          env:
+          - name: DYN_ROUTER_MODE
+            value: kv
 
   - name: SGLangPrefillWorker
     type: worker
@@ -54,6 +57,10 @@ spec:
         - name: sglang-engine
           image: lmsysorg/sglang:v0.5.16
           restartPolicy: Always
+          ports:
+          - name: kv-events
+            containerPort: 5557
+            protocol: TCP
           securityContext:
             capabilities:
               add: ["IPC_LOCK"]
@@ -104,6 +111,8 @@ spec:
           - "30000"
           - --grpc-port
           - "30001"
+          - --kv-events-config
+          - '{"publisher":"zmq","endpoint":"tcp://*:5557","topic":""}'
           - --disaggregation-mode
           - prefill
           - --disaggregation-bootstrap-port
@@ -142,6 +151,10 @@ spec:
         - name: sglang-engine
           image: lmsysorg/sglang:v0.5.16
           restartPolicy: Always
+          ports:
+          - name: kv-events
+            containerPort: 5557
+            protocol: TCP
           securityContext:
             capabilities:
               add: ["IPC_LOCK"]
@@ -192,6 +205,8 @@ spec:
           - "30000"
           - --grpc-port
           - "30001"
+          - --kv-events-config
+          - '{"publisher":"zmq","endpoint":"tcp://*:5557","topic":""}'
           - --disaggregation-mode
           - decode
           - --disaggregation-bootstrap-port

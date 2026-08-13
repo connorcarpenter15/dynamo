@@ -26,13 +26,37 @@ a minimal one from `Dockerfile`. Official packaging is deferred to a follow-up.
 
 Use `SGLANG_GRPC_ENDPOINT` instead of `--sglang-endpoint` when the endpoint is provided through the environment.
 
-The sidecar discovers the model and tokenizer paths, served model name, parser defaults, worker role, context length, KV capacity, scheduler limits, data-parallel topology, and KV-event sources through SGLang's native discovery RPCs. Explicit Dynamo parser options override parser names discovered from SGLang.
+The sidecar discovers the model and tokenizer paths, served model name, parser defaults, worker role, context length, KV capacity, scheduler limits, and data-parallel topology through SGLang's native discovery RPCs. It derives KV-event sources from the `kv_events_config` returned by `GetServerInfo`. Explicit Dynamo parser options override parser names discovered from SGLang.
 
 SGLang remains the source of truth for the worker's aggregated, prefill, or decode role. The inherited `--disaggregation-mode` option and `DYN_DISAGGREGATION_MODE` environment variable have no effect in this sidecar. The SGLang sidecar rejects `--route-to-encoder` because its native protocol does not support encoder workers. Disaggregated workers continue to register under their fixed role components; aggregated workers honor `--component` or `DYN_COMPONENT`.
 
 The sidecar opens eight gRPC connections by default. Override the pool size with `--grpc-connections` or `DYN_SIDECAR_GRPC_CONNECTIONS`.
 
 Connection startup uses a 30-second timeout per attempt, a one-second retry and readiness interval, and a five-minute deadline for establishing the full connection pool. Override them with `--grpc-connect-attempt-timeout-secs`, `--grpc-retry-interval-secs`, and `--grpc-startup-deadline-secs`, or with the corresponding `DYN_SIDECAR_GRPC_*` environment variables.
+
+## KV-aware routing
+
+Enable SGLang's ZMQ publisher and Dynamo's KV router together:
+
+```bash
+python3 -m dynamo.frontend --router-mode kv &
+
+python3 -m sglang.launch_server \
+    <args> \
+    --grpc-port 30001 \
+    --kv-events-config '{"publisher":"zmq","endpoint":"tcp://*:5557","topic":""}'
+```
+
+The sidecar creates one Dynamo KV-event source per registered DP rank, using consecutive ports beginning at the configured ZMQ port. The SGLang publisher must use a TCP wildcard bind host (`*`, `0.0.0.0`, or `::`); the sidecar replaces it with the gRPC endpoint host when connecting. `page_size * dcp_size` is used as the router-facing block size.
+
+| Topology | Event-driven routing |
+|---|---|
+| Single rank | Supported |
+| Single-node DP attention | Supported |
+| Multi-node TP with one logical DP rank | Supported |
+| Multi-node DP attention | Not supported; startup fails when KV publication is enabled because `GetServerInfo` does not map DP ranks to publisher hosts |
+
+If `kv_events_config` is absent or selects the `null` publisher, the sidecar publishes no KV events. The frontend can still use approximate routing with `--router-mode kv --no-router-kv-events`.
 
 ## SGLang-managed module contract
 

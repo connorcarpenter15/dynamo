@@ -45,6 +45,8 @@ while [[ $# -gt 0 ]]; do
             echo "  SGLANG_PREFILL_GRPC_PORT                Prefill gRPC port (default: 30001)"
             echo "  SGLANG_DECODE_HTTP_PORT                 Decode HTTP port (default: 30010)"
             echo "  SGLANG_DECODE_GRPC_PORT                 Decode gRPC port (default: 30011)"
+            echo "  SGLANG_PREFILL_KV_EVENT_PORT            Prefill ZMQ KV-event port (default: 5557)"
+            echo "  SGLANG_DECODE_KV_EVENT_PORT             Decode ZMQ KV-event port (default: 5657)"
             echo "  SGLANG_DISAGGREGATION_BOOTSTRAP_PORT    KV-transfer bootstrap port (default: 8998)"
             echo "  SGLANG_BOOTSTRAP_HOST                   Advertised bootstrap host (default: 127.0.0.1)"
             echo "  MAX_MODEL_LEN                           Maximum model length (default: 4096)"
@@ -68,6 +70,8 @@ SGLANG_PREFILL_HTTP_PORT="${SGLANG_PREFILL_HTTP_PORT:-30000}"
 SGLANG_PREFILL_GRPC_PORT="${SGLANG_PREFILL_GRPC_PORT:-30001}"
 SGLANG_DECODE_HTTP_PORT="${SGLANG_DECODE_HTTP_PORT:-30010}"
 SGLANG_DECODE_GRPC_PORT="${SGLANG_DECODE_GRPC_PORT:-30011}"
+SGLANG_PREFILL_KV_EVENT_PORT="${SGLANG_PREFILL_KV_EVENT_PORT:-5557}"
+SGLANG_DECODE_KV_EVENT_PORT="${SGLANG_DECODE_KV_EVENT_PORT:-5657}"
 SGLANG_PREFILL_GPU="${SGLANG_PREFILL_GPU:-0}"
 SGLANG_DECODE_GPU="${SGLANG_DECODE_GPU:-1}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
@@ -79,9 +83,10 @@ GPU_MEM_ARGS=$(build_sglang_gpu_mem_args)
 print_launch_banner "Launching SGLang Native-gRPC Sidecar (Disaggregated, 2 GPUs)" "$MODEL" "$HTTP_PORT" \
     "Prefill:     GPU ${SGLANG_PREFILL_GPU}, HTTP http://${SGLANG_HOST}:${SGLANG_PREFILL_HTTP_PORT}, gRPC ${SGLANG_HOST}:${SGLANG_PREFILL_GRPC_PORT}" \
     "Decode:      GPU ${SGLANG_DECODE_GPU}, HTTP http://${SGLANG_HOST}:${SGLANG_DECODE_HTTP_PORT}, gRPC ${SGLANG_HOST}:${SGLANG_DECODE_GRPC_PORT}" \
-    "Bootstrap:   ${SGLANG_BOOTSTRAP_HOST}:${SGLANG_DISAGGREGATION_BOOTSTRAP_PORT}"
+    "Bootstrap:   ${SGLANG_BOOTSTRAP_HOST}:${SGLANG_DISAGGREGATION_BOOTSTRAP_PORT}" \
+    "KV events:   prefill ${SGLANG_HOST}:${SGLANG_PREFILL_KV_EVENT_PORT}, decode ${SGLANG_HOST}:${SGLANG_DECODE_KV_EVENT_PORT}"
 
-python3 -m dynamo.frontend &
+python3 -m dynamo.frontend --router-mode kv &
 
 # shellcheck disable=SC2086 # GPU_MEM_ARGS intentionally expands into multiple flags.
 CUDA_VISIBLE_DEVICES="$SGLANG_PREFILL_GPU" \
@@ -90,6 +95,7 @@ CUDA_VISIBLE_DEVICES="$SGLANG_PREFILL_GPU" \
     --host "$SGLANG_HOST" \
     --port "$SGLANG_PREFILL_HTTP_PORT" \
     --grpc-port "$SGLANG_PREFILL_GRPC_PORT" \
+    --kv-events-config "{\"publisher\":\"zmq\",\"endpoint\":\"tcp://*:${SGLANG_PREFILL_KV_EVENT_PORT}\",\"topic\":\"\"}" \
     --disaggregation-mode prefill \
     --disaggregation-bootstrap-port "$SGLANG_DISAGGREGATION_BOOTSTRAP_PORT" \
     --disaggregation-transfer-backend nixl \
@@ -105,6 +111,7 @@ CUDA_VISIBLE_DEVICES="$SGLANG_DECODE_GPU" \
     --host "$SGLANG_HOST" \
     --port "$SGLANG_DECODE_HTTP_PORT" \
     --grpc-port "$SGLANG_DECODE_GRPC_PORT" \
+    --kv-events-config "{\"publisher\":\"zmq\",\"endpoint\":\"tcp://*:${SGLANG_DECODE_KV_EVENT_PORT}\",\"topic\":\"\"}" \
     --disaggregation-mode decode \
     --disaggregation-bootstrap-port "$SGLANG_DISAGGREGATION_BOOTSTRAP_PORT" \
     --disaggregation-transfer-backend nixl \
