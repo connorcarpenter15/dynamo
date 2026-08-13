@@ -86,6 +86,20 @@ impl fmt::Display for GrpcEndpoint {
     }
 }
 
+/// Convert a ZMQ wildcard bind endpoint into the address a colocated sidecar
+/// should dial. Concrete endpoints are returned unchanged.
+pub fn zmq_connect_endpoint(endpoint: &str, grpc_endpoint: &GrpcEndpoint) -> String {
+    let port = endpoint
+        .strip_prefix("tcp://*:")
+        .or_else(|| endpoint.strip_prefix("tcp://0.0.0.0:"))
+        .or_else(|| endpoint.strip_prefix("tcp://[::]:"));
+    let Some(port) = port else {
+        return endpoint.to_string();
+    };
+
+    format!("tcp://{}:{port}", grpc_endpoint.authority_host())
+}
+
 #[cfg(test)]
 mod tests {
     use super::GrpcEndpoint;

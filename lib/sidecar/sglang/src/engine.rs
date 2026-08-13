@@ -9,12 +9,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use dynamo_backend_common::{
-    AsyncEngineContext, DisaggregationMode, DynamoError, EngineConfig, GenerateContext, LLMEngine,
-    LLMEngineOutput, LLMEngineOutputExt, LlmRegistration, ModelInput, PreprocessedRequest,
-    WorkerConfig, usage,
+    AsyncEngineContext, DisaggregationMode, DynamoError, EngineConfig, GenerateContext,
+    KvEventSource, LLMEngine, LLMEngineOutput, LLMEngineOutputExt, LlmRegistration, ModelInput,
+    PreprocessedRequest, WorkerConfig, usage,
 };
-use dynamo_sidecar_common::{GrpcEndpoint, GrpcTransportConfig};
+use dynamo_sidecar_common::{GrpcEndpoint, GrpcTransportConfig, zmq_connect_endpoint};
 use futures::stream::BoxStream;
+use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::OnceCell;
 use tokio::time::Instant;
@@ -34,8 +35,34 @@ pub struct SglangSidecarEngine {
     disaggregation_mode: DisaggregationMode,
     bootstrap_host: Option<String>,
     bootstrap_port: Option<u16>,
-    pool: OnceCell<Pool>,
+    state: OnceCell<StartedState>,
     cancel: CancellationToken,
+}
+
+struct StartedState {
+    pool: Pool,
+    kv_event_sources: Vec<DiscoveredKvEventSource>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DiscoveredKvEventSource {
+    endpoint: String,
+    topic: String,
+    dp_rank: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct SglangKvEventsConfig {
+    #[serde(default)]
+    publisher: Option<String>,
+    #[serde(default = "default_kv_event_endpoint")]
+    endpoint: String,
+    #[serde(default)]
+    topic: String,
+}
+
+fn default_kv_event_endpoint() -> String {
+    "tcp://*:5557".to_string()
 }
 
 impl SglangSidecarEngine {
@@ -52,7 +79,7 @@ impl SglangSidecarEngine {
             disaggregation_mode,
             bootstrap_host,
             bootstrap_port,
-            pool: OnceCell::new(),
+            state: OnceCell::new(),
             cancel: CancellationToken::new(),
         }
     }
@@ -162,7 +189,7 @@ impl SglangSidecarEngine {
 #[async_trait]
 impl LLMEngine for SglangSidecarEngine {
     async fn start(&self, _worker_id: u64) -> Result<EngineConfig, DynamoError> {
-        if self.pool.initialized() {
+        if self.state.initialized() {
             return Err(client::engine_shutdown("sglang sidecar already started"));
         }
 
@@ -185,14 +212,20 @@ impl LLMEngine for SglangSidecarEngine {
             self.bootstrap_host.clone(),
             self.bootstrap_port,
         )?;
+        let kv_event_sources = discover_kv_event_sources(&discovery, &config, &self.endpoint)?;
         let connection_count = pool.len();
-        self.pool
-            .set(pool)
+        let kv_event_source_count = kv_event_sources.len();
+        self.state
+            .set(StartedState {
+                pool,
+                kv_event_sources,
+            })
             .map_err(|_| client::engine_shutdown("sglang sidecar already started"))?;
         tracing::info!(
             model = %config.model,
             mode = ?self.disaggregation_mode,
             connections = connection_count,
+            kv_event_sources = kv_event_source_count,
             "sglang sidecar started"
         );
         Ok(config)
@@ -204,9 +237,9 @@ impl LLMEngine for SglangSidecarEngine {
         ctx: GenerateContext,
     ) -> Result<BoxStream<'static, Result<LLMEngineOutput, DynamoError>>, DynamoError> {
         let mut grpc_client = self
-            .pool
+            .state
             .get()
-            .map(Pool::stream_client)
+            .map(|state| state.pool.stream_client())
             .ok_or_else(|| client::engine_shutdown("generate called before start"))?;
 
         let prompt_tokens = request.token_ids.len() as u32;
@@ -393,7 +426,8 @@ impl LLMEngine for SglangSidecarEngine {
     }
 
     async fn abort(&self, ctx: Arc<dyn AsyncEngineContext>) {
-        let Some(mut grpc_client) = self.pool.get().map(Pool::control_client) else {
+        let Some(mut grpc_client) = self.state.get().map(|state| state.pool.control_client())
+        else {
             return;
         };
         let request = pb::AbortRequest {
@@ -419,6 +453,22 @@ impl LLMEngine for SglangSidecarEngine {
         self.cancel.cancel();
         tracing::info!("sglang sidecar shutdown complete");
         Ok(())
+    }
+
+    async fn kv_event_sources(&self) -> Result<Vec<KvEventSource>, DynamoError> {
+        let state = self
+            .state
+            .get()
+            .ok_or_else(|| client::engine_shutdown("sglang sidecar is not started"))?;
+        Ok(state
+            .kv_event_sources
+            .iter()
+            .map(|source| KvEventSource::Zmq {
+                endpoint: source.endpoint.clone(),
+                topic: source.topic.clone(),
+                dp_rank: source.dp_rank,
+            })
+            .collect())
     }
 }
 
@@ -556,6 +606,156 @@ fn is_routable_host(host: &str) -> bool {
         .unwrap_or(true)
 }
 
+fn discover_kv_event_sources(
+    discovery: &Discovery,
+    engine_config: &EngineConfig,
+    grpc_endpoint: &GrpcEndpoint,
+) -> Result<Vec<DiscoveredKvEventSource>, DynamoError> {
+    let Some(raw_config) = discovery.server_info.get("kv_events_config") else {
+        return Ok(Vec::new());
+    };
+    if raw_config.is_null() {
+        return Ok(Vec::new());
+    }
+    let raw_config = raw_config.as_str().ok_or_else(|| {
+        client::protocol_error("SGLang kv_events_config must be a JSON string or null")
+    })?;
+    if raw_config.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let raw_value: Value = serde_json::from_str(raw_config).map_err(|error| {
+        client::protocol_error(format!("invalid SGLang kv_events_config: {error}"))
+    })?;
+    if raw_value.is_null() {
+        return Ok(Vec::new());
+    }
+    let config: SglangKvEventsConfig = serde_json::from_value(raw_value).map_err(|error| {
+        client::protocol_error(format!("invalid SGLang kv_events_config: {error}"))
+    })?;
+    match config.publisher.as_deref() {
+        None | Some("null") => return Ok(Vec::new()),
+        Some("zmq") => {}
+        Some(publisher) => {
+            return Err(client::protocol_error(format!(
+                "unsupported SGLang KV-event publisher `{publisher}`; expected `zmq` or `null`"
+            )));
+        }
+    }
+
+    let endpoint = url::Url::parse(&config.endpoint).map_err(|error| {
+        client::protocol_error(format!(
+            "invalid SGLang KV-event endpoint `{}`: {error}",
+            config.endpoint
+        ))
+    })?;
+    if endpoint.scheme() != "tcp"
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+        || !matches!(endpoint.path(), "" | "/")
+    {
+        return Err(client::protocol_error(format!(
+            "SGLang KV-event endpoint `{}` must contain only a tcp scheme, wildcard host, and port",
+            config.endpoint
+        )));
+    }
+    let host = endpoint.host().ok_or_else(|| {
+        client::protocol_error(format!(
+            "SGLang KV-event endpoint `{}` is missing a host",
+            config.endpoint
+        ))
+    })?;
+    let is_wildcard = match host {
+        url::Host::Domain(host) => host == "*",
+        url::Host::Ipv4(host) => host.is_unspecified(),
+        url::Host::Ipv6(host) => host.is_unspecified(),
+    };
+    if !is_wildcard {
+        return Err(client::protocol_error(format!(
+            "SGLang KV-event endpoint `{}` must use a wildcard bind host (`*`, `0.0.0.0`, or `::`)",
+            config.endpoint
+        )));
+    }
+    let base_port = endpoint.port().ok_or_else(|| {
+        client::protocol_error(format!(
+            "SGLang KV-event endpoint `{}` is missing a port",
+            config.endpoint
+        ))
+    })?;
+
+    let llm = engine_config.llm.as_ref().ok_or_else(|| {
+        client::protocol_error("SGLang KV events require an LLM engine registration")
+    })?;
+    let page_size = client::json_u32(&discovery.server_info, "page_size")
+        .filter(|size| *size > 0)
+        .ok_or_else(|| {
+            client::protocol_error(
+                "SGLang enabled KV events without reporting a usable page_size/dcp_size",
+            )
+        })?;
+    let dcp_size = client::json_u32(&discovery.server_info, "dcp_size").unwrap_or(1);
+    let block_size = page_size
+        .checked_mul(dcp_size)
+        .filter(|size| *size > 0)
+        .ok_or_else(|| {
+            client::protocol_error(
+                "SGLang enabled KV events without reporting a usable page_size/dcp_size",
+            )
+        })?;
+    if llm.kv_cache_block_size != Some(block_size) {
+        return Err(client::protocol_error(format!(
+            "SGLang KV-event block size {block_size} does not match the registered engine block size {:?}",
+            llm.kv_cache_block_size
+        )));
+    }
+    let dp_start = llm.data_parallel_start_rank.unwrap_or(0);
+    let dp_size = llm.data_parallel_size.unwrap_or(1);
+    if dp_size == 0 {
+        return Err(client::protocol_error(
+            "SGLang registered zero data-parallel ranks for KV events",
+        ));
+    }
+    let dp_end = dp_start.checked_add(dp_size).ok_or_else(|| {
+        client::protocol_error("SGLang data-parallel rank range overflows uint32")
+    })?;
+    let nnodes = client::json_u32(&discovery.server_info, "nnodes")
+        .unwrap_or(1)
+        .max(1);
+    if nnodes > 1 && dp_size > 1 {
+        return Err(client::protocol_error(format!(
+            "SGLang KV events for multi-node DP are not supported by the native sidecar: GetServerInfo does not map DP ranks to publisher hosts (nnodes={nnodes}, dp_size={dp_size})"
+        )));
+    }
+
+    let mut sources = Vec::with_capacity(dp_size as usize);
+    for dp_rank in dp_start..dp_end {
+        let port = u32::from(base_port)
+            .checked_add(dp_rank)
+            .filter(|port| *port <= u32::from(u16::MAX))
+            .ok_or_else(|| {
+                client::protocol_error(format!(
+                    "SGLang KV-event port overflows 65535 for base port {base_port} and DP rank {dp_rank}"
+                ))
+            })?;
+        sources.push(DiscoveredKvEventSource {
+            endpoint: zmq_connect_endpoint(&format!("tcp://*:{port}"), grpc_endpoint),
+            topic: config.topic.clone(),
+            dp_rank,
+        });
+    }
+
+    tracing::info!(
+        sources = sources.len(),
+        block_size,
+        base_port,
+        topic = %config.topic,
+        "discovered SGLang ZMQ KV-event sources"
+    );
+    Ok(sources)
+}
+
 fn build_engine_config(
     discovery: &Discovery,
     mode: DisaggregationMode,
@@ -634,10 +834,12 @@ fn build_engine_config(
 
 #[cfg(test)]
 mod tests {
+    use dynamo_sidecar_common::GrpcEndpoint;
     use serde_json::json;
 
     use super::{
-        DisaggregationMode, Discovery, build_engine_config, resolve_bootstrap_host_with_local,
+        DisaggregationMode, Discovery, build_engine_config, discover_kv_event_sources,
+        resolve_bootstrap_host_with_local,
     };
 
     fn discovery(server_info: serde_json::Value) -> Discovery {
@@ -754,5 +956,94 @@ mod tests {
 
         assert_eq!(registration.kv_cache_block_size, Some(512));
         assert_eq!(registration.total_kv_blocks, Some(16));
+    }
+
+    #[test]
+    fn single_node_dp_discovers_ranked_kv_event_sources() {
+        let discovery = discovery(json!({
+            "page_size": 64,
+            "dcp_size": 2,
+            "dp_size": 3,
+            "enable_dp_attention": true,
+            "nnodes": 1,
+            "kv_events_config": r#"{"publisher":"zmq","endpoint":"tcp://*:5557","topic":"kv"}"#,
+        }));
+        let config =
+            build_engine_config(&discovery, DisaggregationMode::Decode, None, None).unwrap();
+        let endpoint = GrpcEndpoint::parse("http://127.0.0.1:30001", "test").unwrap();
+
+        let sources = discover_kv_event_sources(&discovery, &config, &endpoint).unwrap();
+
+        assert_eq!(sources.len(), 3);
+        assert_eq!(
+            sources
+                .iter()
+                .map(|source| (
+                    source.endpoint.as_str(),
+                    source.topic.as_str(),
+                    source.dp_rank
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("tcp://127.0.0.1:5557", "kv", 0),
+                ("tcp://127.0.0.1:5558", "kv", 1),
+                ("tcp://127.0.0.1:5559", "kv", 2),
+            ]
+        );
+        assert_eq!(
+            config.llm.unwrap().kv_cache_block_size,
+            Some(128),
+            "KV publishers must use the DCP-aware logical block size"
+        );
+    }
+
+    #[test]
+    fn invalid_kv_event_discovery_fails_before_registration() {
+        let cases = [
+            (
+                json!({
+                    "page_size": 64,
+                    "kv_events_config": "{not-json",
+                }),
+                "invalid SGLang kv_events_config",
+            ),
+            (
+                json!({
+                    "page_size": 64,
+                    "dp_size": 2,
+                    "enable_dp_attention": true,
+                    "kv_events_config": r#"{"publisher":"zmq","endpoint":"tcp://*:65535"}"#,
+                }),
+                "port overflows 65535",
+            ),
+            (
+                json!({
+                    "kv_events_config": r#"{"publisher":"zmq","endpoint":"tcp://*:5557"}"#,
+                }),
+                "without reporting a usable page_size/dcp_size",
+            ),
+            (
+                json!({
+                    "page_size": 64,
+                    "dp_size": 2,
+                    "enable_dp_attention": true,
+                    "nnodes": 2,
+                    "kv_events_config": r#"{"publisher":"zmq","endpoint":"tcp://*:5557"}"#,
+                }),
+                "multi-node DP",
+            ),
+        ];
+        let endpoint = GrpcEndpoint::parse("http://127.0.0.1:30001", "test").unwrap();
+
+        for (server_info, expected) in cases {
+            let discovery = discovery(server_info);
+            let config =
+                build_engine_config(&discovery, DisaggregationMode::Decode, None, None).unwrap();
+            let error = discover_kv_event_sources(&discovery, &config, &endpoint).unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "expected `{expected}` in `{error}`"
+            );
+        }
     }
 }

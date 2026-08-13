@@ -8,7 +8,7 @@ use dynamo_backend_common::{
     DisaggregationMode, DynamoError, GenerateContext, KvEventSource, LLMEngine, LLMEngineOutput,
     LLMEngineOutputExt, WorkerConfig, usage,
 };
-use dynamo_sidecar_common::{GrpcEndpoint, GrpcTransportConfig};
+use dynamo_sidecar_common::{GrpcEndpoint, GrpcTransportConfig, zmq_connect_endpoint};
 use futures::stream::BoxStream;
 use tokio::sync::OnceCell;
 use tokio::time::Instant;
@@ -391,18 +391,6 @@ impl LLMEngine for VllmSidecarEngine {
         }
         Ok(sources)
     }
-}
-
-fn zmq_connect_endpoint(endpoint: &str, grpc_endpoint: &GrpcEndpoint) -> String {
-    let port = endpoint
-        .strip_prefix("tcp://*:")
-        .or_else(|| endpoint.strip_prefix("tcp://0.0.0.0:"))
-        .or_else(|| endpoint.strip_prefix("tcp://[::]:"));
-    let Some(port) = port else {
-        return endpoint.to_string();
-    };
-
-    format!("tcp://{}:{port}", grpc_endpoint.authority_host())
 }
 
 fn bootstrap_discover(
